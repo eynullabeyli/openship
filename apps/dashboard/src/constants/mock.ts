@@ -1,3 +1,5 @@
+import type { ReleaseSource } from "@repo/core";
+
 /**
  * Shared domain types used across the dashboard.
  *
@@ -16,9 +18,16 @@ export interface Project {
   gitOwner?: string | null;
   gitRepo?: string | null;
   gitBranch?: string | null;
+  /** Prebuilt release/archive or tracked registry-image source. */
+  releaseSource?: ReleaseSource | null;
 
   /* ── Build configuration ────────────────────────────────── */
   framework: string;
+  /** True when this project was installed from the Apps catalog (Convex, webmail, …).
+   *  Drives the Apps-vs-Projects split; the detail UI is otherwise identical. */
+  isApp?: boolean | null;
+  /** Catalog entry this app was installed from (e.g. "convex", "mail-webmail"). */
+  appTemplateId?: string | null;
   packageManager?: string | null;
   installCommand?: string | null;
   buildCommand?: string | null;
@@ -30,6 +39,10 @@ export interface Project {
   port?: number | null;
   hasServer?: boolean;
   hasBuild?: boolean;
+  /** Resolved runtime workload ("web" | "worker" | "static", #538). A worker
+   *  shares `hasServer=false` with a static site, so it's the only field that
+   *  tells them apart on read-only surfaces (cards, chips). */
+  workloadType?: string | null;
 
   /* ── State ──────────────────────────────────────────────── */
   activeDeploymentId?: string | null;
@@ -41,6 +54,19 @@ export interface Project {
   activeDeploymentStatus?: string | null;
   /** True when the live release is a partial-failure deploy awaiting keep/reject. */
   awaitingDecision?: boolean | null;
+  /** True when the live release's edge/domain routes did not finish syncing. */
+  routingUnsynced?: boolean | null;
+  /** True when the latest failed deploy has a named, clearable blocker. */
+  latestDeploymentBlocked?: boolean | null;
+  /** Operator switch, derived from the project's disabled timestamp. */
+  enabled?: boolean | null;
+  /** Current project migration, when one is still running or awaiting a decision. */
+  activeMigration?: {
+    id: string;
+    status: string;
+    mode: string;
+    needsAction?: boolean;
+  } | null;
   serviceCount?: number;
   hasMultipleServices?: boolean;
   /** Set once soft-deleted; in practice teardown hard-deletes, so the list
@@ -53,6 +79,7 @@ export interface Project {
   /* ── Hosting info (enriched by API) ─────────────────────── */
   favicon?: string | null;
   deployTarget?: string | null;
+  serverId?: string | null;
   serverName?: string | null;
   /** Runtime isolation mode (bare | docker) — editable in the Runtime tab. */
   runtimeMode?: "bare" | "docker" | null;

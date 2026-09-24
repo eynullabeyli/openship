@@ -28,8 +28,9 @@
  */
 
 import type { Context } from "hono";
+import { cloudRequiredCode } from "@repo/core";
 import { dumpSubgraph } from "@repo/db";
-import { cloudClient } from "../../../lib/cloud/client";
+import { cloudClient } from "@repo/platform/engine/lib/cloud/client";
 import { withMigration } from "./with-migration";
 
 export interface MigrateToCloudInput {
@@ -51,7 +52,9 @@ export interface MigrateToCloudResult {
 }
 
 export class MigrateToCloudNotConnectedError extends Error {
-  readonly code = "MIGRATE_TO_CLOUD_NOT_CONNECTED" as const;
+  // Sourced from the shared cloud-capability registry (single source of truth);
+  // identical string, no wire-format change.
+  readonly code = cloudRequiredCode("migrate-to-cloud");
   constructor() {
     super(
       "This instance is not connected to Openship Cloud. Connect your cloud account in Settings first.",
@@ -108,9 +111,13 @@ export async function migrateInstanceToCloud(
       //       SaaS's own auth tables; ingestSubgraph rejects it. An
       //       organization-scope dump carries exactly the rows the SaaS
       //       wants to import.
+      //       stripInstanceRefs: true — servers/mail_servers are instance-scope and
+      //       never travel, but their children (project.serverId,
+      //       backup_destination.serverId, backup_*.mailServerId) do; those FKs are
+      //       not DEFERRABLE and the parents can never exist on the SaaS.
       const dump = await dumpSubgraph(
         { kind: "organization", organizationId: ctx.input.organizationId },
-        { stripEncrypted: true },
+        { stripEncrypted: true, stripInstanceRefs: true },
       );
 
       // ── 2. POST to SaaS — cloudClient handles auth (org owner's cloud
@@ -123,7 +130,7 @@ export async function migrateInstanceToCloud(
       });
 
       if (!result.ok) {
-        if (result.code === "MIGRATE_TO_CLOUD_NOT_CONNECTED") {
+        if (result.code === cloudRequiredCode("migrate-to-cloud")) {
           throw new MigrateToCloudNotConnectedError();
         }
         if (result.code === "INGEST_TARGET_NOT_EMPTY") {

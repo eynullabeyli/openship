@@ -2,17 +2,9 @@
 
 import React, { useState, useEffect, useMemo, useCallback } from "react";
 import Link from "next/link";
-import {
-  Rocket,
-  Activity,
-  CheckCircle2,
-  XCircle,
-  Loader2,
-  Clock,
-  Zap,
-  ArrowRight,
-} from "lucide-react";
-import { deployApi, projectsApi } from "@/lib/api";
+import { Rocket, Activity, CheckCircle2, XCircle, Loader2, Zap, ArrowRight, ChevronLeft, ChevronRight } from "lucide-react";
+import { deployApi, projectsApi, getApiErrorMessage } from "@/lib/api";
+import type { DeploymentHistoryFilter } from "@repo/core";
 import { useI18n, interpolate } from "@/components/i18n-provider";
 import { DeploymentsFilters } from "./DeploymentsFilters";
 import { DeploymentsList } from "./DeploymentsList";
@@ -20,10 +12,7 @@ import { LoadingSkeleton } from "./LoadingSkeleton";
 import type { Deployment, Project } from "../types";
 import {
   calculateDeploymentStats,
-  filterDeployments,
-  sortDeploymentsByDate,
   mapRowToDeployment,
-  formatDistanceToNow,
 } from "../utils";
 
 interface DeploymentsContentProps {
@@ -32,13 +21,22 @@ interface DeploymentsContentProps {
   projectName?: string;
   hideHeader?: boolean;
   hideSidebar?: boolean;
+  /** Catalog-app template id — rows show the app logo instead of the stack icon. */
+  appTemplateId?: string;
 }
 
-export const DeploymentsContent: React.FC<DeploymentsContentProps> = ({
+export const DeploymentsContent: React.FC<DeploymentsContentProps> = (props) => (
+  <DeploymentHistory key={props.projectId ?? "all-projects"} {...props} />
+);
+
+const PAGE_SIZE = 20;
+
+const DeploymentHistory: React.FC<DeploymentsContentProps> = ({
   projectId,
   projectName,
   hideHeader = false,
   hideSidebar = false,
+  appTemplateId,
 }) => {
   const { t } = useI18n();
   const isProject = !!projectId;
@@ -46,74 +44,73 @@ export const DeploymentsContent: React.FC<DeploymentsContentProps> = ({
   const [deployments, setDeployments] = useState<Deployment[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [isLoading, setIsLoading] = useState(true);
-  const [filter, setFilter] = useState<
-    "all" | "success" | "failed" | "building" | "pending" | "canceled"
-  >("all");
-  const [searchQuery, setSearchQuery] = useState("");
-  const [selectedProjectId, setSelectedProjectId] = useState<string | "all">(
-    "all"
-  );
-
-  const fetchDeployments = useCallback(async () => {
-    setIsLoading(true);
-    try {
-      if (isProject && projectId) {
-        const res = await projectsApi.getDeployments(projectId);
-        const rows: any[] = res.data ?? res.deployments ?? [];
-        const mapped = rows.map((r: any) =>
-          mapRowToDeployment({
-            ...r,
-            projectId,
-            projectName: projectName ?? r.projectName,
-          })
-        );
-        setDeployments(sortDeploymentsByDate(mapped));
-        setProjects([]);
-      } else {
-        const res = await deployApi.getAll({ perPage: 100 });
-        const rows: any[] = res.data ?? [];
-        const mapped = rows.map(mapRowToDeployment);
-        setDeployments(sortDeploymentsByDate(mapped));
-
-        const projectMap = new Map<string, Project>();
-        for (const d of mapped) {
-          if (d.projectId && d.projectName) {
-            projectMap.set(d.projectId, {
-              id: d.projectId,
-              name: d.projectName,
-            });
-          }
-        }
-        setProjects([...projectMap.values()]);
-      }
-    } catch {
-      /* silent */
-    } finally {
-      setIsLoading(false);
-    }
-  }, [isProject, projectId, projectName]);
+  const [total, setTotal] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+  const [revision, setRevision] = useState(0);
+  const [query, setQuery] = useState({
+    page: 1,
+    filter: "all" as DeploymentHistoryFilter | "all",
+    searchQuery: "",
+    selectedProjectId: "all",
+  });
+  const { page, filter, searchQuery, selectedProjectId } = query;
+  const refreshDeployments = useCallback(() => setRevision((value) => value + 1), []);
 
   useEffect(() => {
-    fetchDeployments();
-  }, [fetchDeployments]);
+    const controller = new AbortController();
+    setIsLoading(true);
+    setError(null);
+    const params = {
+      page,
+      perPage: PAGE_SIZE,
+      status: filter === "all" ? undefined : filter,
+      search: searchQuery.trim() || undefined,
+    };
+    const request = projectId
+      ? projectsApi.getDeployments(projectId, params, controller.signal)
+      : deployApi.getAll({ ...params, projectId: selectedProjectId === "all" ? undefined : selectedProjectId }, controller.signal);
+    void request.then((res) => {
+      if (controller.signal.aborted) return;
+      const lastPage = Math.max(1, Math.ceil(res.total / PAGE_SIZE));
+      if (page > lastPage) {
+        // Deleting the last row on a page should return to the last real page.
+        setQuery((previous) => ({ ...previous, page: lastPage }));
+        return;
+      }
+      const mapped = res.data.map((row) => mapRowToDeployment({
+        ...row,
+        ...(projectId ? { projectId, projectName: projectName ?? row.projectName } : {}),
+      }));
+      setDeployments(mapped);
+      setTotal(res.total);
+      if (!isProject) {
+        setProjects((previous) => {
+          if (res.projects) return res.projects;
+          // Older APIs omit the complete options list; keep already seen
+          // options stable while navigating or narrowing the history.
+          const known = new Map(previous.map((project) => [project.id, project]));
+          for (const deployment of mapped) {
+            if (deployment.projectId && deployment.projectName) {
+              known.set(deployment.projectId, { id: deployment.projectId, name: deployment.projectName });
+            }
+          }
+          return [...known.values()].sort((a, b) => a.name.localeCompare(b.name));
+        });
+      }
+    }).catch((err) => {
+      if (!controller.signal.aborted) setError(getApiErrorMessage(err, t.deployments.loadFailed));
+    }).finally(() => {
+      if (!controller.signal.aborted) setIsLoading(false);
+    });
+    return () => controller.abort();
+  }, [projectId, projectName, isProject, page, filter, searchQuery, selectedProjectId, revision, t.deployments.loadFailed]);
 
-  const filteredDeployments = useMemo(
-    () =>
-      filterDeployments(deployments, {
-        status: filter,
-        searchQuery,
-        projectId: selectedProjectId,
-      }),
-    [deployments, filter, searchQuery, selectedProjectId]
-  );
+  const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
-  const stats = useMemo(
-    () => calculateDeploymentStats(deployments),
-    [deployments]
-  );
+  const stats = useMemo(() => calculateDeploymentStats(deployments), [deployments]);
 
   const activeCount = (stats.building || 0) + (stats.pending || 0);
-  const recentDeployments = deployments.slice(0, 4);
+  const failedCount = (stats.failed || 0) + (stats.canceled || 0);
 
   return (
     <div>
@@ -126,22 +123,10 @@ export const DeploymentsContent: React.FC<DeploymentsContentProps> = ({
           <p className="text-sm text-muted-foreground/70 mt-1">
             {isLoading
               ? t.deployments.header.loading
-              : isProject
-                ? interpolate(
-                    deployments.length === 1
-                      ? t.deployments.header.countProjectOne
-                      : t.deployments.header.countProjectOther,
-                    { count: String(deployments.length) },
-                  )
-                : interpolate(
-                    projects.length === 1
-                      ? t.deployments.header.countAllOne
-                      : t.deployments.header.countAllOther,
-                    {
-                      deployments: String(deployments.length),
-                      projects: String(projects.length),
-                    },
-                  )}
+              : interpolate(
+                  total === 1 ? t.deployments.header.countProjectOne : t.deployments.header.countProjectOther,
+                  { count: String(total) },
+                )}
           </p>
         </div>
       )}
@@ -150,189 +135,200 @@ export const DeploymentsContent: React.FC<DeploymentsContentProps> = ({
       <div className={hideSidebar ? "" : "grid grid-cols-1 lg:grid-cols-[1fr_340px] gap-6"}>
         {/* LEFT COLUMN */}
         <div className="space-y-4 min-w-0">
+          <DeploymentsFilters
+            isProject={isProject}
+            filter={filter}
+            searchQuery={searchQuery}
+            selectedProjectId={selectedProjectId}
+            projects={projects}
+            onFilterChange={(value) => setQuery((previous) => ({ ...previous, filter: value, page: 1 }))}
+            onSearchChange={(value) => setQuery((previous) => ({ ...previous, searchQuery: value, page: 1 }))}
+            onProjectChange={(value) => setQuery((previous) => ({ ...previous, selectedProjectId: value, page: 1 }))}
+          />
           {isLoading ? (
             <LoadingSkeleton />
+          ) : error ? (
+            <div role="alert" className="rounded-2xl border border-danger/20 bg-danger-bg p-4 text-sm">
+              <p>{error}</p>
+              <button type="button" onClick={refreshDeployments} className="mt-2 font-medium underline">
+                {t.deployments.retry}
+              </button>
+            </div>
           ) : (
-            <>
-              <DeploymentsFilters
-                isProject={isProject}
-                filter={filter}
-                searchQuery={searchQuery}
-                selectedProjectId={selectedProjectId}
-                projects={projects}
-                onFilterChange={setFilter}
-                onSearchChange={setSearchQuery}
-                onProjectChange={setSelectedProjectId}
-              />
-
-              <DeploymentsList
-                deployments={filteredDeployments}
-                hasFilters={
-                  filter !== "all" ||
-                  searchQuery !== "" ||
-                  selectedProjectId !== "all"
-                }
-                onStatusChange={fetchDeployments}
-              />
-            </>
+            <DeploymentsList
+              deployments={deployments}
+              hasFilters={filter !== "all" || searchQuery !== "" || selectedProjectId !== "all"}
+              onStatusChange={refreshDeployments}
+              appTemplateId={appTemplateId}
+            />
+          )}
+          {total > 0 && (
+            <nav aria-label={t.deployments.pagination.label} className="flex flex-wrap items-center justify-between gap-3 text-xs text-muted-foreground">
+              <span aria-live="polite">
+                {isLoading ? t.deployments.header.loading : interpolate(t.deployments.pagination.range, {
+                  from: String((page - 1) * PAGE_SIZE + 1),
+                  to: String(Math.min(page * PAGE_SIZE, total)),
+                  total: String(total),
+                })}
+              </span>
+              <div className="flex items-center gap-3">
+                <button type="button" disabled={isLoading || page <= 1}
+                  aria-label={t.deployments.pagination.previous}
+                  onClick={() => setQuery((previous) => ({ ...previous, page: previous.page - 1 }))}
+                  className="rounded-lg border border-border/60 p-2 enabled:hover:bg-muted disabled:opacity-40">
+                  <ChevronLeft className="size-4 rtl:rotate-180" />
+                </button>
+                <span>{interpolate(t.deployments.pagination.pageOf, { page: String(page), total: String(pageCount) })}</span>
+                <button type="button" disabled={isLoading || page >= pageCount}
+                  aria-label={t.deployments.pagination.next}
+                  onClick={() => setQuery((previous) => ({ ...previous, page: previous.page + 1 }))}
+                  className="rounded-lg border border-border/60 p-2 enabled:hover:bg-muted disabled:opacity-40">
+                  <ChevronRight className="size-4 rtl:rotate-180" />
+                </button>
+              </div>
+            </nav>
           )}
         </div>
 
         {/* RIGHT COLUMN (Sticky) */}
         {!hideSidebar && (
-        <div className="space-y-4 lg:sticky lg:top-6 lg:self-start">
-          {/* Activity Overview */}
-          <div className="bg-card rounded-2xl border border-border/50 p-5">
-            <div className="flex items-center gap-2 mb-4">
-              <Activity className="size-4 text-muted-foreground" />
-              <h3 className="font-semibold text-foreground text-sm">{t.deployments.sidebar.overview.title}</h3>
-            </div>
-
-            <div className="space-y-3">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <div className="w-8 h-8 rounded-lg bg-primary/10 flex items-center justify-center">
-                    <Rocket className="size-4 text-primary" />
-                  </div>
-                  <span className="text-sm text-muted-foreground">{t.deployments.sidebar.overview.total}</span>
-                </div>
-                <span className="text-lg font-semibold text-foreground">
-                  {isLoading ? "–" : stats.total}
-                </span>
+          <div className="space-y-4 lg:sticky lg:top-6 lg:self-start">
+            {/* Activity Overview */}
+            <div className="bg-card rounded-2xl border border-border/50 p-5">
+              <div className="flex items-center gap-2 mb-4">
+                <Activity className="size-4 text-muted-foreground" />
+                <h3 className="font-semibold text-foreground text-sm">
+                  {t.deployments.sidebar.overview.pageTitle}
+                </h3>
               </div>
 
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <div className="w-8 h-8 rounded-lg bg-emerald-500/10 flex items-center justify-center">
-                    <CheckCircle2 className="size-4 text-emerald-500" />
-                  </div>
-                  <span className="text-sm text-muted-foreground">{t.deployments.sidebar.overview.successful}</span>
-                </div>
-                <span className="text-lg font-semibold text-foreground">
-                  {isLoading ? "–" : stats.success}
-                </span>
-              </div>
-
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <div className="w-8 h-8 rounded-lg bg-red-500/10 flex items-center justify-center">
-                    <XCircle className="size-4 text-red-500" />
-                  </div>
-                  <span className="text-sm text-muted-foreground">{t.deployments.sidebar.overview.failed}</span>
-                </div>
-                <span className="text-lg font-semibold text-foreground">
-                  {isLoading ? "–" : (stats.failed || 0) + (stats.canceled || 0)}
-                </span>
-              </div>
-
-              {activeCount > 0 && (
+              <div className="space-y-3">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
-                    <div className="w-8 h-8 rounded-lg bg-amber-500/10 flex items-center justify-center">
-                      <Loader2 className="size-4 text-amber-500 animate-spin" />
+                    <div className="w-8 h-8 rounded-lg bg-primary/10 flex items-center justify-center">
+                      <Rocket className="size-4 text-primary" />
                     </div>
-                    <span className="text-sm text-muted-foreground">{t.deployments.sidebar.overview.inProgress}</span>
+                    <span className="text-sm text-muted-foreground">
+                      {t.deployments.sidebar.overview.total}
+                    </span>
                   </div>
-                  <span className="text-lg font-semibold text-foreground">{activeCount}</span>
+                  <span className="text-lg font-semibold text-foreground">
+                    {isLoading ? "–" : stats.total}
+                  </span>
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <div className="w-8 h-8 rounded-lg bg-success-bg flex items-center justify-center">
+                      <CheckCircle2 className="size-4 text-success" />
+                    </div>
+                    <span className="text-sm text-muted-foreground">
+                      {t.deployments.sidebar.overview.successful}
+                    </span>
+                  </div>
+                  <span className="text-lg font-semibold text-foreground">
+                    {isLoading ? "–" : stats.success}
+                  </span>
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <div className="w-8 h-8 rounded-lg bg-danger-bg flex items-center justify-center">
+                      <XCircle className="size-4 text-danger" />
+                    </div>
+                    <span className="text-sm text-muted-foreground">
+                      {t.deployments.sidebar.overview.failed}
+                    </span>
+                  </div>
+                  <span className="text-lg font-semibold text-foreground">
+                    {isLoading ? "–" : failedCount}
+                  </span>
+                </div>
+
+                {activeCount > 0 && (
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <div className="w-8 h-8 rounded-lg bg-warning-bg flex items-center justify-center">
+                        <Loader2 className="size-4 text-warning animate-spin" />
+                      </div>
+                      <span className="text-sm text-muted-foreground">
+                        {t.deployments.sidebar.overview.inProgress}
+                      </span>
+                    </div>
+                    <span className="text-lg font-semibold text-foreground">{activeCount}</span>
+                  </div>
+                )}
+              </div>
+
+              {/* Success/failure proportion — at-a-glance fleet health, same
+                semantic colors as the stat rows above. */}
+              {!isLoading && stats.total > 0 && (
+                <div className="mt-4 flex h-1.5 overflow-hidden rounded-full bg-muted/40">
+                  {stats.success > 0 && (
+                    <div
+                      className="bg-success-solid"
+                      style={{ width: `${(stats.success / stats.total) * 100}%` }}
+                    />
+                  )}
+                  {failedCount > 0 && (
+                    <div
+                      className="bg-danger-solid"
+                      style={{ width: `${(failedCount / stats.total) * 100}%` }}
+                    />
+                  )}
+                  {activeCount > 0 && (
+                    <div
+                      className="bg-warning-solid"
+                      style={{ width: `${(activeCount / stats.total) * 100}%` }}
+                    />
+                  )}
                 </div>
               )}
             </div>
-          </div>
 
-          {/* Quick Tip */}
-          {deployments.length > 0 ? (
-            <div className="bg-gradient-to-br from-primary/5 via-primary/3 to-transparent rounded-2xl border border-primary/10 p-5">
-              <div className="flex items-center gap-2 mb-3">
-                <Zap className="size-4 text-primary" />
-                <h3 className="font-semibold text-foreground text-sm">{t.deployments.sidebar.autoDeploy.title}</h3>
-              </div>
-              <p className="text-sm text-muted-foreground leading-relaxed">
-                {t.deployments.sidebar.autoDeploy.description}
-              </p>
-              {!isProject && (
-                <Link
-                  href="/projects"
-                  className="inline-flex items-center gap-1 text-sm font-medium text-primary hover:text-primary/80 mt-3 transition-colors"
-                >
-                  {t.deployments.sidebar.autoDeploy.cta}
-                  <ArrowRight className="size-3.5 rtl:rotate-180" />
-                </Link>
-              )}
-            </div>
-          ) : (
-            <div className="bg-gradient-to-br from-primary/5 via-primary/3 to-transparent rounded-2xl border border-primary/10 p-5">
-              <div className="flex items-center gap-2 mb-3">
-                <Zap className="size-4 text-primary" />
-                <h3 className="font-semibold text-foreground text-sm">{t.deployments.sidebar.getStarted.title}</h3>
-              </div>
-              <p className="text-sm text-muted-foreground leading-relaxed">
-                {t.deployments.sidebar.getStarted.description}
-              </p>
-              <Link
-                href="/library"
-                className="inline-flex items-center gap-1 text-sm font-medium text-primary hover:text-primary/80 mt-3 transition-colors"
-              >
-                {t.deployments.sidebar.getStarted.cta}
-                <ArrowRight className="size-3.5 rtl:rotate-180" />
-              </Link>
-            </div>
-          )}
-
-          {/* Recent Deployments */}
-          <div className="bg-card rounded-2xl border border-border/50 p-5">
-            <div className="flex items-center gap-2 mb-4">
-              <Clock className="size-4 text-muted-foreground" />
-              <h3 className="font-semibold text-foreground text-sm">{t.deployments.sidebar.recent.title}</h3>
-            </div>
-
-            {isLoading ? (
-              <div className="space-y-3">
-                {[...Array(3)].map((_, i) => (
-                  <div key={i} className="flex items-center gap-3 animate-pulse">
-                    <div className="w-2 h-2 rounded-full bg-muted" />
-                    <div className="flex-1 h-4 bg-muted rounded" />
-                  </div>
-                ))}
-              </div>
-            ) : recentDeployments.length === 0 ? (
-              <div className="text-center py-4">
-                <div className="w-10 h-10 rounded-xl bg-muted/50 flex items-center justify-center mx-auto mb-3">
-                  <Clock className="size-4 text-muted-foreground/50" />
+            {/* Quick Tip */}
+            {deployments.length > 0 ? (
+              <div className="bg-gradient-to-br from-primary/5 via-primary/3 to-transparent rounded-2xl border border-primary/10 p-5">
+                <div className="flex items-center gap-2 mb-3">
+                  <Zap className="size-4 text-primary" />
+                  <h3 className="font-semibold text-foreground text-sm">
+                    {t.deployments.sidebar.autoDeploy.title}
+                  </h3>
                 </div>
-                <p className="text-xs text-muted-foreground/70">
-                  {t.deployments.sidebar.recent.empty}
+                <p className="text-sm text-muted-foreground leading-relaxed">
+                  {t.deployments.sidebar.autoDeploy.description}
                 </p>
+                {!isProject && (
+                  <Link
+                    href="/projects"
+                    className="inline-flex items-center gap-1 text-sm font-medium text-primary hover:text-primary/80 mt-3 transition-colors"
+                  >
+                    {t.deployments.sidebar.autoDeploy.cta}
+                    <ArrowRight className="size-3.5 rtl:rotate-180" />
+                  </Link>
+                )}
               </div>
             ) : (
-              <div className="space-y-2.5">
-                {recentDeployments.map((d) => (
-                  <Link
-                    key={d.id}
-                    href={`/build/${d.id}`}
-                    className="flex items-center gap-3 group"
-                  >
-                    <span
-                      className={`w-2 h-2 rounded-full shrink-0 ${
-                        d.status === "success" ? "bg-emerald-500" :
-                        d.status === "failed" ? "bg-red-500" :
-                        d.status === "building" ? "bg-amber-500" :
-                        "bg-muted-foreground/40"
-                      }`}
-                    />
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm text-foreground truncate group-hover:text-primary transition-colors">
-                        {d.projectName || t.deployments.sidebar.recent.unknown}
-                      </p>
-                      <p className="text-xs text-muted-foreground">
-                        {formatDistanceToNow(new Date(d.createdAt), t.deployments.time)}
-                      </p>
-                    </div>
-                  </Link>
-                ))}
+              <div className="bg-gradient-to-br from-primary/5 via-primary/3 to-transparent rounded-2xl border border-primary/10 p-5">
+                <div className="flex items-center gap-2 mb-3">
+                  <Zap className="size-4 text-primary" />
+                  <h3 className="font-semibold text-foreground text-sm">
+                    {t.deployments.sidebar.getStarted.title}
+                  </h3>
+                </div>
+                <p className="text-sm text-muted-foreground leading-relaxed">
+                  {t.deployments.sidebar.getStarted.description}
+                </p>
+                <Link
+                  href="/library"
+                  className="inline-flex items-center gap-1 text-sm font-medium text-primary hover:text-primary/80 mt-3 transition-colors"
+                >
+                  {t.deployments.sidebar.getStarted.cta}
+                  <ArrowRight className="size-3.5 rtl:rotate-180" />
+                </Link>
               </div>
             )}
           </div>
-        </div>
         )}
       </div>
     </div>

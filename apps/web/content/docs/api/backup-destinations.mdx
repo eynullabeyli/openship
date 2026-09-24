@@ -1,0 +1,190 @@
+---
+title: Backup destinations
+description: Configure and verify storage for backups.
+---
+
+import { TypeTable } from 'fumadocs-ui/components/type-table';
+
+A backup destination is a reusable storage target — an S3-compatible bucket, an SFTP server, a local
+filesystem path, or another Openship server — that [backup policies](/docs/api/backups) write their archives
+to. This API creates and manages those targets and runs a **preflight** that proves a destination is
+actually reachable (it writes, reads back, and deletes a probe object). Credentials are encrypted at rest;
+serialized destinations never return secret values, only `hasX` flags showing which are configured.
+
+This module is available on both self-hosted and cloud instances. The `local` destination kind is
+self-hosted only — it is rejected in cloud mode and, on self-hosted, must be explicitly enabled (see below).
+
+## Create a destination
+
+<Tabs items={['SDK', 'REST API']} groupId="api-transport" persist>
+<Tab value="SDK">
+
+```ts
+const result = await ship.backupDestinations.create({
+  name: "prod-s3",
+  kind: "s3_compatible",
+  bucket: "my-backups",
+  region: "us-east-1",
+  accessKeyId: "AKIA...",
+  secretAccessKey: "...",
+});
+console.log(result);
+```
+
+</Tab>
+<Tab value="REST API">
+
+```bash
+curl -X POST "$OPENSHIP_URL/api/backup-destinations" \
+  -H "Authorization: Bearer $OPENSHIP_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"prod-s3","kind":"s3_compatible","bucket":"my-backups","region":"us-east-1","accessKeyId":"AKIA...","secretAccessKey":"..."}'
+```
+
+</Tab>
+</Tabs>
+
+<TypeTable
+  type={{
+    name: { type: 'string', description: 'Display name, unique within the org (max 80 chars).', required: true },
+    kind: { type: "'s3_compatible' | 'sftp' | 'openship_server' | 'local'", description: 'Storage backend. Determines which other fields are required.', required: true },
+    endpoint: { type: 'string | null', description: 'S3 endpoint URL, or the absolute filesystem path for a local destination.' },
+    region: { type: 'string | null', description: 'S3 region.' },
+    bucket: { type: 'string | null', description: 'S3 bucket name. Required for s3_compatible.' },
+    pathPrefix: { type: 'string | null', description: 'Key/path prefix under which archives are stored.' },
+    sshHost: { type: 'string | null', description: 'SFTP host. Required for sftp.' },
+    sshPort: { type: 'number | null', description: 'SFTP port.' },
+    sshUser: { type: 'string | null', description: 'SFTP username. Required for sftp.' },
+    serverId: { type: 'string | null', description: "An existing server's ID to reuse. Required for openship_server; must belong to your org." },
+    accessKeyId: { type: 'string | null', description: 'S3 access key ID. Required (with secret) for s3_compatible.' },
+    secretAccessKey: { type: 'string | null', description: 'S3 secret access key. Stored encrypted.' },
+    sftpPassword: { type: 'string | null', description: 'SFTP password. Provide this or sftpPrivateKey. Stored encrypted.' },
+    sftpPrivateKey: { type: 'string | null', description: 'SFTP private key (raw PEM). Provide this or sftpPassword. Stored encrypted.' },
+    sftpKeyPassphrase: { type: 'string | null', description: 'Passphrase for the SFTP private key. Stored encrypted.' },
+    isDefault: { type: 'boolean', description: "Mark as the org's default destination.", default: 'false' },
+  }}
+/>
+
+Required fields depend on `kind`:
+
+- **`s3_compatible`** — `bucket`, `accessKeyId`, and `secretAccessKey`.
+- **`sftp`** — `sshHost`, `sshUser`, and one of `sftpPassword` / `sftpPrivateKey`.
+- **`openship_server`** — `serverId` (a server in your org).
+- **`local`** — `endpoint` (an absolute path inside `BACKUP_LOCAL_ROOT`).
+
+## Update a destination
+
+Send only the fields you want to change. For credentials, `undefined` (omitted) leaves the stored value
+unchanged, `null` clears it, and a string replaces it. The `kind` cannot be changed after creation.
+
+<Tabs items={['SDK', 'REST API']} groupId="api-transport" persist>
+<Tab value="SDK">
+
+```ts
+const result = await ship.backupDestinations.update("bkd_123", {
+  pathPrefix: "nightly/",
+  isDefault: true,
+});
+console.log(result);
+```
+
+</Tab>
+<Tab value="REST API">
+
+```bash
+curl -X PATCH "$OPENSHIP_URL/api/backup-destinations/bkd_123" \
+  -H "Authorization: Bearer $OPENSHIP_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"pathPrefix":"nightly/","isDefault":true}'
+```
+
+</Tab>
+</Tabs>
+
+<TypeTable
+  type={{
+    name: { type: 'string', description: 'New display name (max 80 chars).' },
+    endpoint: { type: 'string | null', description: 'S3 endpoint URL, or absolute path for local kind (re-validated against BACKUP_LOCAL_ROOT).' },
+    region: { type: 'string | null', description: 'S3 region.' },
+    bucket: { type: 'string | null', description: 'S3 bucket name.' },
+    pathPrefix: { type: 'string | null', description: 'Key/path prefix.' },
+    sshHost: { type: 'string | null', description: 'SFTP host.' },
+    sshPort: { type: 'number | null', description: 'SFTP port.' },
+    sshUser: { type: 'string | null', description: 'SFTP username.' },
+    accessKeyId: { type: 'string | null', description: 'S3 access key ID. undefined = keep, null = clear, string = replace.' },
+    secretAccessKey: { type: 'string | null', description: 'S3 secret access key. undefined = keep, null = clear, string = replace.' },
+    sftpPassword: { type: 'string | null', description: 'SFTP password. undefined = keep, null = clear, string = replace.' },
+    sftpPrivateKey: { type: 'string | null', description: 'SFTP private key. undefined = keep, null = clear, string = replace.' },
+    sftpKeyPassphrase: { type: 'string | null', description: 'SFTP key passphrase. undefined = keep, null = clear, string = replace.' },
+    isDefault: { type: 'boolean', description: "Mark as the org's default destination." },
+  }}
+/>
+
+## Preflight (verify connectivity)
+
+Proves the destination works by writing, reading back, and deleting a small probe object. On success it
+stamps `lastVerifiedAt`; on failure it records the error in `lastVerifyError`.
+
+<Tabs items={['SDK', 'REST API']} groupId="api-transport" persist>
+<Tab value="SDK">
+
+```ts
+const result = await ship.backupDestinations.preflight("bkd_123");
+console.log(result);
+```
+
+</Tab>
+<Tab value="REST API">
+
+```bash
+curl -X POST "$OPENSHIP_URL/api/backup-destinations/bkd_123/preflight" \
+  -H "Authorization: Bearer $OPENSHIP_TOKEN"
+```
+
+</Tab>
+</Tabs>
+
+<Callout title="A failed check is still a 200" type="info">
+Preflight returns `200` with `{"ok": false, "reason": "..."}` when the target is unreachable or
+misconfigured — the reason (bad credentials, DNS failure, permission denied) is in the body, not the HTTP
+status. A `404` here means the `:id` doesn't belong to your organization.
+</Callout>
+
+## Errors
+
+<Callout title="400 — validation failed" type="warn">
+The body is missing a field required for its `kind` (e.g. an S3 destination without a `bucket` or
+credentials), the `name` is blank / over 80 chars or duplicates an existing destination, or you passed an
+unsupported `kind`. `http_upload` is defined but not yet supported.
+</Callout>
+
+<Callout title="400 — local destinations disabled" type="warn">
+A `local` destination requires `BACKUP_ALLOW_LOCAL_DESTINATION=true` and a configured `BACKUP_LOCAL_ROOT`,
+and the `endpoint` must resolve to an absolute path inside that root. Both the root and the endpoint are
+symlink-resolved before the check, so a symlink that escapes the root is rejected. `BACKUP_LOCAL_ROOT`
+itself must be a dedicated directory — not `/`, `/var`, `/var/lib`, Openship's own state directory, or
+anything inside a system tree such as `/etc` or `/var/lib/docker`. Local destinations are always rejected
+in cloud mode.
+</Callout>
+
+<Callout title="404 on a per-destination route" type="error">
+The `:id` doesn't belong to your organization (or was deleted). List your destinations with
+`GET /api/backup-destinations` to get valid IDs.
+</Callout>
+
+## Operations
+
+{/* api-operations:start */}
+
+| Operation | SDK | REST API |
+| --- | --- | --- |
+| List backup storage destinations. | `backupDestinations.list()` | `GET /api/backup-destinations`<br />`backup_destination:list` |
+| Create a backup destination. | `backupDestinations.create(input)` | `POST /api/backup-destinations`<br />`backup_destination:write` |
+| Test destination configuration before saving it. | `backupDestinations.preflightDraft(input)` | `POST /api/backup-destinations/preflight`<br />`backup_destination:write` |
+| Read a destination with credentials protected. | `backupDestinations.get(id)` | `GET /api/backup-destinations/:id`<br />`backup_destination:read` |
+| Read destination storage usage. | `backupDestinations.usage(id)` | `GET /api/backup-destinations/:id/usage`<br />`backup_destination:read` |
+| Update destination settings. | `backupDestinations.update(id, input)` | `PATCH /api/backup-destinations/:id`<br />`backup_destination:write` |
+| Remove an eligible destination. | `backupDestinations.remove(id)` | `DELETE /api/backup-destinations/:id`<br />`backup_destination:admin` |
+| Test a saved destination and record its verification state. | `backupDestinations.preflight(id)` | `POST /api/backup-destinations/:id/preflight`<br />`backup_destination:write` |
+
+{/* api-operations:end */}

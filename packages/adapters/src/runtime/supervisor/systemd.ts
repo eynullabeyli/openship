@@ -13,15 +13,35 @@
  * Unit location: /etc/systemd/system/ (standard for admin-created units)
  */
 
-import type { CommandExecutor, LogEntry, LogCallback } from "../../types";
+import type { CommandExecutor, LogEntry, LogCallback, ResourceUsage } from "../../types";
 import type { ProcessSupervisor, SupervisorDeployOpts } from "./types";
+import { sampleBareUsage, ZERO_USAGE } from "./usage";
 import { sq, parseLogLevel } from "../build-pipeline";
-import { probeListeningPort } from "../port-conflict";
+import { portOccupantDetails, probeListeningPort } from "../port-conflict";
+import { managedDeploymentUnitName } from "../../system/port-owner";
 import { execReliable } from "../../system/remote-journal";
 import { DeployError } from "@repo/core";
 
-/** Prefix for all openship systemd units */
-const UNIT_PREFIX = "openship";
+/**
+ * Escape an env value for a double-quoted systemd `Environment=` assignment.
+ *
+ * `Environment=` takes a SPACE-SEPARATED list of assignments, so an unquoted
+ * value is cut at its first space. Quoting fixes that, and inside the quotes
+ * systemd applies C-style escapes plus `%` specifier expansion — so `"`, `\`
+ * and `%` have to be escaped, and a literal newline (which would otherwise
+ * inject raw lines into the unit) is encoded as `\n`.
+ *
+ * Backslash is replaced first so the escapes introduced below aren't re-escaped.
+ */
+export function escapeSystemdEnvValue(value: string): string {
+  return value
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/%/g, "%%")
+    .replace(/\n/g, "\\n")
+    .replace(/\r/g, "\\r")
+    .replace(/\t/g, "\\t");
+}
 
 export class SystemdSupervisor implements ProcessSupervisor {
   readonly name = "systemd";
@@ -34,7 +54,7 @@ export class SystemdSupervisor implements ProcessSupervisor {
   // ── Helpers ──────────────────────────────────────────────────────────
 
   private unitName(deploymentId: string): string {
-    return `${UNIT_PREFIX}-${deploymentId}.service`;
+    return managedDeploymentUnitName(deploymentId);
   }
 
   private unitPath(deploymentId: string): string {
@@ -67,13 +87,14 @@ export class SystemdSupervisor implements ProcessSupervisor {
    * Build a systemd unit file contents string.
    *
    * Uses Type=exec so systemd tracks the actual process (not the shell wrapper).
-   * Environment vars are set via Environment= directives (one per line)
-   * which avoids any shell quoting issues.
+   * Environment vars are set via Environment= directives (one per line), which
+   * avoids any SHELL quoting issues - but systemd does its own parsing, so each
+   * assignment is double-quoted and escaped (see escapeSystemdEnvValue).
    */
   private buildUnitFile(opts: SupervisorDeployOpts): string {
     const envLines = Object.entries(opts.env)
       .filter(([key]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(key))
-      .map(([k, v]) => `Environment=${k}=${v}`)
+      .map(([k, v]) => `Environment="${k}=${escapeSystemdEnvValue(v)}"`)
       .join("\n");
 
     return `[Unit]
@@ -89,7 +110,7 @@ Restart=on-failure
 RestartSec=3
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=${UNIT_PREFIX}-${opts.deploymentId}
+SyslogIdentifier=${this.unitName(opts.deploymentId).replace(/\.service$/, "")}
 
 [Install]
 WantedBy=multi-user.target
@@ -139,16 +160,7 @@ WantedBy=multi-user.target
             (occupant ? ` by ${occupant.command}` : "") +
             ". Stop the existing process before deploying.",
           "PORT_IN_USE",
-          {
-            port: opts.port,
-            pid: occupant?.pid,
-            command: occupant?.command,
-            rawCommand: occupant?.rawCommand,
-            systemdUnit: occupant?.systemdUnit,
-            systemdDescription: occupant?.systemdDescription,
-            deploymentId: occupant?.deploymentId,
-            isManagedDeployment: occupant?.isManagedDeployment,
-          },
+          portOccupantDetails(opts.port, occupant),
         );
       }
 
@@ -171,6 +183,10 @@ WantedBy=multi-user.target
   async start(deploymentId: string): Promise<void> {
     const unitName = this.unitName(deploymentId);
     await this.executor.exec(`systemctl start ${sq(unitName)}`);
+  }
+
+  async canStart(deploymentId: string): Promise<boolean> {
+    return this.executor.exists(this.unitPath(deploymentId));
   }
 
   async restart(deploymentId: string): Promise<void> {
@@ -210,6 +226,34 @@ WantedBy=multi-user.target
       return result.trim() === "active";
     } catch {
       return false;
+    }
+  }
+
+  /**
+   * Usage for the unit. Prefers the unit's cgroup, which accounts for the whole
+   * process tree — a `npm start` that forks the real server would otherwise report
+   * only the wrapper's near-zero usage.
+   *
+   * `MainPID` is fetched as the fallback identity (and as the liveness check) for a
+   * host without a readable cgroup; the probe picks the tier itself. `--value` is
+   * used so a stopped unit yields "0" rather than a `MainPID=0` line to parse.
+   */
+  async getUsage(deploymentId: string): Promise<ResourceUsage> {
+    const unitName = this.unitName(deploymentId);
+    try {
+      const out = await this.executor.exec(
+        `systemctl show ${sq(unitName)} -p MainPID --value 2>/dev/null || true`,
+      );
+      const pid = Number.parseInt(out.trim(), 10);
+      if (!Number.isFinite(pid) || pid <= 0) return { ...ZERO_USAGE };
+      return sampleBareUsage(this.executor, pid, [
+        // Where systemd places a unit started from /etc/systemd/system. The delegate
+        // path appears when the unit sets Delegate=yes; harmless to probe either way.
+        `/sys/fs/cgroup/system.slice/${unitName}`,
+        `/sys/fs/cgroup/system.slice/${unitName}/init.scope`,
+      ]);
+    } catch {
+      return { ...ZERO_USAGE };
     }
   }
 

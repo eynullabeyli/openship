@@ -1,11 +1,11 @@
 "use client";
 
-import { Suspense, useState } from "react";
+import { Suspense, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { signIn } from "@/lib/auth-client";
 import { useToast } from "@/components/toast";
-import { useI18n } from "@/components/i18n-provider";
+import { useI18n, interpolate } from "@/components/i18n-provider";
 import { useAuthContext } from "../providers";
 import { AuthShell } from "@/components/auth-shell";
 import { OAuthButtons } from "@/components/oauth-buttons";
@@ -14,7 +14,15 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Eye, EyeOff, Loader2, ExternalLink } from "lucide-react";
 import { isNetworkError } from "@/lib/api";
+import { getApiBaseUrl } from "@/lib/api/client";
 import { getApiOrigin } from "@/lib/api/urls";
+import {
+  clearZeroAuthAttempt,
+  markZeroAuthAttempt,
+  readZeroAuthAttempt,
+  resolveZeroAuthLogin,
+  type ZeroAuthDecision,
+} from "@/lib/zero-auth";
 import {
   buildAuthPageHref,
   buildDesktopAuthorizeUrl,
@@ -54,14 +62,52 @@ function LoginPageInner() {
 
   const postLoginUrl = getPostAuthRedirect(searchParams);
 
+  // Zero-auth mode has no form — the page exists only to bounce the browser at
+  // desktop-login. Decide that BEFORE navigating, so a browser the server will
+  // never mint a session for is told why instead of being sent to its own
+  // loopback address (#484).
+  const zeroAuth = useMemo<ZeroAuthDecision>(() => {
+    if (authMode !== "none") return { action: "wait" };
+    return resolveZeroAuthLogin({
+      pageOrigin: typeof window !== "undefined" ? window.location.origin : undefined,
+      // The same base every other API call uses: correct under the single-port
+      // proxy and on the desktop's dynamic port, both of which a target-table
+      // lookup of window.location gets wrong.
+      apiBaseUrl: getApiBaseUrl(),
+      attemptedAt: readZeroAuthAttempt(),
+      now: Date.now(),
+    });
+  }, [authMode]);
+
+  useEffect(() => {
+    if (zeroAuth.action !== "redirect") return;
+    markZeroAuthAttempt(Date.now());
+    window.location.href = zeroAuth.url;
+  }, [zeroAuth]);
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setLoading(true);
     try {
       const result = await signIn.email({ email, password });
       if (result.error) {
-        toast("error", result.error.message ?? t.auth.errors.invalidCredentials);
-      } else if (postLoginUrl) {
+        // Sign-in is blocked until the email is verified (SaaS requires it).
+        // Route to the verify page (resend + status) instead of a dead-end toast.
+        const err = result.error;
+        if (err.code === "EMAIL_NOT_VERIFIED" || err.message?.toLowerCase().includes("verify")) {
+          router.push(`/verify-email?email=${encodeURIComponent(email)}`);
+          return; // navigating away — keep the spinner until this page unmounts
+        }
+        // Stayed on the login page → stop the spinner so they can retry.
+        toast("error", err.message ?? t.auth.errors.invalidCredentials);
+        setLoading(false);
+        return;
+      }
+      // Success → navigate. Deliberately DO NOT clear loading: router.push only
+      // *starts* the client transition, and the dashboard takes a moment to
+      // render. Keeping the button in its loading state until this page unmounts
+      // avoids the dead "idle button, no navigation yet" gap.
+      if (postLoginUrl) {
         window.location.href = postLoginUrl;
       } else {
         router.push("/");
@@ -70,8 +116,7 @@ function LoginPageInner() {
       toast("error", isNetworkError(err)
         ? t.auth.errors.serverUnreachable
         : t.auth.errors.generic);
-    } finally {
-      setLoading(false);
+      setLoading(false); // stayed on the page — re-enable the form
     }
   }
 
@@ -106,12 +151,47 @@ function LoginPageInner() {
 
   /* ── Zero-auth mode (desktop): auto-redirect to create session ── */
   if (authMode === "none") {
-    const apiUrl = getApiOrigin(typeof window !== "undefined" ? window.location.origin : undefined);
-    // Redirect to the desktop-login endpoint which creates a real
-    // session cookie and redirects back to the dashboard.
-    if (typeof window !== "undefined") {
-      window.location.href = `${apiUrl}/api/auth/desktop-login`;
+    if (zeroAuth.action === "explain") {
+      const pageOrigin = typeof window !== "undefined" ? window.location.origin : "";
+      return (
+        <AuthShell onBack={handleBack}>
+          <div className="text-center">
+            <h1 className="text-xl font-semibold tracking-tight text-foreground">
+              {t.auth.zeroAuth.title}
+            </h1>
+            <p className="mt-2 text-sm text-muted-foreground">
+              {zeroAuth.reason === "remote_browser"
+                ? interpolate(t.auth.zeroAuth.remoteBrowser, { origin: pageOrigin })
+                : t.auth.zeroAuth.refused}
+            </p>
+          </div>
+
+          <div className="mt-6 rounded-xl border border-warning-border bg-warning-bg p-4 text-start">
+            <p className="text-sm text-warning">{t.auth.zeroAuth.remedy}</p>
+            <code
+              dir="ltr"
+              className="mt-2 block rounded-md bg-background/60 px-2 py-1.5 font-mono text-xs text-foreground"
+            >
+              OPENSHIP_AUTH_MODE=local
+            </code>
+            <p className="mt-2 text-sm text-warning">{t.auth.zeroAuth.remedyAdmin}</p>
+          </div>
+
+          <Button
+            variant="outline"
+            className="mt-4 w-full"
+            onClick={() => {
+              clearZeroAuthAttempt();
+              window.location.reload();
+            }}
+          >
+            {t.auth.zeroAuth.retry}
+          </Button>
+        </AuthShell>
+      );
     }
+    // Redirecting (see the effect above) — or server-rendering, where there's no
+    // origin to judge yet.
     return (
       <AuthShell>
         <div className="flex items-center justify-center py-8">
@@ -231,15 +311,21 @@ function LoginPageInner() {
       {/* OAuth only for SaaS (cloud-hosted) - hidden on self-hosted */}
       {!selfHosted && <OAuthButtons callbackURL={postLoginUrl ?? "/"} />}
 
-      <p className="mt-8 text-center text-sm text-muted-foreground">
-        {t.auth.login.noAccount}{" "}
-        <Link
-          href={buildAuthPageHref("/register", searchParams)}
-          className="font-medium text-foreground transition-colors hover:underline"
-        >
-          {t.auth.login.createOne}
-        </Link>
-      </p>
+      {/* Public sign-up is a SaaS-only front door. On a self-hosted instance the
+          only account is the CLI-created admin; everyone else joins via an
+          invitation link (server also enforces invite-only signup), so there's
+          no public "create account" entry here. */}
+      {!selfHosted && (
+        <p className="mt-8 text-center text-sm text-muted-foreground">
+          {t.auth.login.noAccount}{" "}
+          <Link
+            href={buildAuthPageHref("/register", searchParams)}
+            className="font-medium text-foreground transition-colors hover:underline"
+          >
+            {t.auth.login.createOne}
+          </Link>
+        </p>
+      )}
     </AuthShell>
   );
 }

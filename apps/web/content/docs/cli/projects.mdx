@@ -1,0 +1,79 @@
+---
+title: Projects, services, and domains
+description: Manage application configuration and related resources from the CLI.
+---
+
+Resource commands use the active [connection context](/docs/cli/access) or your selected
+[native configuration](/docs/cli/native).
+
+## Projects
+
+```bash
+openship project list
+openship project create --name my-app --git-owner my-team --git-repo my-app
+openship project get proj_123
+openship project rename proj_123 "My application"
+openship init --project proj_123
+```
+
+`project rename` updates the display name through the same operation as the dashboard.
+The project ID, slug, volumes, and live routes keep their existing identities. Manage hostnames
+with the domain commands below.
+
+`init` writes a project link in `.openship/project.json`. This is different from `openship.json`, which
+declares deployment configuration:
+
+```bash
+openship config init
+openship config validate
+```
+
+See [project commands](/docs/cli/reference/project), [link options](/docs/cli/reference/init), and
+[configuration commands](/docs/cli/reference/config).
+
+## Environment and source settings
+
+```bash
+openship project env get proj_123
+openship project git branch proj_123 main
+openship project sleep-mode proj_123 always_on
+```
+
+Use the project reference for environment writes, auto-deploy, release images, logs, and project
+teardown. [Environment variables](/docs/guides/environment-variables) explains secret handling and
+when changes reach a running application.
+
+## Services
+
+```bash
+openship service list --project proj_123
+openship service get svc_123 --project proj_123
+openship service logs svc_123 --project proj_123 --follow
+```
+
+Services belong to a project. Supply `--project` or use a linked directory. The [service reference](/docs/cli/reference/service)
+covers creation, Compose synchronization, drift decisions, environment variables, runtime controls, and execution.
+
+## Domains
+
+```bash
+openship domain add app.example.com --project proj_123
+openship domain records dom_123
+openship domain verify dom_123
+openship domain verify-ssl dom_123
+```
+
+Follow the returned DNS instructions before verification. See [domain options](/docs/cli/reference/domain)
+and the [custom-domain guide](/docs/guides/custom-domains) for DNS providers, TLS, and primary domains.
+
+## Catalog apps
+
+```bash
+openship app list
+openship app get postgres
+openship app host-fit postgres --server srv_123
+```
+
+`app install` creates an installation draft. Deploy the returned project ID with `openship deploy`.
+Custom app definitions, curated settings, and connection details are covered in the
+[app reference](/docs/cli/reference/app).

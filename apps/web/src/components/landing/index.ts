@@ -1,6 +1,6 @@
 export { Navbar } from "./navbar";
 export { Hero } from "./hero";
-export { Features } from "./features";
+export { SystemMap } from "./system-map";
 export { HowItWorks } from "./how-it-works";
 export { Dashboard } from "./dashboard";
 export { DeploymentModels } from "./deployment-models";
@@ -10,5 +10,4 @@ export { Comparison } from "./comparison";
 export { OpenSource } from "./open-source";
 export { FinalCta } from "./final-cta";
 export { DarkSection } from "./dark-section";
-export { Pricing } from "./pricing";
 export { Footer } from "./footer";

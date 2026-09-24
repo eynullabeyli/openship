@@ -123,7 +123,7 @@ export function FolderUpload() {
                 className="flex flex-col items-center gap-3 p-5 rounded-xl border border-border/50 bg-background hover:bg-muted/40 hover:border-border transition-all group"
               >
                 <div className="w-10 h-10 rounded-xl bg-muted/60 flex items-center justify-center group-hover:scale-105 transition-transform">
-                  {fw.icon("hsl(var(--foreground))")}
+                  {fw.icon("var(--foreground)")}
                 </div>
                 <span className="text-sm font-medium text-foreground">{fw.name}</span>
               </button>
@@ -147,7 +147,7 @@ export function FolderUpload() {
           </button>
         )}
         <div className="w-9 h-9 bg-muted/60 rounded-xl flex items-center justify-center">
-          {stack.icon("hsl(var(--foreground))")}
+          {stack.icon("var(--foreground)")}
         </div>
         <div>
           <h2 className="font-semibold text-foreground text-[15px]">{interpolate(t.library.folderUpload.uploadTitle, { stack: stack.name })}</h2>
@@ -221,9 +221,9 @@ export function FolderUpload() {
         )}
 
         {error && (
-          <div className="flex items-center gap-2 px-3 py-2 rounded-lg mt-3 bg-red-500/10 border border-red-500/20">
-            <AlertCircle className="size-4 shrink-0 text-red-500" />
-            <p className="text-xs text-red-500">{error}</p>
+          <div className="flex items-center gap-2 px-3 py-2 rounded-lg mt-3 bg-danger-bg border border-danger-border">
+            <AlertCircle className="size-4 shrink-0 text-danger" />
+            <p className="text-xs text-danger">{error}</p>
           </div>
         )}
       </div>

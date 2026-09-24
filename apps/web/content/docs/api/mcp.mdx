@@ -1,0 +1,146 @@
+---
+title: MCP
+description: Call Openship tools through Model Context Protocol.
+---
+
+import { TypeTable } from 'fumadocs-ui/components/type-table';
+
+The MCP API is a single **Model Context Protocol** endpoint that lets AI agents (Claude, Cursor, and any
+MCP-compatible client) drive Openship as a set of tools. Each tool maps onto a permission-tagged REST route,
+and every call re-runs the full auth and permission stack — so an agent only ever sees and does what its
+token allows. For client setup (OAuth flow, config snippets), see the [MCP overview](/docs/mcp).
+
+Available on both self-hosted and Openship Cloud (mounted in the shared route set).
+
+## How authentication works
+
+A missing or invalid bearer returns **`401`** with a `WWW-Authenticate` header pointing at
+`/.well-known/oauth-protected-resource`, so OAuth-2.1 MCP clients can discover the authorization server and
+start the PKCE flow. A valid credential resolves the caller's effective capability — this is used only to
+**filter `tools/list`** so the endpoint doesn't advertise tools the token can't use.
+
+The capability is **not** the authorization gate. Every `tools/call` builds an internal HTTP request and
+dispatches it through the real Hono app, forwarding the caller's bearer, so routing, validation, auth, and
+the per-resource permission check all run exactly as they do over HTTP. A read-only token can only reach
+read tools; a scoped token stays confined to the projects, servers, and repositories it was granted.
+
+The endpoint is rate-limited per-IP (the `mcp` policy: 300 requests/minute) because even an unauthenticated
+probe costs a credential lookup.
+
+## Request body (JSON-RPC 2.0 envelope)
+
+The `POST` body is a single JSON-RPC 2.0 message (batching was removed in protocol `2025-06-18` — an array
+body returns `-32600`).
+
+<TypeTable
+  type={{
+    jsonrpc: { type: 'string', description: 'Protocol identifier. Must be "2.0".', required: true },
+    method: { type: 'string', description: 'One of: initialize, ping, tools/list, tools/call, notifications/initialized.', required: true },
+    id: { type: 'string | number', description: 'Request id, echoed back in the response. Omit entirely for a notification — the server replies 202 with no body.' },
+    params: { type: 'object', description: 'Method arguments — e.g. { protocolVersion } for initialize, { name, arguments } for tools/call.' },
+  }}
+/>
+
+### Methods
+
+| Method | Result |
+|---|---|
+| `initialize` | Negotiates the protocol version (default `2025-06-18`; also speaks `2025-03-26` and `2024-11-05`) and returns `capabilities: { tools: { listChanged: false }, prompts: { listChanged: false } }` and `serverInfo: { name: "openship", version: "1.0.0" }`. |
+| `ping` | Returns `{}`. |
+| `tools/list` | Returns the tools the caller's token can actually use (filtered by read-only flag, role, and grants). |
+| `tools/call` | Dispatches the named tool through the real API and returns its response as JSON text content. |
+| `prompts/list` | Returns the guided-flow catalog — one entry per multi-step workflow (`openship-overview`, `deploy-from-git`, `deploy-a-folder`, `install-catalog-app`). |
+| `prompts/get` | Returns a named prompt's guidance as a user message, with tool references resolved to their live tool names and any `arguments` interpolated. |
+| `notifications/initialized` | Acknowledged only (notification, no reply → `202`). |
+
+## List available tools
+
+```
+POST /api/mcp
+```
+
+```bash
+curl -s "$OPENSHIP_URL/api/mcp" \
+  -H "Authorization: Bearer $OPENSHIP_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+The tool set is derived from Openship's permission-tagged routes that opt in with an `mcp` block; the
+credential/auth surfaces (`tokens`, `auth`, `mcp` itself) are never exposed.
+
+## Call a tool
+
+`params.name` is the tool name from `tools/list`; `params.arguments` carries any path parameters, an optional
+`query` object, an optional `body` object (for `POST`/`PUT`/`PATCH` tools), and an optional
+`organizationId` (sent as the `x-organization-id` header).
+
+```bash
+curl -s "$OPENSHIP_URL/api/mcp" \
+  -H "Authorization: Bearer $OPENSHIP_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call",
+       "params":{"name":"get_projects","arguments":{}}}'
+```
+
+The result wraps the underlying API response as text content, with `isError: true` when the dispatched
+request failed.
+
+## Guided flows (prompts)
+
+`tools/list` is flat — it tells an agent what each tool does, one call at a time, but not how the multi-step
+flows chain together. The **prompts** catalog fills that gap: each prompt is a short, ordered playbook for a
+workflow, referencing the exact tool names to call in sequence. MCP clients surface them as slash-commands /
+starters, so they also serve as the discoverable entry points into a flow.
+
+```bash
+curl -s "$OPENSHIP_URL/api/mcp" \
+  -H "Authorization: Bearer $OPENSHIP_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":3,"method":"prompts/get",
+       "params":{"name":"deploy-from-git","arguments":{"repo":"acme/widgets"}}}'
+```
+
+| Prompt | What it walks you through |
+|---|---|
+| `openship-overview` | The tool groups, each flow's entry point, and how permission scoping (incl. per-repo GitHub grants) shapes what you can see and do. |
+| `deploy-from-git` | Connect/verify GitHub → pick a repo → detect the stack → create the project → deploy → watch. Optional `repo` / `branch` arguments. |
+| `deploy-a-folder` | The 4-step folder-upload flow, including the out-of-band tarball upload that is deliberately **not** an MCP tool (raw binary can't cross JSON-RPC). |
+| `install-catalog-app` | Browse the catalog → install → handle the `flowHref` that wizard apps (e.g. mail) return instead of installing in-band. |
+
+Prompt text resolves tool references against the live registry, so a renamed route never leaves a prompt
+pointing at a stale tool name.
+
+## Errors
+
+<Callout title="401 — missing or invalid access token" type="error">
+No bearer, or one that's expired/revoked. The response carries a `WWW-Authenticate` header so OAuth clients
+can start discovery; PAT clients should mint a fresh token with `openship token create`.
+</Callout>
+
+<Callout title="405 on GET /api/mcp" type="warn">
+Expected. This is a request/response server with no server→client stream, so `GET` is not supported — always
+`POST` your JSON-RPC message.
+</Callout>
+
+<Callout title="-32600 / -32700 — bad request" type="warn">
+`-32700` is a JSON parse error; `-32600` is an invalid envelope or a batch (array) body, which this server
+does not accept. `-32601` means the JSON-RPC method is unknown, and `-32602` means the tool name in
+`tools/call` doesn't exist.
+</Callout>
+
+<Callout title="A tool call returns 404 for a resource" type="info">
+`tools/list` succeeded but a specific `tools/call` reports `404` — that's the token's scope working as
+intended: it wasn't granted that project, server, or repository.
+</Callout>
+
+## Operations
+
+{/* api-operations:start */}
+
+| Operation | REST API |
+| --- | --- |
+| Returns `405` — this server never pushes messages, so there is no SSE stream to open. | `GET /api/mcp`<br />`Handler authentication` |
+| Stateless Streamable-HTTP JSON-RPC 2.0 endpoint. Authenticates the bearer itself, then handles `initialize`, `ping`, `tools/list`, and `tools/call`. | `POST /api/mcp`<br />`Handler authentication` |
+
+{/* api-operations:end */}

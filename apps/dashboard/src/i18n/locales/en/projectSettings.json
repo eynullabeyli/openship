@@ -4,6 +4,227 @@
     "save": "Save",
     "cancel": "Cancel"
   },
+  "appSource": {
+    "title": "Source",
+    "description": "This app deploys from a release — there's no repo to push to; updates ship as new versions.",
+    "sourceType": "Source",
+    "kindRelease": "Release",
+    "kindImage": "Container image",
+    "current": "Current version",
+    "latest": "Latest version",
+    "repository": "Repository",
+    "notChecked": "Not checked yet",
+    "upToDate": "Up to date",
+    "updateAvailable": "Update available",
+    "checkForUpdates": "Check for updates",
+    "checkFailed": "Couldn't check for updates",
+    "update": "Update",
+    "updateTo": "Update to {version}",
+    "updating": "Updating…",
+    "updateFailed": "Update failed",
+    "toastTitle": "Source",
+    "cliManaged": "This is the Openship control plane — it updates itself. Run \"openship update\" on the host to upgrade it; there's nothing to change here."
+  },
+  "releaseImageSource": {
+    "validationInvalid": "Invalid release image source.",
+    "toast": {
+      "saved": "Container release source saved.",
+      "saveFailed": "Could not save the container release source."
+    },
+    "status": {
+      "notDeployed": "Not deployed",
+      "checking": "Checking…",
+      "unavailable": "Unavailable"
+    },
+    "switchToImage": {
+      "title": "Switch to a prebuilt image source",
+      "description": "Saving replaces the current Git or local source for every environment. Existing deployments and rollback history remain available.",
+      "keep": "Keep current source"
+    },
+    "switchToGit": {
+      "title": "Switch to a Git source",
+      "description": "Nothing changes until you link a repository. Linking one replaces the tracked image source for every environment.",
+      "back": "Back to image source"
+    },
+    "entry": {
+      "shortButton": "Use prebuilt image",
+      "button": "Track a prebuilt container image",
+      "description": "Deploy a versioned registry image directly, without cloning or building a repository."
+    },
+    "summary": {
+      "title": "Tracked container image",
+      "badge": "Prebuilt",
+      "description": "Deploys a published image directly. No repository is cloned and no build command runs.",
+      "linkGit": "Link Git repository",
+      "image": "Image",
+      "versionSource": "Version source",
+      "githubReleases": "GitHub Releases",
+      "pinnedVersion": "Pinned version",
+      "currentVersion": "Current version",
+      "targetVersion": "Target version",
+      "latestVersion": "Latest version",
+      "updateAvailable": "Update available"
+    },
+    "editor": {
+      "trackingTitle": "Release tracking",
+      "configureTitle": "Configure prebuilt image",
+      "templateHint": "Use {tag} to preserve the publisher's exact tag, or {version} for the normalized version.",
+      "provider": "Version provider",
+      "githubTitle": "GitHub Releases",
+      "githubDescription": "Follow the latest published release tag.",
+      "urlTitle": "Version URL or pin",
+      "urlDescription": "Read a version endpoint or deploy a fixed version.",
+      "imageTemplate": "Image template",
+      "imagePlaceholder": "ghcr.io/acme/api:{tag}",
+      "githubRepository": "GitHub repository",
+      "repoPlaceholder": "owner/repository",
+      "versionUrl": "Version URL",
+      "versionUrlPlaceholder": "https://example.com/latest-version",
+      "versionUrlHint": "HTTPS endpoint returning text or JSON with version/tag_name.",
+      "pinnedVersion": "Pinned version",
+      "pinnedPlaceholder": "Optional, e.g. v2.4.1",
+      "pinnedHint": "Overrides the discovered latest version; leave blank to track updates.",
+      "appliesAll": "Changes apply to every environment in this project.",
+      "saving": "Saving…",
+      "save": "Save source"
+    }
+  },
+  "appSettings": {
+    "modeApp": "App settings",
+    "modeDeployment": "Deployment",
+    "saveChanges": "Save changes",
+    "saving": "Saving…",
+    "saved": "Settings saved",
+    "saveHint": "Save to store these changes — they apply the next time the app is deployed.",
+    "applyNow": "Apply now",
+    "applying": "Applying…",
+    "applied": "Applying changes",
+    "restartNote": "Apply now to restart the app with the new settings, or they take effect on the next deploy.",
+    "redeployNote": "Applying these changes recreates the app — you may need to re-authenticate its dashboard or CLI afterwards.",
+    "advancedShow": "Show advanced",
+    "advancedHide": "Hide advanced",
+    "secretSet": "Set — leave blank to keep the current value",
+    "loadError": "Couldn't load app settings.",
+    "saveFailed": "Couldn't save settings.",
+    "applyFailed": "Couldn't apply changes.",
+    "unmanaged": "This app has no configurable settings yet."
+  },
+  "appInstall": {
+    "install": "Install",
+    "installing": "Installing…",
+    "advanced": "Advanced deployment options",
+    "nameLabel": "Name",
+    "nameHint": "How this app appears in Openship.",
+    "domainTitle": "Where should it live?",
+    "domainFree": "Free subdomain",
+    "domainFreeHint": "A free subdomain on {domain}",
+    "domainCustom": "Your own domain",
+    "domainCustomPlaceholder": "app.example.com",
+    "domainNone": "No public URL",
+    "domainNoneHint": "Internal only — no public address.",
+    "customRequired": "Enter your domain, or pick another option.",
+    "progressPreparing": "Preparing…",
+    "progressDeploying": "Deploying…",
+    "progressLive": "Your app is live",
+    "openApp": "Open app",
+    "goToApp": "Go to app",
+    "installFailed": "Install failed",
+    "installFailedBody": "It stopped before everything was running. The technical details carry the full build log.",
+    "installCancelledSelf": "You stopped this install.",
+    "installCancelledBody": "The containers and images it had created were removed, and data volumes were kept — installing again reuses them. Anything already live was left alone.",
+    "settledAtPhase": "Stopped at {phase}",
+    "viewDetails": "View technical details",
+    "showLogs": "Show logs",
+    "hideLogs": "Hide logs",
+    "deployLogs": "deploy logs",
+    "logsWaiting": "Waiting for output…",
+    "logsEmpty": "No output was captured.",
+    "back": "Back",
+    "phaseImages": "Preparing images",
+    "phaseServices": "Starting services",
+    "phaseAppSetup": "Finishing setup",
+    "phaseReady": "Live",
+    "phaseQueued": "Queued…",
+    "stepperTitle": "Installation steps",
+    "firstLoginTitle": "First login",
+    "firstLoginUser": "Username",
+    "firstLoginPassword": "Password",
+    "destinationTitle": "Where to install",
+    "destinationHint": "Pick the server or cloud this app runs on.",
+    "descMore": "More",
+    "descLess": "Less",
+    "needsTitle": "What it needs",
+    "needsMemory": "{value} RAM",
+    "needsCpu": "{value}",
+    "hostFitTitle": "This server is smaller than {app} needs",
+    "hostFitMemory": "Needs {needed} of RAM — this one has {available}",
+    "hostFitCpu": "Needs {needed} — this one has {available}",
+    "hostFitHint": "Install it on a bigger machine, or pick another destination.",
+    "routePortLabel": "Port only (no domain)",
+    "routePortDesc": "Reachable at the host address and port — no domain or Cloud needed.",
+    "routeFreeLabel": "Free subdomain",
+    "routeFreeDesc": "A free subdomain on {domain}, routed by Openship Cloud.",
+    "routeFreeNeedsCloud": "Connect Openship Cloud to use a free subdomain.",
+    "routeCustomLabel": "Your own domain",
+    "routeCustomDesc": "Point a domain you own at this app.",
+    "routeDomainLabel": "Domain",
+    "routeDomainDesc": "Reach it on a domain — a free subdomain or your own.",
+    "exposeTitle": "Exposure",
+    "httpBadge": "Web",
+    "tcpBadge": "Database",
+    "tcpPublishLabel": "Publish port",
+    "tcpPublishDesc": "Publish it on the host so external tools can connect.",
+    "tcpInternalLabel": "Internal only",
+    "tcpInternalDesc": "Only other services in this app can reach it.",
+    "tcpFirewallNote": "Open port {port} on your server firewall to connect from outside.",
+    "desktopReachNote": "On desktop you can open it on localhost — or forward the port from Servers → Ports for a remote server.",
+    "statusInstalling": "Installing",
+    "statusLive": "Live",
+    "statusCancelled": "Cancelled",
+    "statusFailed": "Failed",
+    "stopInstall": "Stop install",
+    "stopping": "Stopping…",
+    "installCancelled": "Install cancelled",
+    "startOver": "Start over",
+    "breadcrumbApps": "Apps",
+    "appEyebrow": "App",
+    "stopFailed": "Couldn't stop the install",
+    "progressStep": "Step {current} of {total}",
+    "progressServicesReady": "{done} of {total} services ready",
+    "summaryTitle": "Configuration",
+    "summaryDestination": "Destination",
+    "summaryServices": "Services",
+    "mail": {
+      "title": "Set up mail",
+      "subtitle": "Deploy webmail on your own domain, or connect an existing mailbox.",
+      "chooseSelf": "Self-host a mail server",
+      "chooseSelfDesc": "Full SMTP/IMAP + webmail (iRedMail) on your server — we provision everything.",
+      "chooseConnect": "Connect an existing mailbox",
+      "chooseConnectDesc": "Deploy just the webmail UI, pointed at any external SMTP/IMAP provider — Amazon SES, Oracle Cloud, Gmail, Fastmail, and more.",
+      "provider": "Provider",
+      "presets": {
+        "custom": "Custom",
+        "ses": "Amazon SES",
+        "gmail": "Gmail",
+        "fastmail": "Fastmail"
+      },
+      "sendOnlyNote": "{provider} only sends mail — it holds no mailboxes. IMAP has to point at wherever your mail is actually stored.",
+      "sendOnlyNoInbox": "No inbox yet? Set up a mail server here, then relay sending through {provider} →",
+      "imapOnOurServer": "Mailboxes read from {host} — this instance's own mail server. Only sending goes through {provider}.",
+      "relayNote": "This instance already runs a mail server. If the mailboxes are on it, relay sending from its Delivery → Sending tab instead: IMAP stays local and only sending goes to {provider}, per domain or per address, and its own webmail keeps working.",
+      "relayCta": "Configure the relay instead →",
+      "hostname": "Webmail address",
+      "hostnameHint": "The public URL people open to read their mail, e.g. mail.example.com.",
+      "imapHost": "IMAP host",
+      "imapPort": "IMAP port",
+      "smtpHost": "SMTP host",
+      "smtpPort": "SMTP port",
+      "deploy": "Deploy webmail",
+      "deploying": "Deploying…",
+      "hostnameRequired": "Enter the webmail address.",
+      "hostsRequired": "Enter both the IMAP and SMTP host."
+    }
+  },
   "advanced": {
     "projectInfo": {
       "title": "Project Info",
@@ -13,6 +234,28 @@
       "status": "Status",
       "project": "Project",
       "hostedOn": "Hosted On"
+    },
+    "projectMenu": {
+      "rename": "Rename project",
+      "copyId": "Copy project ID",
+      "idCopied": "Project ID copied",
+      "copyFailed": "Couldn't copy to the clipboard",
+      "pause": "Pause project",
+      "resume": "Resume project",
+      "delete": "Delete project"
+    },
+    "rename": {
+      "title": "Rename project",
+      "description": "Changes the display name. Nothing is redeployed.",
+      "label": "Project name",
+      "placeholder": "My project",
+      "identityNote": "The project keeps the identity “{slug}” — its URL, container names and volumes don't change. To change the URL, edit the domain under Domains & Routes.",
+      "save": "Save",
+      "cancel": "Cancel",
+      "toast": {
+        "renamed": "Renamed to {name}",
+        "failed": "Failed to rename the project"
+      }
     },
     "statusActive": "Active",
     "statusDisabled": "Disabled",
@@ -27,15 +270,54 @@
       "liveAccessible": "Live and accessible",
       "pausedInaccessible": "Paused and not accessible",
       "disable": "Disable",
-      "enable": "Enable"
+      "enable": "Enable",
+      "migrating": "Migrating",
+      "migratingHint": "Being moved to another server"
+    },
+    "migration": {
+      "title": "Migration",
+      "description": "Move this project to another server",
+      "currentServer": "Current server",
+      "migrate": "Migrate",
+      "noOtherServers": "Add a second server to move this project to one.",
+      "cloudLater": "Server to server. Moving to or from Openship Cloud isn't supported yet.",
+      "startFailed": "Couldn't start the migration",
+      "confirmTitle": "Move {project} to {server}",
+      "confirmSubtitle": "Nothing changes until you start the move.",
+      "svcVolumes": "{count} volume(s)",
+      "downtimeNote": "The project is offline while its data copies across and the new server starts it. Stateful services are down for the whole transfer.",
+      "dnsNote": "DNS still points at the old server — move your records once the new one is serving.",
+      "cancel": "Cancel",
+      "confirmStart": "Start move",
+      "duplicate": "Duplicate",
+      "intentMove": "Move",
+      "intentCopy": "Duplicate",
+      "intentMoveHint": "The project moves. Its containers and volumes are removed from the old server once you confirm.",
+      "intentCopyHint": "The original keeps running. A second project is created on the new server with a copy of the data.",
+      "confirmTitleCopy": "Duplicate {project} onto {server}",
+      "confirmStartCopy": "Start duplicate",
+      "downtimeNoteCopy": "The project is briefly offline while its data is copied — the volumes have to be still to copy cleanly. It starts again on the old server as soon as the copy finishes.",
+      "copyNoDomainsNote": "The copy starts with no domains — the originals stay with the project that's serving them.",
+      "fromLabel": "From",
+      "toLabel": "To",
+      "modeLabel": "Mode",
+      "scopeLabel": "What to duplicate",
+      "scopeAll": "Select all",
+      "scopeHintAll": "Every service, with its data.",
+      "scopeHintSome": "{count} service(s) — the rest stay only on the original.",
+      "sourceServices": "{count} service(s)",
+      "runningStatus": "In progress — {status}"
     },
     "cache": {
-      "title": "Cache",
-      "description": "Clear cached build artifacts and dependency installs",
+      "title": "Docker Build Cache",
+      "description": "Unused build cache is automatically limited to 5 GB per server",
       "clearInstall": "Clear Install Cache",
       "clearInstallDesc": "Remove cached node_modules",
       "clearBuild": "Clear Build Cache",
-      "clearBuildDesc": "Remove cached build output"
+      "clearBuildDesc": "Remove unused cache across this project's Docker server",
+      "clearBuildConfirm": "Clear all unused Docker build cache on this server? Other projects may rebuild dependencies on their next deployment.",
+      "clearBuildSuccess": "Reclaimed {size} of build cache",
+      "clearBuildEmpty": "No unused build cache to clear"
     },
     "transfer": {
       "title": "Transfer & Clone",
@@ -58,7 +340,72 @@
       "toggleFailed": "Failed to toggle project",
       "clearInstallFailed": "Failed to clear install cache",
       "clearBuildFailed": "Failed to clear build cache"
+    },
+    "routing": {
+      "title": "Routing",
+      "description": "How the edge reaches this app's upstream",
+      "intro": "Choose how the edge addresses this project's container.",
+      "note": "Loopback port is recommended: a private 127.0.0.1 host port, stable across restarts and never network-exposed. Container IP is advanced (zero-downtime swaps; needs the edge on the Docker bridge; not supported on Docker Desktop).",
+      "modes": {
+        "auto": {
+          "label": "Auto",
+          "desc": "Recommended (loopback port)"
+        },
+        "loopbackPort": {
+          "label": "Loopback port",
+          "desc": "Private 127.0.0.1 host port"
+        },
+        "containerIp": {
+          "label": "Container IP",
+          "desc": "Advanced — bridge IP"
+        }
+      },
+      "toast": {
+        "saved": "Routing set to {mode}",
+        "failed": "Failed to update routing"
+      }
+    },
+    "internalAlias": {
+      "title": "Internal hostname",
+      "description": "Custom name other services use to reach this app privately",
+      "intro": "Set an extra DNS name for this app on its private project network. It resolves alongside the default (the project slug) — other linked services can use either. Public access is unchanged; this never exposes a port.",
+      "label": "Hostname alias",
+      "hint": "Letters, digits and dashes only. Leave empty to use the project slug.",
+      "save": "Save",
+      "toast": {
+        "saved": "Internal hostname updated",
+        "failed": "Couldn't update the internal hostname",
+        "invalid": "Enter at least one letter or digit"
+      }
     }
+  },
+  "routeRules": {
+    "title": "Route rules",
+    "description": "Rate-limit, ban, and allow/deny rules enforced at the edge — applied instantly, no redeploy.",
+    "loading": "Loading rules…",
+    "empty": "No route rules yet. Add one below.",
+    "allHosts": "All hostnames",
+    "allPaths": "All paths",
+    "addTitle": "Add a rule",
+    "pathLabel": "Path prefix (optional)",
+    "rps": "Requests / sec",
+    "burst": "Burst",
+    "methods": "Allow only methods",
+    "banIps": "Ban IPs / CIDRs",
+    "banCountries": "Ban countries (ISO)",
+    "allowCountries": "Allow only countries (ISO)",
+    "denyCidrs": "Deny CIDRs",
+    "allowReferers": "Hotlink: allow referers",
+    "banUserAgents": "Ban user-agents (substring)",
+    "blockEmptyUa": "Block empty user-agent",
+    "blockStatus": "Block response code",
+    "add": "Add rule",
+    "remove": "Remove",
+    "enabled": "Enabled",
+    "disabled": "Disabled",
+    "saved": "Rule saved",
+    "saveFailed": "Failed to save rule",
+    "loadFailed": "Failed to load rules"
   },
   "backup": {
     "live": {
@@ -131,23 +478,60 @@
       "framework": "Framework",
       "packageManager": "Package manager",
       "runtimeIsolation": "Runtime isolation",
-      "resources": "Resources",
-      "resourcesValue": "{cpu} vCPU · {memory} MB",
       "runtimePort": "Runtime port",
       "installCommand": "Install command",
       "buildCommand": "Build command",
       "noBuildStep": "No build step",
       "outputDirectory": "Output directory",
       "rootDirectory": "Root directory",
+      "composePath": "Compose File",
       "startCommand": "Start command",
       "staticNoServer": "Static (no server)",
       "modeSandboxed": "Sandboxed (container)",
       "modeDirect": "Direct (host process)",
-      "modeDefault": "Default (resolved at deploy)"
+      "modeDefault": "Default (resolved at deploy)",
+      "modeStatic": "None — served as static files"
+    },
+    "storage": {
+      "title": "Persistent storage",
+      "description": "Paths kept when a new version replaces the old one. Everything else in the container is discarded on deploy.",
+      "edit": "Edit",
+      "save": "Save",
+      "cancel": "Cancel",
+      "saved": "Storage updated. It applies on the next deploy.",
+      "reset": "Use framework defaults",
+      "empty": "Nothing is kept between deploys.",
+      "inherited": "Framework defaults for this stack.",
+      "declared": "Set for this project.",
+      "placeholder": "storage\nuploads:/app/public/uploads",
+      "hint": "One per line. A bare path is relative to the app (storage), or give a full mount (name:/app/path, /host/path:/app/path)."
+    },
+    "objectStorage": {
+      "title": "Object storage",
+      "description": "An S3 bucket for uploads — survives redeploys and works with more than one replica, unlike a local path.",
+      "connect": "Connect",
+      "disconnect": "Disconnect",
+      "disconnected": "Object storage disconnected.",
+      "connected": "Bucket verified and connected. It applies on the next deploy.",
+      "loading": "Checking…",
+      "empty": "No bucket connected. Uploads stay on the container's disk.",
+      "sourceLabel": "Source",
+      "externalOption": "External provider",
+      "providerLabel": "Provider",
+      "bucketLabel": "Bucket",
+      "endpointLabel": "Endpoint",
+      "regionLabel": "Region",
+      "accessKeyLabel": "Access key ID",
+      "secretKeyLabel": "Secret access key",
+      "testAndConnect": "Test & connect",
+      "cancel": "Cancel",
+      "envLabel": "Variables",
+      "envHint": "Sets:",
+      "appliesOnDeploy": "Applied on the next deploy."
     },
     "env": {
-      "title": "Environment variables",
-      "description": "Encrypted at rest. Secrets stay masked — only the values you change are written.",
+      "title": "Project environment (build + shared runtime)",
+      "description": "Used for image builds and shared runtime input. Compose values and service runtime overrides take precedence at runtime. Secrets stay masked.",
       "edit": "Edit"
     }
   },
@@ -156,10 +540,10 @@
     "saveChanges": "Save changes",
     "close": "Close",
     "applyTitle": "Apply without a rebuild",
-    "applyText": "Saved. Apply these to the running service — it restarts with the new env, no clone or rebuild.",
+    "applyText": "Saved. Restart to apply runtime changes. Rebuild and redeploy to apply values used when building an image.",
     "applyButton": "Apply (restart, no rebuild)",
-    "title": "Environment variables",
-    "description": "Production. Encrypted at rest. Secrets show as set — type to replace; leave blank to keep.",
+    "title": "Project environment (build + shared runtime)",
+    "description": "Production project variables. Secrets stay masked; leave a saved secret blank to keep it. Service runtime values take precedence for the same key.",
     "empty": "No environment variables yet.",
     "keyPlaceholder": "KEY",
     "secretPlaceholder": "•••••••• (set — type to replace)",
@@ -178,35 +562,21 @@
       "savedTitle": "Saved",
       "saveFailed": "Failed to save environment variables",
       "saveFailedTitle": "Save failed",
+      "noChanges": "No changes to save — your saved values were kept.",
+      "noChangesTitle": "Nothing to save",
       "applying": "Restarting the service with the new env — no rebuild.",
       "applyingTitle": "Applying",
       "applyFailed": "Couldn't apply the env to the running service",
       "applyFailedTitle": "Apply failed"
-    }
+    },
+    "linkedBadge": "Linked",
+    "linkedManaged": "via {app}",
+    "linkedTitle": "Linked integration",
+    "linkedBody": "This value comes from the {app} connection. Manage it from that app — changes made here won't stick.",
+    "unlink": "Remove connection"
   },
   "gitInfo": {
-    "repository": "Repository",
-    "autoDeploy": "Auto-deploy",
-    "deploysOnPush": "Deploys on every push",
-    "manualOnly": "Manual deploys only",
-    "branchToDeploy": "Branch to Deploy",
-    "chooseBranch": "Choose which branch to deploy from your repository",
-    "save": "Save",
-    "cancel": "Cancel",
-    "viewOnGithub": "View on GitHub",
-    "recentCommits": "Recent Commits",
-    "totalCommits": "{count} total",
-    "noCommits": "No commits yet",
-    "toast": {
-      "fetchBranchesFailed": "Failed to fetch branches",
-      "errorTitle": "Error",
-      "branchUpdated": "Branch updated successfully",
-      "updatedTitle": "Updated",
-      "branchUpdateFailed": "Failed to update branch",
-      "autoDeployEnabled": "Auto-deploy enabled",
-      "autoDeployDisabled": "Auto-deploy disabled",
-      "autoDeployFailed": "Failed to update auto-deploy"
-    }
+    "autoDeploy": "Auto-deploy"
   },
   "git": {
     "connectFirst": {
@@ -269,18 +639,33 @@
       "title": "Rollback strategy",
       "rebuild": "Rebuild (git)",
       "instant": "Instant (snapshot)",
-      "descRebuild": "Rollback re-clones & rebuilds the old commit — cheaper, but slower and can fail if that commit no longer builds.",
-      "descInstant": "Keeps each version's build artifact on disk for rollback in seconds. Uses extra disk, capped by the history limit.",
-      "toggleAria": "Toggle snapshot retention"
+      "descRebuild": "Rebuilds the old commit, unless its image is still on the host.",
+      "descInstant": "Keeps rollback artifacts within the history limit. Older versions may need to be rebuilt.",
+      "toggleAria": "Toggle snapshot retention",
+      "keepNone": "Reuse images or rebuild",
+      "keepCopies": "Preserve rollback artifacts",
+      "descRebuildFiles": "Rebuilds the old commit, unless its files are still on the host.",
+      "descInstantFiles": "Keeps built files within the history limit. Older versions may need to be rebuilt."
     },
     "rollbackHistory": {
       "title": "Rollback history",
+      "retentionHint": "Keep recent deployment artifacts for quick rollback.",
+      "retentionDescription": "Maximum number of past releases to keep. Active and pinned releases are extra. Older artifacts are removed; deployment history stays available. Set to 0 to keep only active and pinned releases.",
+      "defaultBadge": "instance default",
+      "loadFailed": "Could not load rollback settings.",
       "valueOne": "{count} version",
       "valueOther": "{count} versions",
-      "descSnapshot": "How many recent versions keep their build artifact for rollback. Older ones are pruned to reclaim disk.",
-      "descGit": "Applies only to Instant (snapshot) mode — Git mode keeps no artifacts to retain.",
+      "descSnapshot": "Older versions are pruned to reclaim disk.",
+      "descGit": "Recent images are retained either way, so a rollback can skip the build.",
       "decreaseAria": "Decrease rollback history",
-      "increaseAria": "Increase rollback history"
+      "increaseAria": "Increase rollback history",
+      "sizeEach": "~{size} per image, including shared layers",
+      "diskFree": "{size} free",
+      "autoBadge": "sized automatically",
+      "manualBadge": "set manually",
+      "kindFiles": "built files on disk",
+      "kindImages": "images on the host",
+      "descGitFiles": "Recent versions' files are retained either way, so a rollback can skip the build."
     },
     "commits": {
       "title": "Recent Commits",
@@ -330,7 +715,7 @@
   },
   "logs": {
     "noRuntime": "No runtime logs",
-    "noRuntimeDesc": "This project is deployed as a static app, so there is no running server process to stream logs from.",
+    "noRuntimeDesc": "This project has no running server process and no domain, so there is nothing to stream. Add a domain and its edge request logs will appear here.",
     "terminal": "Terminal",
     "server": "Server",
     "requests": "Requests",
@@ -343,38 +728,60 @@
   },
   "resources": {
     "title": "Machine Power",
-    "description": "Configure the machine power for your project.",
+    "description": "CPU and memory limits for this project's containers.",
+    "loading": "Reading the target machine…",
+    "unavailable": "Machine power unavailable",
+    "loadFailed": "Failed to load machine power",
+    "retry": "Retry",
+    "machineCapacity": "Machine: {cpu} vCPU · {memory}",
+    "exceedsMachine": "Exceeds this machine",
+    "appliesOnNextDeploy": "Limits are applied when the container is recreated — redeploy for a change to take effect.",
     "tiers": {
-      "lightweight": { "name": "Lightweight", "description": "Small apps and static sites" },
-      "standard": { "name": "Standard", "description": "Most web applications" },
-      "performance": { "name": "Performance", "description": "High-traffic applications" },
-      "enterprise": { "name": "Enterprise", "description": "Large scale production apps" },
-      "autoscale": { "name": "Auto Scale", "description": "Scales based on demand" }
+      "unlimited": {
+        "name": "No limits",
+        "description": "Use the whole machine (default)",
+        "spec": "Machine capacity"
+      },
+      "micro": {
+        "name": "Micro",
+        "description": "Tiny sidecars and workers"
+      },
+      "low": {
+        "name": "Low",
+        "description": "Small apps and static sites"
+      },
+      "medium": {
+        "name": "Medium",
+        "description": "Most web applications"
+      },
+      "high": {
+        "name": "High",
+        "description": "High-traffic applications"
+      },
+      "xlarge": {
+        "name": "Extra large",
+        "description": "Databases and heavy workloads"
+      }
     },
-    "dynamic": "Dynamic",
     "custom": {
       "name": "Custom",
-      "description": "Define your own resources",
-      "clickToConfigure": "Click to configure"
+      "description": "Set your own limits",
+      "notSet": "Not set"
     },
-    "cpuValue": "{cpu} vCPU",
     "customPanel": {
-      "title": "Configure Custom Resources",
-      "cpuCores": "CPU Cores",
-      "cpuRange": "Range: 0.25 - 4.00",
+      "boundedBy": "This machine has {cpu} vCPU and {memory}. Enter 0 for no limit.",
+      "capacityUnknown": "Could not read this machine's capacity, so no ceiling is enforced. Enter 0 for no limit.",
+      "cpuCores": "CPU cores",
       "memory": "Memory (MB)",
-      "memoryRange": "Range: 128 - 8192",
+      "zeroMeansNoLimit": "0 = no limit",
       "cancel": "Cancel",
-      "saving": "Saving...",
-      "save": "Save Configuration"
+      "saving": "Saving…",
+      "save": "Save"
     },
     "toast": {
-      "updated": "Resources updated successfully",
-      "updateFailed": "Failed to update resources",
-      "cpuRange": "CPU must be between 0.25 and 4.00 cores",
-      "memoryRange": "Memory must be between 128 MB and 8192 MB",
-      "customSaved": "Custom resources saved successfully",
-      "customSaveFailed": "Failed to save custom resources"
+      "updated": "Machine power updated",
+      "updateFailed": "Failed to update machine power",
+      "invalidValues": "CPU and memory must be 0 or a positive number"
     }
   },
   "sleep": {
@@ -408,10 +815,6 @@
     "cannotUndo": "This action cannot be undone.",
     "aboutToPrefix": "You are about to delete ",
     "aboutToSuffix": ".",
-    "deleteAllAria": "Delete all environments",
-    "deleteAll": "Delete all environments",
-    "deleteAllOn": "Removes the project app and every branch environment under it.",
-    "deleteAllOff": "Removes only this environment. Other branches stay.",
     "scanning": "Scanning attached services and volumes…",
     "wipeAria": "Also wipe service data",
     "wipeLabelOne": "Also wipe service data ({count} volume)",
@@ -426,10 +829,17 @@
     "typePrefix": "Type ",
     "typeSuffix": " to confirm.",
     "cancel": "Cancel",
-    "confirmDeleteWipe": "Delete + wipe data",
     "confirmDeleteEnvWipe": "Delete environment + wipe data",
-    "confirmDelete": "Delete project",
-    "confirmDeleteEnv": "Delete environment"
+    "confirmDeleteEnv": "Delete environment",
+    "recordOnlyLabel": "Remove from Openship only",
+    "recordOnlyDesc": "Keeps the app and its data running on your server — only the Openship record is removed. You can re-import it later.",
+    "recordOnlyReversible": "Reversible — the app stays on your server.",
+    "recordOnlyNote": "Nothing on the server is touched — the app keeps running with its data. Only Openship's record is removed, and it can be re-imported later.",
+    "confirmRecordOnly": "Remove record",
+    "linkedTitleOne": "{count} project is connected to this app",
+    "linkedTitleOther": "{count} projects are connected to this app",
+    "linkedNote": "They keep running with their data untouched — they only lose this connection. Redeploy them to pick that up.",
+    "linkedNoteRecordOnly": "They keep running, but the link goes with the record — re-importing this app later won't restore it."
   },
   "routing": {
     "title": "Routing",
@@ -450,15 +860,18 @@
       "active": "Active",
       "failed": "Failed",
       "removing": "Removing",
-      "pending": "Pending"
+      "pending": "Pending",
+      "waiting": "Waiting"
     },
     "ssl": {
       "includedByHost": "Included by host",
       "active": "Active",
-      "provisioning": "Provisioning",
+      "provisioning": "Awaiting certificate",
       "expired": "Expired",
       "error": "Error",
-      "inactive": "Inactive"
+      "inactive": "Inactive",
+      "external": "External TLS",
+      "manual": "Manual cert"
     },
     "typeCustom": "Custom domain",
     "typeFree": "Free subdomain",
@@ -500,9 +913,18 @@
       "customPlaceholder": "yourdomain.com",
       "defaultAppName": "my-app",
       "mapsToPort": "Maps to port",
+      "servesPath": "Serves path",
+      "servesPathHint": "Requests to this domain are served from this path in your build output.",
+      "servesPathRedeploy": "New paths take effect on your next deploy.",
       "includeWww": "Include www",
       "includeWwwDesc": "Also generate records for www.{domain}",
       "includeWwwFallback": "yourdomain.com",
+      "externalIngress": "External ingress & TLS",
+      "externalIngressDesc": "TLS terminates at your reverse proxy (Cloudflare Tunnel, Nginx Proxy Manager, or a load balancer). The domain need not point at this server, and Openship won't issue a certificate.",
+      "dnsChallenge": "Use DNS-01 challenge",
+      "dnsChallengeDesc": "Issue and renew the certificate through your connected DNS provider. Use this when port 80 cannot be reached.",
+      "dnsChallengeWildcardDesc": "Wildcard certificates require DNS-01 and a connected DNS provider.",
+      "noWww": "That domain is already on this project.",
       "adding": "Adding...",
       "submit": "Add domain"
     },
@@ -513,12 +935,35 @@
       "infoPreview": "Add these records first — they don't change after adding, so propagation starts now. Then press Add domain to attach it, and finally Verify once DNS resolves.",
       "infoApply": "DNS changes can take up to 48 hours to propagate globally. Once the records resolve, click Verify below — we'll check DNS, mark the domain active, and provision SSL in the background.",
       "verifying": "Verifying...",
-      "verify": "Verify {hostname}",
-      "copy": "Copy"
+      "verify": "Verify {hostname}"
+    },
+    "records": {
+      "toggle": "DNS records",
+      "hint": "Add these at your DNS provider, then click Verify.",
+      "loading": "Loading records…",
+      "none": "No records to add for this domain.",
+      "failed": "Couldn't load the DNS records for this domain.",
+      "retry": "Try again"
+    },
+    "verifyMissing": {
+      "both": "Neither the CNAME nor the TXT record is resolving yet — add the records below, wait for DNS to propagate, then Verify.",
+      "cname": "The CNAME record isn't resolving yet — add it below, wait for DNS to propagate, then Verify.",
+      "txt": "The TXT verification record isn't resolving yet — add it below, wait for DNS to propagate, then Verify."
+    },
+    "portHint": {
+      "body": "Nothing responded on port {port} — requests may 502 until the app listens there.",
+      "bodyService": "Service \"{service}\": nothing responded on port {port} — requests may 502 until it listens there."
+    },
+    "outputHint": {
+      "body": "No build output found at {path} — check your Output Directory and redeploy.",
+      "noIndex": "Output exists at {path} but there is no index file — requests will 404. Check your Output Directory.",
+      "notServed": "The edge answered HTTP {status} for {path} — this path is not serving. Check your Output Directory and the route."
     },
     "overview": {
       "primary": "Primary",
       "mappedTo": "Mapped to",
+      "redirect": "Redirect",
+      "redirectValue": "{status} → {hostname}",
       "status": "Status",
       "ssl": "SSL",
       "visit": "Visit"
@@ -555,7 +1000,8 @@
       "title": "Edit route",
       "internalOnly": "Internal only",
       "close": "Close",
-      "disabledWarning": "Service is disabled - routes are inactive until the service is re-enabled."
+      "disabledWarning": "Service is disabled - routes are inactive until the service is re-enabled.",
+      "save": "Save changes"
     },
     "menu": {
       "editRoute": "Edit route",
@@ -566,7 +1012,19 @@
       "renewing": "Renewing...",
       "renewSsl": "Renew SSL",
       "rechecking": "Rechecking...",
-      "recheckSsl": "Recheck SSL"
+      "recheckSsl": "Recheck SSL",
+      "uploadCert": "Upload certificate"
+    },
+    "certUpload": {
+      "title": "Upload certificate",
+      "desc": "Serve TLS from your own certificate (bring-your-own or Cloudflare Origin CA) instead of Let's Encrypt. Use this when an upstream proxy fronts this domain and the origin still needs a real cert (Cloudflare Full-strict). Certbot is disabled for this domain once a certificate is uploaded — renew by uploading a new one.",
+      "certLabel": "Certificate (fullchain PEM)",
+      "certPlaceholder": "-----BEGIN CERTIFICATE-----",
+      "keyLabel": "Private key (PEM)",
+      "keyPlaceholder": "-----BEGIN PRIVATE KEY-----",
+      "submit": "Install certificate",
+      "submitting": "Installing...",
+      "close": "Cancel"
     },
     "toast": {
       "enterPort": "Enter the port this domain should route to (1–65535).",
@@ -587,6 +1045,8 @@
       "sslVerified": "SSL verified for {hostname}.",
       "sslNoCert": "No valid certificate found for {hostname} yet. If you just deployed, give Let's Encrypt a moment, then recheck.",
       "sslRecheckFailed": "Failed to recheck SSL for {hostname}.",
+      "certUploaded": "Certificate installed for {hostname}.",
+      "certUploadFailed": "Failed to install certificate for {hostname}.",
       "completeEndpoints": "Complete every domain and mapped port before saving",
       "domainsTitle": "Domains",
       "routingUpdated": "Domain routing updated",
@@ -594,10 +1054,50 @@
       "primaryUpdated": "Primary domain updated",
       "setPrimaryFailed": "Failed to set primary domain",
       "routeUpdateFailed": "Failed to update service route",
+      "publishing": "Publishing — deploying to install the edge and apply your domain…",
+      "publishFailed": "Domain saved, but the deploy didn't start — redeploy to publish it.",
       "enterPortShort": "Enter the port this domain should route to.",
       "noServicePort": "No service publishes port {port}. Add that port to a service first.",
       "enterCustom": "Enter a custom domain.",
       "enterSubdomain": "Enter a subdomain."
+    },
+    "edge": {
+      "setUp": "Set up edge",
+      "ready": "Edge ready",
+      "checking": "Checking edge…",
+      "recheck": "Re-check",
+      "foreignProxyHint": "Another proxy holds 80/443"
+    },
+    "diagnosis": {
+      "title": "Domain details",
+      "noneYet": "No check has run yet, so there's no result to show. Add the DNS records shown for this domain, then run Verify.",
+      "attempts": "{count} failed attempt(s) so far.",
+      "pillHint": "Show why",
+      "lastChecked": "Last check:",
+      "nextCheck": "Next scheduled check:",
+      "scheduleHint": "Checks run while this instance is online. Queued work can delay the start.",
+      "automaticDisabled": "Automatic domain checks are disabled. Retry manually or enable them in Jobs.",
+      "scheduleUnavailable": "The automatic check schedule is unavailable. You can retry manually.",
+      "retryNow": "Retry now",
+      "checking": "Checking…",
+      "reasons": {
+        "verification": "Domain verification has not completed. Check the DNS records before retrying.",
+        "certificate": "HTTPS needs checking on the serving server. Retrying checks for an existing certificate before requesting one.",
+        "deployment": "This route is waiting for a deployment. Deploy the project to apply it.",
+        "disabled": "This project or service is disabled. Enable it before checking the route.",
+        "removing": "This domain is being removed. No verification is scheduled.",
+        "manual_certificate": "This domain uses an uploaded certificate. Upload a valid replacement, then recheck it. Openship does not renew it automatically.",
+        "managed_certificate": "TLS is managed by your external proxy or Openship Cloud. Check that provider’s configuration.",
+        "route_missing": "This configured route has not been applied. Retry routing to apply it. No automatic routing retry is scheduled."
+      }
     }
+  },
+  "serviceEnvironment": {
+    "title": "Service runtime environment",
+    "description": "These variables apply only to this service and override matching Compose or shared project values. Use Apply environment changes to activate saved values.",
+    "overrides": "These keys take precedence over project values for this service: {keys}.",
+    "buildArguments": "Build arguments are configured in the Compose file or source configuration and require a rebuild.",
+    "projectLink": "Edit shared project environment",
+    "loadFailed": "Could not load project variable names to check overrides."
   }
 }

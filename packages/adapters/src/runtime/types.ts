@@ -12,6 +12,7 @@
 
 import type {
   BuildConfig,
+  ImageArtifactConfig,
   DeployConfig,
   BuildResult,
   DeploymentResult,
@@ -26,6 +27,8 @@ import type {
 } from "../types";
 import type { ComposeAdvanced } from "@repo/core";
 import type { BuildLogger } from "./build-pipeline";
+import type { PortProbeExecutor } from "../system/port-listen";
+import type { ContainerStabilitySample } from "./stability";
 
 // ─── Capabilities ────────────────────────────────────────────────────────────
 
@@ -37,7 +40,11 @@ import type { BuildLogger } from "./build-pipeline";
  * it actually implements - callers never hit a silent stub.
  */
 export type RuntimeCapability =
+  /** Real Docker container semantics, including a Docker daemon in a cloud workspace. */
+  | "dockerHost"
   | "build"
+  /** Acquire and deploy an already-built application container image verbatim. */
+  | "prebuiltImage"
   | "deploy"
   | "multiServiceDeploy"
   | "stop"
@@ -50,11 +57,23 @@ export type RuntimeCapability =
   | "usage"
   | "containerIp"
   /**
-   * Runtime exposes the rollback primitives (`makeActive`, `archive`,
-   * `purge`). When unsupported, rollback is unavailable for projects
-   * deploying to this runtime. All in-tree runtimes support this.
+   * Runtime participates in artifact RETENTION — it implements `archive`
+   * and `purge`, so the rollback orchestrator can preserve a past
+   * deployment's artifact and reclaim it on retention overflow. All
+   * in-tree runtimes support this.
    */
   | "rollback"
+  /**
+   * Runtime's artifact is a durable PER-DEPLOYMENT UNIT that survives a
+   * redeploy and can be restarted in place, so it implements
+   * `makeActive` and rollback is a genuine instant unit swap.
+   *
+   * Bare (supervisor unit + release dir) and Cloud (stopped workspace +
+   * disk) have this. Docker does NOT: a redeploy removes the previous
+   * container, so its restore re-materializes from the retained image
+   * through the normal deploy step instead.
+   */
+  | "unitRestore"
   /**
    * Runtime can open an interactive PTY shell INSIDE a deployed
    * service's container/workspace. Docker exec with TTY, Oblien
@@ -79,7 +98,83 @@ export type RuntimeCapability =
    * drift. Docker implements this; Bare/Cloud don't (no label-queryable set)
    * and reconcile falls back to per-container `getContainerInfo`.
    */
-  | "deploymentContainerQuery";
+  | "deploymentContainerQuery"
+  /**
+   * Runtime can enumerate EVERY container on its host, label-agnostic, with
+   * live state — `docker ps -a`. Unlike `deploymentContainerQuery` this is not
+   * scoped by an `openship.*` label, which is exactly why the live service-state
+   * read needs it: a migration-attached container keeps its ORIGINAL labels
+   * (immutable in place), so a label-filtered query can never see it. Docker
+   * implements this; Cloud/Bare don't (no host container set).
+   */
+  | "hostContainerQuery"
+  /**
+   * Runtime can hand back a command runner that executes INSIDE a running
+   * deployment (not on the build/daemon host). Powers the advisory post-deploy
+   * port probe (`cat /proc/net/tcp*`). Docker exec (Tty:false), Oblien workspace
+   * exec, or — for Bare — the host executor itself (the process shares the host
+   * netns). Capability flag: "inContainerExec".
+   */
+  | "inContainerExec"
+  /**
+   * The in-container executor is genuinely CONFINED to the deployment — a command
+   * run through it cannot see or touch the host.
+   *
+   * Deliberately separate from "inContainerExec", which only promises "runs in the
+   * deployment's context". For Bare that context IS the host (`inContainerExecutor`
+   * returns the host executor, since a bare deployment is a host process), which is
+   * fine for the advisory port probe that capability was added for — and a privilege
+   * escalation for anything that runs an arbitrary command, because a project-tier
+   * grant would reach the whole machine.
+   *
+   * Any consumer running caller-supplied commands must gate on THIS, not on
+   * "inContainerExec". Omitted ⇒ not confined, so a new runtime fails closed.
+   */
+  | "isolatedExec"
+  /**
+   * Runtime can report a container's RESTART HISTORY and health, not just a
+   * point-in-time status — the readings the post-deploy stabilization watch
+   * needs to tell "up" from "bouncing" (`sampleStability`). Docker implements
+   * it; Cloud/Bare expose no restart counter, so their deploys skip the watch.
+   */
+  | "stabilityProbe"
+  /**
+   * Runtime can push container lifecycle TRANSITIONS as they happen
+   * (`watchContainerEvents` — Docker's `/events`). This only ever *accelerates*
+   * a state read: the stream is edge-triggered, so a dropped connection or a
+   * daemon restart loses transitions forever, and a container that never
+   * changes (stuck in `created`, down before we connected) emits nothing at
+   * all. Consumers therefore keep polling and use an event as "read state now"
+   * — see modules/monitoring/container-events.ts. Docker implements it;
+   * Cloud/Bare have no event feed.
+   */
+  | "containerEvents";
+
+// ─── Events ──────────────────────────────────────────────────────────────────
+
+/** One container lifecycle transition, normalized away from Docker's wire shape. */
+export interface ContainerLifecycleEvent {
+  containerId: string;
+  /**
+   * Docker's `Action`, normalized. Both healthcheck edges are carried —
+   * `health_status: unhealthy` → "unhealthy", `health_status: healthy` →
+   * "healthy" — because a healthcheck recovery emits no other event: the
+   * container never stopped, so there is no `start` to notice it by.
+   * `health_status: starting` is dropped at the source.
+   */
+  action:
+    | "die"
+    | "oom"
+    | "kill"
+    | "stop"
+    | "restart"
+    | "start"
+    | "unhealthy"
+    | "healthy"
+    | "destroy";
+  /** Event time in whole seconds, as the daemon reported it. */
+  atSeconds: number;
+}
 
 // ─── Interface ───────────────────────────────────────────────────────────────
 
@@ -95,6 +190,8 @@ export interface RuntimeAdapter {
 
   /** Clean up any resources held by the runtime (connections, temp files) */
   dispose?(): Promise<void>;
+  /** Cancel this deployment's API/build work without disposing the cleanup transport. */
+  setOperationSignal?(signal: AbortSignal): void;
 
   // ── Build lifecycle ──────────────────────────────────────────────────
 
@@ -105,6 +202,15 @@ export interface RuntimeAdapter {
    * Cloud: delegates to cloud build infrastructure.
    */
   build(config: BuildConfig, logger?: BuildLogger): Promise<BuildResult>;
+
+  /**
+   * Turn a registry image into this runtime's native deploy artifact.
+   *
+   * Docker pulls it onto the target daemon and returns an immutable digest when
+   * available. Cloud provisions a temporary workspace from it. Runtimes that
+   * cannot run container images (Bare) omit the method and capability.
+   */
+  prepareImage?(config: ImageArtifactConfig, logger?: BuildLogger): Promise<BuildResult>;
 
   /** Cancel an in-progress build */
   cancelBuild(sessionId: string): Promise<void>;
@@ -136,6 +242,8 @@ export interface RuntimeAdapter {
    * present when `supports("projectContainerSweep")`.
    */
   listProjectContainerIds?(projectId: string): Promise<string[]>;
+  /** Remove an empty owned project scope after full project teardown (not one release). */
+  cleanupProject?(projectId: string): Promise<void>;
 
   /**
    * List the containers this runtime owns for `deploymentId`, matched by the
@@ -147,10 +255,51 @@ export interface RuntimeAdapter {
     deploymentId: string,
   ): Promise<Array<{ containerId: string; status: ContainerStatus; serviceName?: string }>>;
 
+  /**
+   * Every container on this runtime's host (running or not), label-agnostic —
+   * the raw `docker ps -a` view. The live service-state read matches these
+   * against the project's service rows by identity (labels, container name,
+   * tracked id), so a container Openship adopted in place — carrying another
+   * project's labels — still reports its true state. Only present when
+   * `supports("hostContainerQuery")`.
+   */
+  listAllContainers?(): Promise<DockerContainerSummary[]>;
+
   // ── Observability ────────────────────────────────────────────────────
 
   /** Get the current status and metadata */
   getContainerInfo(containerId: string): Promise<ContainerInfo>;
+
+  /**
+   * One stabilization reading: restart count, last exit code, healthcheck
+   * verdict, current uptime. `getContainerInfo` cannot answer this — it maps
+   * `restarting` onto `running` on purpose, so a crash-looping container reads
+   * as healthy there. Returns a `missing` sample when the container is gone.
+   * Only present when `supports("stabilityProbe")`; the post-deploy watch is
+   * skipped for runtimes without it.
+   */
+  sampleStability?(containerId: string): Promise<ContainerStabilitySample>;
+
+  /**
+   * Subscribe to container lifecycle transitions on this host, host-wide and
+   * label-agnostic (the consumer maps ids → projects itself). Returns a cleanup
+   * function, same convention as `streamRuntimeLogs`.
+   *
+   * The stream carries TRANSITIONS, never state — so it is an accelerator for a
+   * poll, not a replacement (see the `containerEvents` capability doc). The
+   * runtime deliberately does NOT reconnect on its own: only the caller knows
+   * whether the subscription is still wanted, and it must treat every
+   * (re)connect as a reason to re-read state anyway. Only present when
+   * `supports("containerEvents")`.
+   */
+  watchContainerEvents?(handlers: {
+    onEvent: (event: ContainerLifecycleEvent) => void;
+    /**
+     * The stream ended. `null` = clean EOF, otherwise the transport error.
+     * Fires at most once per subscription, and not at all after cleanup.
+     */
+    onClose: (err: Error | null) => void;
+  }): Promise<() => void>;
 
   /** Get runtime logs */
   getRuntimeLogs(containerId: string, tail?: number): Promise<LogEntry[]>;
@@ -173,48 +322,100 @@ export interface RuntimeAdapter {
   /** Resolve the internal IP address of a container/process */
   getContainerIp(containerId: string): Promise<string | null>;
 
-  // ── Rollback primitives ──────────────────────────────────────────────
-  //
-  // Three atomic ops the RollbackOrchestrator composes into "deploy
-  // landed: archive prev + activate new", "user rolled back: archive
-  // current + makeActive target", and "retention overflowed: purge".
-  // Each runtime implements them differently:
-  //   Docker — container start/stop + image tag retention + rmi
-  //   Bare   — release-dir symlink swap + service reload + rm -rf
-  //   Cloud  — workspace launch from archived disk + archive disk + delete
-  //
-  // Capability flag: "rollback". Service code calls assertCapability
-  // before using; runtimes without rollback raise at deploy preflight
-  // rather than mid-flight.
-  //
-  // ALL ops are idempotent: calling makeActive on an already-active
-  // deployment is a no-op; archiving an already-archived one is too;
-  // purging an already-purged one is too.
+  /**
+   * Hand back a command runner scoped to the INSIDE of the running deployment
+   * named by `containerId` (docker container / cloud workspace / bare host
+   * netns). Its `.exec` runs `sh -c <cmd>` in that context — used by the
+   * advisory post-deploy port probe. Optional; callers skip the probe when the
+   * runtime doesn't implement it (capability "inContainerExec").
+   *
+   * NOTE: on Bare this is the host executor, so a probe sees EVERY listener on
+   * the host, not only this deployment's — fine for an advisory "is something on
+   * this port?" but not proof it's this specific process.
+   */
+  inContainerExecutor?(containerId: string): Promise<PortProbeExecutor>;
 
   /**
-   * Make this deployment the live one. Handles the transition from
-   * whatever was active before — the orchestrator passes the previous
-   * active as `from` so the runtime can stop / archive it as part of
-   * the same swap (avoids brief "nothing active" windows).
+   * Attach this project's containers to additional networks (by name) — for
+   * cross-project service links, so a consumer joins a linked database app's
+   * `openship-<slug>` network and resolves its service alias with no public
+   * port. Best-effort + idempotent. Optional (docker only; cloud/bare skip —
+   * cloud uses public host:port, its private-link mesh is group-scoped).
+   */
+  attachToExternalNetworks?(
+    projectId: string,
+    networkNames: string[],
+    /** Containers to include BEYOND the `openship.project` label match — an adopted
+     *  container keeps its original labels, so the filter cannot see it. */
+    extraContainerIds?: string[],
+    options?: { prunePrefix?: string; retain?: string[]; strict?: boolean },
+  ): Promise<void>;
+
+  /**
+   * Join already-running containers (migration attach-live reuse) to a project's
+   * `openship-<slug>` network with a DNS alias each, so a natively-deployed
+   * service in the SAME project resolves them by name (reused `postgres` reachable
+   * from a freshly-built `web`). Additive network-connect — no restart, no volume
+   * touch. Best-effort + idempotent. Optional (docker only). */
+  joinServiceGroupContainers?(
+    slug: string,
+    members: Array<{ containerId: string; aliases: string[] }>,
+    options?: { strict?: boolean },
+  ): Promise<void>;
+
+  /** Disconnect exact containers from a shared-service network; remove it when empty. */
+  leaveServiceGroupContainers?(slug: string, containerIds: string[]): Promise<void>;
+
+  // ── Rollback primitives ──────────────────────────────────────────────
+  //
+  // What "the artifact" IS differs per runtime, and that difference is
+  // the whole design:
+  //
+  //   Bare / Cloud — a DURABLE PER-DEPLOYMENT UNIT (supervisor unit +
+  //     release dir; stopped workspace + disk). It survives a redeploy,
+  //     so restoring it really is an instant swap: `makeActive`.
+  //     Capability flag: "unitRestore".
+  //
+  //   Docker — the IMAGE. Containers are disposable and a redeploy
+  //     REMOVES the previous one (the loopback-port route strategy can't
+  //     overlap two containers on one host port), so there is no unit to
+  //     restart. Docker therefore does NOT implement `makeActive`; its
+  //     restore re-materializes the container from the retained image
+  //     through the normal deploy step, with the target's frozen config
+  //     snapshot + env (see modules/deployments/rollback/restore-plan.ts).
+  //     A hand-rolled `createContainer` here can only ever be a
+  //     lesser copy of `deploy()` — that's exactly the stub that shipped
+  //     rollbacks with no env, no published port and detached volumes.
+  //
+  // `archive`/`purge` are the RETENTION half and every runtime
+  // implements them (capability flag: "rollback").
+  //
+  // ALL ops are idempotent: archiving an already-archived deployment is
+  // a no-op; purging an already-purged one is too.
+
+  /**
+   * Make this deployment the live one, swapping away from whatever was
+   * active before (`from`) in the same call so there's no "nothing
+   * active" window.
    *
-   * Used by:
-   *   - Rollback (artifact already archived, we restore it)
-   *   - Re-promotion (rare: a paused/archived dep is brought back)
+   * ONLY implemented by runtimes with the "unitRestore" capability —
+   * those whose artifact is a durable per-deployment unit that can be
+   * restarted in place (bare, cloud). Absent on Docker by design.
    *
-   * NOT used by the initial deploy path — that's `deploy()` which
-   * builds-then-activates atomically.
+   * NOT used by the initial deploy path — that's `deploy()`.
    *
    * Returns identifiers the orchestrator needs to persist on the
-   * deployment row (newly-created container ID for Docker if we ran
-   * from image, new workspace ID for Cloud, etc.).
+   * deployment row (new workspace ID for Cloud, etc.).
    */
-  makeActive(input: RollbackInput): Promise<MakeActiveResult>;
+  makeActive?(input: RollbackInput): Promise<MakeActiveResult>;
 
   /**
    * Preserve this deployment's artifact in non-active state so it can
-   * be made active later. Idempotent.
-   *   Docker — `docker stop` (image stays tagged, container preserved)
-   *   Bare   — no-op (release dir already on disk = archived)
+   * be restored later. Idempotent.
+   *   Docker — `docker stop`; the IMAGE is what's retained (by the
+   *            rollback-window keep-set in modules/deployments/image-gc),
+   *            and the container is usually already gone.
+   *   Bare   — stop the supervisor unit; release dir stays on disk.
    *   Cloud  — `snapshots.createArchive` + `workspace.stop` (disk
    *            captured as point-in-time archive next to the workspace;
    *            compute paused).
@@ -250,10 +451,7 @@ export interface RuntimeAdapter {
    * Open an interactive shell inside a deployed service. Optional —
    * runtimes without `serviceShell` capability throw if called.
    */
-  openServiceShell?(
-    containerId: string,
-    opts?: ShellOptions,
-  ): Promise<ShellSession>;
+  openServiceShell?(containerId: string, opts?: ShellOptions): Promise<ShellSession>;
 }
 
 // ─── Rollback primitive types ───────────────────────────────────────────────
@@ -271,9 +469,6 @@ export interface DeploymentRef {
    *  on archived deployments (Docker container could be GC'd, Bare
    *  doesn't track one, Cloud terminated its workspace). */
   containerId: string | null;
-  /** Per-service container IDs for multi-service compose deployments.
-   *  Empty for single-service. */
-  serviceContainerIds?: Record<string, string>;
 }
 
 export interface RollbackInput {
@@ -285,19 +480,19 @@ export interface RollbackInput {
    *  that this deployment's artifact is archived (rollback-restorable)
    *  before invoking the runtime. */
   to: DeploymentRef;
+  /** The target's cpu/memory caps, so a runtime that has to re-create
+   *  anything restores the limits it originally had instead of dropping
+   *  them. Undefined/0 = no cap (self-hosted default). */
+  resources?: ResourceConfig;
 }
 
 export interface MakeActiveResult {
-  /** New container ID if the runtime created one (Docker `run` from
-   *  image when the previous container was GC'd). Undefined when no
-   *  ID change happened (existing container started, Bare symlink
-   *  swap, etc.). */
+  /** New container/unit ID if the runtime assigned one. Undefined when no
+   *  ID change happened (existing unit restarted). */
   containerId?: string;
   /** New URL if the runtime assigned one (Cloud launches new
    *  workspace at fresh URL). Undefined when the URL is stable. */
   url?: string;
-  /** New per-service container IDs for multi-service deployments. */
-  serviceContainerIds?: Record<string, string>;
 }
 
 export interface MultiServiceGroupHandle {
@@ -318,22 +513,91 @@ export interface MultiServiceDeployConfig {
    *  create time. False for grandfathered pre-migration services (bare names). */
   namespaceVolumes: boolean;
   command?: string;
+  /**
+   * #332: structured argv for the container Cmd (docker-compose semantics —
+   * overrides image CMD, NO implicit `sh -c`). When set, it wins over `command`.
+   * `null`/absent → fall back to the legacy `["sh","-c",command]` wrap; `[]` →
+   * clear the image CMD.
+   */
+  commandArgv?: string[] | null;
   restart?: string;
+  /**
+   * Force a fresh `docker pull` of the image tag even when a local copy exists.
+   * Set for explicit update operations and incoming deploy hooks. A normal
+   * manual redeploy stays pull-if-missing so it never surprise-bumps a
+   * `:latest` app or defeats unchanged-image carry-forward.
+   */
+  forcePull?: boolean;
+  /** The exact image reference was produced/pinned by the orchestrator or was
+   * already pulled during cohort preparation. Docker must not infer this from
+   * the tag text: a registry image can legitimately use Openship's tag shape. */
+  imageAlreadyPrepared?: boolean;
   /** Extended compose fields (healthcheck, …). Docker honors them; runtimes
    *  that can't (cloud) warn-and-drop. See ComposeAdvanced in @repo/core. */
   advanced?: ComposeAdvanced;
+  /** Additional east-west DNS aliases resolving to this container ALONGSIDE the
+   *  default `serviceName` — e.g. an operator-chosen `service.advanced.alias`.
+   *  Every entry is a live name on the project network; loopback publish
+   *  unchanged. Already normalized (DNS-safe) by the caller. */
+  extraAliases?: string[];
   resources?: { cpuCores?: number; memoryMb?: number };
   publicPort?: number;
   publicSlug?: string;
   customDomain?: string;
   expose?: boolean;
+  /** All approved Cloud hostnames for this service, including secondary ports. */
+  cloudEndpoints?: Array<{ hostname: string; port: number; custom: boolean }>;
+  /** Ports needed by project/composite edge routes, without a service hostname. */
+  cloudProxyPorts?: number[];
+  /** Cloud only: the workspace id this service used in the PREVIOUS deployment.
+   *  Reused so its permanent-workspace disk — the only persistence Oblien
+   *  offers (no volume primitive) — survives a redeploy. A fresh workspace each
+   *  deploy = silent data loss for stateful services (Postgres, Redis, …). */
+  previousWorkspaceId?: string;
+  /** Service names this service depends on (compose `depends_on`). Used for
+   *  readiness ordering on runtimes with no native healthcheck. */
+  dependsOn?: string[];
+  /**
+   * Namespaces this container SHARES instead of getting its own, already resolved
+   * to values Docker takes verbatim (`container:<id>`, `none`).
+   *
+   * Resolution happens in the API, not here: a compose `service:<name>` has to
+   * become the sibling's LIVE container id, and the deploy loop is the layer that
+   * knows which siblings came up in this deployment (and refuses the dependent
+   * when one didn't). The runtime's job is to apply these and suppress what they
+   * make impossible — see `deployServiceWorkload`. Absent = its own namespaces,
+   * which is every service that doesn't ask otherwise.
+   */
+  namespaces?: {
+    /** `HostConfig.NetworkMode`. Set ⇒ no port publish, no network join, no alias. */
+    network?: string;
+    /** `HostConfig.PidMode`. Costs the container nothing else. */
+    pid?: string;
+  };
 }
 
 export interface MultiServiceDeployResult {
   containerId: string;
   status: string;
+  /** The container is running, but one or more edge routes need a retry. */
+  routeWarnings?: string[];
   ip?: string;
+  /** The FIRST binding the daemon reports — arbitrary for a multi-port container.
+   *  Anything picking a proxy target for a SPECIFIC container port must read
+   *  `hostPortByContainerPort`; this stays for the one scalar `service_deployment`
+   *  can persist. */
   hostPort?: number;
+  /** Every published binding, keyed by CONTAINER port → host port. See
+   *  `ContainerInfo.hostPortByContainerPort`: without it a route for a container's
+   *  second port is dialed at the first port's publish, reaching a different app. */
+  hostPortByContainerPort?: Record<number, number>;
+  /**
+   * Content-addressable image digest actually running (`repo@sha256:…`), read
+   * from the image's RepoDigests after create. The anchor the update scanner
+   * uses to detect a moved mutable tag. Undefined when unresolvable (e.g. a
+   * locally-built image with no registry digest).
+   */
+  imageDigest?: string;
 }
 
 export interface MultiServiceRuntimeAdapter extends RuntimeAdapter {
@@ -387,6 +651,29 @@ export interface MultiServiceRuntimeAdapter extends RuntimeAdapter {
     }>,
     prepareLogger: BuildLogger,
   ): Promise<Array<{ serviceName: string; result: BuildResult }>>;
+
+  /**
+   * Optional final convergence pass, run ONCE after every service in the group
+   * has deployed. Lets a runtime whose service discovery is built up
+   * incrementally (Cloud: per-workspace /etc/hosts + private links) re-resolve
+   * any late-assigned addresses and rewrite the full mesh so every peer is
+   * reachable by name. Absent on runtimes with live DNS (Docker) — their real
+   * network needs no post-pass.
+   */
+  finalizeServiceGroup?(group: MultiServiceGroupHandle, onLog?: LogCallback): Promise<void>;
+
+  /**
+   * Optional: seed an ALREADY-RUNNING service into the group's in-memory mesh
+   * state WITHOUT deploying it, so a subsequent `finalizeServiceGroup` includes
+   * it when rewriting the full mesh. Used by the decoupled single-service add
+   * (strictScope): only the new service is deployed, but its existing peers
+   * must stay reachable by name (and learn about the newcomer). No-op / absent
+   * on runtimes with live DNS (Docker) — their real network needs no seeding.
+   */
+  registerExistingWorkload?(
+    group: MultiServiceGroupHandle,
+    service: { serviceName: string; workspaceId: string; ip?: string; portSpecs?: string[] },
+  ): void;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -408,4 +695,113 @@ export function isMultiServiceRuntime(
   runtime: RuntimeAdapter,
 ): runtime is MultiServiceRuntimeAdapter {
   return runtime.supports("multiServiceDeploy");
+}
+
+// ─── Docker discovery (label-agnostic inspection) ─────────────────────────────
+//
+// DTOs for MIGRATING an existing Docker deployment into Openship. The
+// label-scoped queries elsewhere in DockerRuntime only see `openship.*`
+// containers; these enumerate the WHOLE daemon so we can adopt containers
+// Openship never created (a hand-run `docker run`, or a `docker compose` stack).
+// All fields are plain/serializable — they cross the API→dashboard boundary.
+
+export interface DockerMount {
+  /** "volume" | "bind" | "tmpfs" | "npipe" */
+  type: string;
+  /** Named-volume name (type=volume). Absent for binds/tmpfs. */
+  name?: string;
+  /** Host path (bind) or the volume's resolved mountpoint. */
+  source?: string;
+  /** Path inside the container. */
+  destination: string;
+  rw: boolean;
+}
+
+export interface DockerPortBinding {
+  /** Container-side port. */
+  privatePort: number;
+  /** Published host port (absent = exposed but not published). */
+  publicPort?: number;
+  /** "tcp" | "udp" | "sctp" */
+  type: string;
+  /** Host IP the port is bound on ("0.0.0.0" = all interfaces). */
+  ip?: string;
+}
+
+/** One container as seen in the `docker ps` list view. */
+export interface DockerContainerSummary {
+  id: string;
+  names: string[];
+  image: string;
+  imageId: string;
+  /** "running" | "exited" | "paused" | "created" | "restarting" | "dead" */
+  state: string;
+  /** Human status line, e.g. "Up 3 days". */
+  status: string;
+  labels: Record<string, string>;
+  ports: DockerPortBinding[];
+  mounts: DockerMount[];
+  /** First network IP the list view reports — the internal address siblings
+   *  reach this container on. Absent for a non-running container. */
+  ip?: string;
+  /** com.docker.compose.project label, if the container is compose-managed. */
+  composeProject?: string;
+  /** com.docker.compose.service label, if the container is compose-managed. */
+  composeService?: string;
+}
+
+/** Full `docker inspect` of one container, normalized to what adoption needs. */
+export interface DockerContainerDetail {
+  id: string;
+  name: string;
+  image: string;
+  imageId: string;
+  state: string;
+  command?: string[];
+  entrypoint?: string[];
+  /** Config.Env as raw KEY=VALUE strings (image-default entries included). */
+  env: string[];
+  workingDir?: string;
+  labels: Record<string, string>;
+  restart?: { name: string; maximumRetryCount?: number };
+  /** Names of the networks the container is attached to. */
+  networks: string[];
+  /** Live addresses on every attached network, for matching proxy upstreams. */
+  networkAddresses?: string[];
+  mounts: DockerMount[];
+  ports: DockerPortBinding[];
+  /** Healthcheck as declared on the container config (durations in ns). */
+  healthcheck?: {
+    test?: string[];
+    interval?: number;
+    timeout?: number;
+    retries?: number;
+    startPeriod?: number;
+  };
+  /** Live cpu/memory caps read off HostConfig, so adopting a container keeps the
+   *  limits it was actually running with — including one set by hand with
+   *  `docker update --memory`. Omitted fields mean the container had no cap. */
+  resources?: { cpuCores?: number; memoryMb?: number };
+  composeProject?: string;
+  composeService?: string;
+  /** com.docker.compose.project.config_files — absolute compose paths on the host. */
+  composeConfigFiles?: string[];
+  /** com.docker.compose.project.working_dir — the compose project's cwd. */
+  composeWorkingDir?: string;
+}
+
+export interface DockerVolumeInfo {
+  name: string;
+  driver: string;
+  mountpoint?: string;
+  labels: Record<string, string>;
+  composeProject?: string;
+}
+
+export interface DockerNetworkInfo {
+  id: string;
+  name: string;
+  driver: string;
+  labels: Record<string, string>;
+  composeProject?: string;
 }

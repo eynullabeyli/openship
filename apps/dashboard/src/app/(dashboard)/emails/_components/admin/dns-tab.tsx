@@ -36,8 +36,11 @@ import {
   type MailSetupStatus,
 } from "@/lib/api";
 import { DnsRecordsView } from "@/components/shared/DnsRecordsView";
+import { AutoDnsPanel } from "@/components/shared/AutoDnsPanel";
 import { SectionCard } from "./_shared/section-card";
+import { DomainPicker } from "./_shared/domain-picker";
 import { useI18n, interpolate } from "@/components/i18n-provider";
+import { useMailRailOwnsTabs } from "../../_lib/mail-section";
 
 interface DnsTabProps {
   status: MailSetupStatus;
@@ -55,6 +58,8 @@ export function DnsTab({
   onSelectDomain,
 }: DnsTabProps) {
   const { t } = useI18n();
+  // Heading lives in the page header in mail view — see ../../_lib/mail-section.
+  const hoisted = useMailRailOwnsTabs(serverId);
   const activeDomain = selectedDomain || primaryDomain;
   const isPrimary = activeDomain === primaryDomain;
 
@@ -149,36 +154,35 @@ export function DnsTab({
 
   return (
     <div className="space-y-5">
-      <Header />
+      {!hoisted && <Header />}
 
-      {/* Domain picker */}
-      <div className="flex items-center gap-2 flex-wrap">
-        <span className="text-sm text-muted-foreground">{t.emailsAdmin.dns.domainLabel}</span>
-        {loadingDomains ? (
-          <div className="px-3 py-2 rounded-xl border border-border bg-muted/30 flex items-center gap-2">
-            <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
-            <span className="text-sm text-muted-foreground">{t.emailsAdmin.dns.loading}</span>
-          </div>
-        ) : (
-          <select
-            value={activeDomain}
-            onChange={(e) => onSelectDomain(e.target.value)}
-            className="px-3 py-2 text-sm rounded-xl border border-border bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-primary/40 transition-colors min-w-[200px]"
-          >
-            {domains.length === 0 && primaryDomain && (
-              <option value={primaryDomain}>{primaryDomain}</option>
-            )}
-            {domains.map((d) => (
-              <option key={d.domain} value={d.domain}>
-                {d.domain}
-              </option>
-            ))}
-          </select>
-        )}
+      {/* Domain picker. Falls back to the install domain while the list is
+          still empty, so the tab always has a scope to render. */}
+      <DomainPicker
+        label={t.emailsAdmin.dns.domainLabel}
+        value={activeDomain}
+        domains={
+          domains.length === 0 && primaryDomain
+            ? [primaryDomain]
+            : domains.map((d) => d.domain)
+        }
+        onChange={onSelectDomain}
+        loading={loadingDomains}
+        loadingLabel={t.emailsAdmin.dns.loading}
+      >
         {isPrimary && (
           <span className="text-xs text-muted-foreground/70">{t.emailsAdmin.dns.primary}</span>
         )}
-      </div>
+      </DomainPicker>
+
+      {/* On-demand auto-configure via a connected DNS provider (Settings→DNS). */}
+      {activeDomain ? (
+        <AutoDnsPanel
+          plan={() => mailAdminApi.domains.dnsPlan(serverId, activeDomain).then((r) => r.data)}
+          apply={() => mailAdminApi.domains.dnsApply(serverId, activeDomain).then((r) => r.data)}
+          reloadKey={activeDomain}
+        />
+      ) : null}
 
       {/* Records for publishing */}
       <SectionCard
@@ -226,7 +230,7 @@ export function DnsTab({
         }
       >
         {scanErr && (
-          <div className="px-5 py-3 text-sm text-red-600 dark:text-red-400 border-b border-border/40 bg-red-500/5">
+          <div className="px-5 py-3 text-sm text-danger border-b border-border/40 bg-danger-bg">
             {scanErr}
           </div>
         )}
@@ -358,25 +362,25 @@ function presentation(status: DnsCheckStatus) {
     case "pass":
       return {
         Icon: Check,
-        iconBg: "bg-emerald-500/10",
-        iconColor: "text-emerald-600 dark:text-emerald-400",
-        pill: "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400",
+        iconBg: "bg-success-bg",
+        iconColor: "text-success",
+        pill: "bg-success-bg text-success",
         label: "Pass",
       };
     case "warn":
       return {
         Icon: AlertTriangle,
-        iconBg: "bg-amber-500/10",
-        iconColor: "text-amber-600 dark:text-amber-400",
-        pill: "bg-amber-500/10 text-amber-600 dark:text-amber-400",
+        iconBg: "bg-warning-bg",
+        iconColor: "text-warning",
+        pill: "bg-warning-bg text-warning",
         label: "Warning",
       };
     case "fail":
       return {
         Icon: CircleX,
-        iconBg: "bg-red-500/10",
-        iconColor: "text-red-600 dark:text-red-400",
-        pill: "bg-red-500/10 text-red-600 dark:text-red-400",
+        iconBg: "bg-danger-bg",
+        iconColor: "text-danger",
+        pill: "bg-danger-bg text-danger",
         label: "Fail",
       };
     default:

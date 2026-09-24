@@ -19,6 +19,8 @@
  * Pure string logic, no dependencies — trivially unit-testable.
  */
 
+import { isHostPathSource } from "@repo/core";
+
 /** Trailing bind mode suffix (":ro" / ":rw" / SELinux / nocopy). Mirrors the
  *  regex in backup/executors/docker.ts so classification stays identical. */
 const MODE_SUFFIX = /:(ro|rw|z|Z|nocopy)$/;
@@ -29,18 +31,27 @@ export function scopedVolumeName(slug: string, name: string): string {
 }
 
 /**
+ * `scopedVolumeName` for a source that may ALREADY carry this project's prefix.
+ *
+ * `scopedVolumeName` is deliberately unconditional — the migration importer relies on
+ * that to claim a foreign volume whose name happens to look scoped. But a source read
+ * back out of our OWN `service.volumes` column may already be stored scoped, and
+ * prefixing it twice names a volume that has never existed. Docker then creates it
+ * empty on mount, so a backup archives nothing and a restore writes where nothing
+ * reads. Same guard `scopeVolumeBinds` applies, exposed for callers that hold a bare
+ * source rather than a whole spec.
+ */
+export function ensureScopedVolumeName(slug: string, source: string): string {
+  const prefix = `openship-${slug}-`;
+  return source.startsWith(prefix) ? source : scopedVolumeName(slug, source);
+}
+
+/**
  * A volume source that is a HOST PATH (bind mount), not a named volume. Named
  * volumes get scoped; bind mounts must pass through untouched. Covers the `~`
  * (home) case that the legacy backup classifier missed.
  */
-export function isHostPathSource(source: string): boolean {
-  return (
-    source.startsWith("/") ||
-    source.startsWith("./") ||
-    source.startsWith("../") ||
-    source.startsWith("~")
-  );
-}
+export { isHostPathSource } from "@repo/core";
 
 /**
  * Rewrite each NAMED volume in a list of raw compose volume specs to its

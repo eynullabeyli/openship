@@ -18,7 +18,7 @@
  *     reset        POST   /mail/setup/reset          { serverId }
  *     forget       DELETE /mail/servers/:serverId
  *   Post-install
- *     health       GET    /mail/health/:serverId
+ *     health       GET    /mail/health/:serverId   (daemons + outbound delivery)
  *     logs         GET    /mail/admin/:serverId/components/:key/logs?lines=
  *     postmaster   POST   /mail/credentials/postmaster  { serverId, password }
  *   Admin panel   (/mail/admin/:serverId/…)
@@ -29,7 +29,7 @@
  *     dns-scan     GET    /admin/:id/dns-scan?domain=
  *   Webmail
  *     targets      GET    /mail/webmail/targets?serverId=
- *     deploy       POST   /mail/webmail/deploy-project  { mailServerId, hostname, target, internalPort? }
+ *     deploy       POST   /mail/webmail/deploy-project  { mailServerId, hostname, target }
  *
  * Setup + webmail-deploy logs stream over lib/sse (sseRequest /
  * streamDeploymentLogs). The mail admin component-logs route is a JSON
@@ -38,13 +38,18 @@
 import { Command } from "commander";
 import chalk from "chalk";
 import ora from "ora";
+import { spawnSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
-import { apiRequest, ApiError } from "../lib/api-client";
-import { sseRequest } from "../lib/sse";
+import { buildMailImageRef } from "@repo/core";
+import { getRemoteClient, ApiError } from "../lib/ship-client";
 import { streamDeploymentLogs } from "../lib/deploy-stream";
 import { getToken } from "../lib/config";
 import { fetchCaps, requireSelfHost } from "../lib/caps";
+import { has } from "../lib/from-source";
+import { readSourceInstall } from "../lib/source-install";
 import { isJsonMode, printJson, printTable, ok, err, info } from "../lib/output";
 
 // ─── Shared plumbing ──────────────────────────────────────────────────────────
@@ -104,7 +109,7 @@ const stepsCmd = new Command("steps")
   .description("List the mail setup steps")
   .action(
     guard(async () => {
-      const res = await apiRequest<{ steps: Array<{ id: number; key: string; label: string; description: string }>; total: number }>(
+      const res = await getRemoteClient().http.request<{ steps: Array<{ id: number; key: string; label: string; description: string }>; total: number }>(
         "/mail/steps",
       );
       if (isJsonMode()) return printJson(res);
@@ -137,7 +142,7 @@ const statusCmd = new Command("status")
   .action(
     guard(async (serverId?: string) => {
       const q = serverId ? `?serverId=${encodeURIComponent(serverId)}` : "";
-      const res = await apiRequest<MailStatus>(`/mail/status${q}`);
+      const res = await getRemoteClient().http.request<MailStatus>(`/mail/status${q}`);
       if (isJsonMode()) return printJson(res);
       info(`  server:  ${res.serverId ?? "-"}`);
       info(`  domain:  ${res.domain ?? "-"}`);
@@ -160,7 +165,7 @@ const serversCmd = new Command("servers")
   .description("List every server the mail stack is installed on")
   .action(
     guard(async () => {
-      const res = await apiRequest<{ servers: Array<{ id: string; name: string; host: string; port: number; user: string; domain: string; completed: boolean; active: boolean }> }>(
+      const res = await getRemoteClient().http.request<{ servers: Array<{ id: string; name: string; host: string; port: number; user: string; domain: string; completed: boolean; active: boolean }> }>(
         "/mail/servers",
       );
       const rows = res.servers ?? [];
@@ -186,7 +191,7 @@ const scanCmd = new Command("scan")
   .action(
     guard(async (serverId: string) => {
       const sp = spin("Scanning server…");
-      const res = await apiRequest<{
+      const res = await getRemoteClient().http.request<{
         serverId: string;
         iredmailInstalled: boolean;
         hasState: boolean;
@@ -213,7 +218,7 @@ const adoptCmd = new Command("adopt")
   .action(
     guard(async (serverId: string) => {
       const sp = spin("Adopting mail server…");
-      const res = await apiRequest<{ success: boolean; serverId: string; domain: string; completed: boolean }>(
+      const res = await getRemoteClient().http.request<{ success: boolean; serverId: string; domain: string; completed: boolean }>(
         "/mail/adopt",
         { method: "POST", body: JSON.stringify({ serverId }) },
       );
@@ -247,7 +252,7 @@ const setupCmd = new Command("setup")
 
       info(`  Setting up mail on ${serverId} for ${opts.domain}… (Ctrl-C to stop)`);
       let failed = false;
-      for await (const ev of sseRequest("/mail/setup", {
+      for await (const ev of getRemoteClient().http.events("/mail/setup", {
         method: "POST",
         body: JSON.stringify(body),
       })) {
@@ -305,7 +310,7 @@ const cancelCmd = new Command("cancel")
   .description("Cancel the mail setup currently running")
   .action(
     guard(async () => {
-      const res = await apiRequest<{ ok: boolean; message?: string }>("/mail/setup/cancel", {
+      const res = await getRemoteClient().http.request<{ ok: boolean; message?: string }>("/mail/setup/cancel", {
         method: "POST",
       });
       if (isJsonMode()) return printJson(res);
@@ -320,7 +325,7 @@ function ackCommand(name: string, path: string, description: string, successMsg:
     .argument("<serverId>", "Mail server ID")
     .action(
       guard(async (serverId: string) => {
-        const res = await apiRequest<{ ok: boolean }>(path, {
+        const res = await getRemoteClient().http.request<{ ok: boolean }>(path, {
           method: "POST",
           body: JSON.stringify({ serverId }),
         });
@@ -356,7 +361,7 @@ const resetCmd = new Command("reset")
         rl.close();
         if (answer.trim().toLowerCase() !== "y") return info("  Aborted.");
       }
-      const res = await apiRequest<{ ok: boolean }>("/mail/setup/reset", {
+      const res = await getRemoteClient().http.request<{ ok: boolean }>("/mail/setup/reset", {
         method: "POST",
         body: JSON.stringify({ serverId }),
       });
@@ -370,7 +375,7 @@ const forgetCmd = new Command("forget")
   .argument("<serverId>", "Mail server ID")
   .action(
     guard(async (serverId: string) => {
-      const res = await apiRequest<{ ok: boolean }>(`/mail/servers/${encodeURIComponent(serverId)}`, {
+      const res = await getRemoteClient().http.request<{ ok: boolean }>(`/mail/servers/${encodeURIComponent(serverId)}`, {
         method: "DELETE",
       });
       if (isJsonMode()) return printJson(res);
@@ -381,14 +386,15 @@ const forgetCmd = new Command("forget")
 // ─── Post-install ─────────────────────────────────────────────────────────────
 
 const healthCmd = new Command("health")
-  .description("Show live status of every mail daemon")
+  .description("Show live status of every mail daemon, and whether mail is leaving the box")
   .argument("<serverId>", "Mail server ID")
   .action(
     guard(async (serverId: string) => {
       const sp = spin("Checking mail daemons…");
-      const res = await apiRequest<{
+      const res = await getRemoteClient().http.request<{
         serverId: string;
         components: Array<{ key: string; label: string; status: string; subState?: string; unit: string }>;
+        delivery?: MailDeliveryHealth;
       }>(`/mail/health/${encodeURIComponent(serverId)}`);
       sp?.stop();
       if (isJsonMode()) return printJson(res);
@@ -401,8 +407,47 @@ const healthCmd = new Command("health")
         })),
         ["component", "unit", "status", "sub"],
       );
+      // Nine green daemons say nine processes are running, not that anything is
+      // being delivered — a relay with a wrong password looks identical to a
+      // healthy box in the table above. Optional so an older API still prints.
+      if (res.delivery) printDelivery(res.delivery);
     }),
   );
+
+interface MailDeliveryHealth {
+  status: "ok" | "warn" | "fail" | "unknown";
+  mode: "direct" | "relay";
+  relayHost?: string;
+  relayScope?: "all" | "selected";
+  relayDomains?: string[];
+  queued: number;
+  sampled: boolean;
+  deferrals: Array<{ kind: string; count: number; reason: string }>;
+  detail?: string;
+}
+
+function printDelivery(d: MailDeliveryHealth): void {
+  const paint = d.status === "fail" ? chalk.red : d.status === "warn" ? chalk.yellow : chalk.dim;
+  info(`  Outbound delivery: ${paint(d.status)}`);
+  info(
+    d.mode === "relay"
+      ? `    send path  relay via ${d.relayHost ?? "?"}` +
+          (d.relayScope === "selected" && d.relayDomains?.length
+            ? ` (${d.relayDomains.join(", ")})`
+            : "")
+      : "    send path  direct to recipients",
+  );
+  if (d.status === "unknown") {
+    if (d.detail) info(`    ${chalk.dim(d.detail)}`);
+    return;
+  }
+  info(`    queued     ${d.queued}${d.sampled ? " (reasons below are a sample)" : ""}`);
+  // The remote's verbatim refusal is the line that names the cause, so print it
+  // whole rather than summarising it into our own words.
+  for (const deferral of d.deferrals) {
+    info(`    ${deferral.kind.padEnd(9)} ×${deferral.count}  ${deferral.reason}`);
+  }
+}
 
 const logsCmd = new Command("logs")
   .description("Tail a mail component's journal (snapshot)")
@@ -411,7 +456,7 @@ const logsCmd = new Command("logs")
   .option("-n, --lines <n>", "Number of lines (max 1000)", "200")
   .action(
     guard(async (serverId: string, component: string, opts) => {
-      const res = await apiRequest<{ key: string; unit: string; lines: string[] }>(
+      const res = await getRemoteClient().http.request<{ key: string; unit: string; lines: string[] }>(
         `/mail/admin/${encodeURIComponent(serverId)}/components/${encodeURIComponent(component)}/logs?lines=${encodeURIComponent(opts.lines)}`,
       );
       if (isJsonMode()) return printJson(res);
@@ -443,7 +488,7 @@ postmasterCmd.addCommand(
           process.exit(1);
         }
         const sp = spin("Updating postmaster password…");
-        const res = await apiRequest<{ ok: boolean }>("/mail/credentials/postmaster", {
+        const res = await getRemoteClient().http.request<{ ok: boolean }>("/mail/credentials/postmaster", {
           method: "POST",
           body: JSON.stringify({ serverId, password }),
         });
@@ -452,6 +497,83 @@ postmasterCmd.addCommand(
       }),
     ),
 );
+
+// ─── Dev: build the engine image locally ──────────────────────────────────────
+
+const DOCKERFILE_REL = join("apps", "email", "Dockerfile");
+
+/** Repo root to build from: --context, else a source-install marker, else cwd. */
+function resolveBuildContext(explicit?: string): string | null {
+  if (explicit?.trim()) return resolve(explicit.trim());
+  const marker = readSourceInstall();
+  if (marker?.dir && existsSync(join(marker.dir, DOCKERFILE_REL))) return marker.dir;
+  const cwd = process.cwd();
+  if (existsSync(join(cwd, DOCKERFILE_REL))) return cwd;
+  return null;
+}
+
+/**
+ * The ref the API's `pinnedMailImage()` will look for: buildMailImageRef with the
+ * fallback tag read from the checkout's apps/api version, honoring the same
+ * OPENSHIP_MAIL_* / OPENSHIP_IMAGE_REGISTRY env the API reads — so the CLI tags
+ * exactly what mail bring-up resolves.
+ */
+function defaultMailRef(context: string): string {
+  let fallbackTag: string | undefined;
+  try {
+    const pkg = JSON.parse(readFileSync(join(context, "apps", "api", "package.json"), "utf8")) as {
+      version?: string;
+    };
+    if (typeof pkg.version === "string") fallbackTag = pkg.version;
+  } catch {
+    /* no checkout package.json → buildMailImageRef falls back to OPENSHIP_VERSION / latest */
+  }
+  return buildMailImageRef({ fallbackTag });
+}
+
+const buildCmd = new Command("build")
+  .description("Build the openship-mail engine image locally from a source checkout [dev]")
+  .option("--context <dir>", "Repo root containing apps/email/Dockerfile (default: checkout or cwd)")
+  .option("--tag <ref>", "Image ref to tag (default: the pinned openship-mail ref)")
+  .action(async (opts: { context?: string; tag?: string }) => {
+    try {
+      if (!has("docker")) {
+        err("Docker isn't on PATH — install Docker, then retry.");
+        process.exit(1);
+      }
+      const context = resolveBuildContext(opts.context);
+      if (!context) {
+        err(
+          "No source checkout to build from. Run from the repo root, or pass --context <path>.",
+        );
+        process.exit(1);
+      }
+      const dockerfile = join(context, DOCKERFILE_REL);
+      if (!existsSync(dockerfile)) {
+        err(`No apps/email/Dockerfile under ${context} — is that the repo root?`);
+        process.exit(1);
+      }
+      const ref = opts.tag?.trim() || defaultMailRef(context);
+
+      info(`  Building ${ref}`);
+      info(`    context:    ${context}`);
+      info(`    dockerfile: ${dockerfile}`);
+      // JSON mode: suppress build stdout so the closing JSON stays parseable; keep
+      // stderr so a failing build is still diagnosable.
+      const res = spawnSync("docker", ["build", "-t", ref, "-f", dockerfile, context], {
+        stdio: [isJsonMode() ? "ignore" : "inherit", isJsonMode() ? "ignore" : "inherit", "inherit"],
+      });
+      if (res.status !== 0) {
+        err(`docker build failed (exit ${res.status ?? "signal"}).`);
+        process.exit(1);
+      }
+      if (isJsonMode()) printJson({ ok: true, image: ref, context });
+      else ok(`  Built ${ref}. Run \`mail setup\` (or redeploy) and it's used without a registry pull.`);
+    } catch (e) {
+      err(e instanceof Error ? e.message : String(e));
+      process.exit(1);
+    }
+  });
 
 // ─── Parent ─────────────────────────────────────────────────────────────────
 
@@ -470,4 +592,5 @@ export const mailCommand = new Command("mail")
   .addCommand(forgetCmd)
   .addCommand(healthCmd)
   .addCommand(logsCmd)
-  .addCommand(postmasterCmd);
+  .addCommand(postmasterCmd)
+  .addCommand(buildCmd);

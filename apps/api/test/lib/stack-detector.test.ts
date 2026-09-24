@@ -6,8 +6,9 @@ import {
   getBuildCommand,
   getInstallCommand,
   getStartCommand,
+  resolvePackageJson,
   type RepoFile,
-} from "../../src/lib/stack-detector";
+} from "@repo/platform/engine/lib/stack-detector";
 
 /**
  * Helper: build a RepoFile[] from a flat string[] of filenames.
@@ -39,6 +40,24 @@ interface StackCase {
 }
 
 const POSITIVE_STACK_CASES: StackCase[] = [
+  // ── #231 regression: a backend framework shipping a Vite asset frontend must
+  //    detect as the backend, NOT as a bare Vite SPA (stock `laravel new` ships
+  //    vite.config.js + package.json and previously shadowed Laravel) ──────────
+  {
+    name: "Laravel + Vite frontend (stock `laravel new`) → laravel, not vite (#231)",
+    files: files("composer.json", "artisan", "package.json", "vite.config.js", "app/", "routes/"),
+    packageJson: { devDependencies: { vite: "^5.0.0", "laravel-vite-plugin": "^1.0.0" } },
+    // Real folder/git scans always carry composer.json content — Laravel's dep
+    // gate keys on laravel/framework. Without the Vite veto, `vite` matched first.
+    fileContents: { "composer.json": '{"require":{"laravel/framework":"^11.0","php":"^8.2"}}' },
+    expectedStack: "laravel",
+  },
+  {
+    name: "Pure Vite SPA (no backend marker) still → vite (#231 guard)",
+    files: files("package.json", "vite.config.ts", "index.html", "src/"),
+    packageJson: { devDependencies: { vite: "^5.0.0" } },
+    expectedStack: "vite",
+  },
   // ── JS/TS Frontend & Fullstack ──────────────────────────────────────────
   {
     name: "Next.js - next.config.js + next dep",
@@ -91,6 +110,55 @@ const POSITIVE_STACK_CASES: StackCase[] = [
     files: files("package.json", "remix.config.js"),
     packageJson: { dependencies: { "@remix-run/react": "^2.0.0" } },
     expectedStack: "remix",
+  },
+  // ── #400: TanStack Start is Vite-based; must detect as fullstack tanstack-start
+  //    (not bare vite SPA) so defaults use .output server start, not empty start.
+  {
+    name: "TanStack Start - vite.config.ts + @tanstack/react-start → tanstack-start, not vite (#400)",
+    files: files("package.json", "vite.config.ts", "src/", "app/"),
+    packageJson: {
+      dependencies: {
+        "@tanstack/react-start": "^1.0.0",
+        react: "^19.0.0",
+        vite: "^6.0.0",
+      },
+      // build script present → pm-prefixed build; no start script → registry default
+      scripts: { build: "vite build" },
+    },
+    expectedStack: "tanstack-start",
+    expectedCategory: "fullstack",
+    expectedProjectType: "app",
+    expectedStartCommand: "node .output/server/index.mjs",
+  },
+  {
+    name: "TanStack Start - app.config.ts + @tanstack/start dep (#400)",
+    files: files("package.json", "app.config.ts"),
+    packageJson: {
+      dependencies: { "@tanstack/start": "^1.0.0" },
+    },
+    expectedStack: "tanstack-start",
+    expectedCategory: "fullstack",
+    expectedStartCommand: "node .output/server/index.mjs",
+  },
+  {
+    name: "TanStack Start - rsbuild.config.ts + @tanstack/react-start dep (#400)",
+    files: files("package.json", "rsbuild.config.ts", "src/"),
+    packageJson: {
+      dependencies: { "@tanstack/react-start": "^1.0.0", "@rsbuild/core": "^1.0.0" },
+    },
+    expectedStack: "tanstack-start",
+    expectedCategory: "fullstack",
+    expectedStartCommand: "node .output/server/index.mjs",
+  },
+  {
+    name: "TanStack Start - pnpm lockfile uses pnpm build default (#400)",
+    files: files("package.json", "vite.config.ts", "pnpm-lock.yaml"),
+    packageJson: {
+      dependencies: { "@tanstack/react-start": "^1.0.0", vite: "^6.0.0" },
+      scripts: { build: "vite build" },
+    },
+    expectedStack: "tanstack-start",
+    expectedStartCommand: "node .output/server/index.mjs",
   },
   {
     name: "Angular - angular.json + @angular/core",
@@ -473,6 +541,29 @@ describe("detectStack - rule ordering & gate disambiguation", () => {
     expect(result.stack).toBe("vite");
   });
 
+  it("TanStack Start wins over Vite when @tanstack/react-start is present (#400)", () => {
+    const result = detectStack(files("package.json", "vite.config.ts", "pnpm-lock.yaml", "src/"), {
+      dependencies: { "@tanstack/react-start": "^1.0.0", vite: "^6.0.0", react: "^19.0.0" },
+      scripts: { build: "vite build" },
+    });
+    expect(result.stack).toBe("tanstack-start");
+    expect(result.category).toBe("fullstack");
+    expect(result.outputDirectory).toBe(".output");
+    expect(result.buildCommand).toBe("pnpm build");
+    expect(result.startCommand).toBe("node .output/server/index.mjs");
+    expect(result.port).toBe(3000);
+    expect(result.productionPaths).toEqual([".output"]);
+    expect(result.packageManager).toBe("pnpm");
+  });
+
+  it("plain Vite without TanStack deps still detects as vite (#400 guard)", () => {
+    const result = detectStack(files("package.json", "vite.config.ts", "index.html", "src/"), {
+      dependencies: { vite: "^6.0.0", react: "^19.0.0" },
+    });
+    expect(result.stack).toBe("vite");
+    expect(result.stack).not.toBe("tanstack-start");
+  });
+
   it("CRA does NOT match a Vite app without react-scripts", () => {
     const result = detectStack(files("package.json", "public/", "src/"), {
       dependencies: { react: "^19.0.0" },
@@ -536,6 +627,36 @@ describe("detectPackageManager", () => {
 
   it("bun via newer bun.lock", () => {
     expect(detectPackageManager(files("package.json", "bun.lock"))).toBe("bun");
+  });
+
+  it("bun via bunfig.toml with no lock file", () => {
+    expect(detectPackageManager(files("package.json", "bunfig.toml"))).toBe("bun");
+  });
+
+  // bunfig.toml is a runtime/test-runner config, NOT an install marker: using
+  // `bun test` while installing with npm/yarn is its whole point. It must stay
+  // BELOW the lock files and below an explicit packageManager field — promoting it
+  // silently flips those repos to `bun install` and the oven/bun build image.
+  describe("bunfig.toml never outranks a real install marker", () => {
+    it("loses to package-lock.json", () => {
+      expect(detectPackageManager(files("package.json", "bunfig.toml", "package-lock.json"))).toBe("npm");
+    });
+
+    it("loses to yarn.lock", () => {
+      expect(detectPackageManager(files("package.json", "bunfig.toml", "yarn.lock"))).toBe("yarn");
+    });
+
+    it("loses to pnpm-lock.yaml", () => {
+      expect(detectPackageManager(files("package.json", "bunfig.toml", "pnpm-lock.yaml"))).toBe("pnpm");
+    });
+
+    it("loses to an explicit packageManager field", () => {
+      expect(
+        detectPackageManager(files("package.json", "bunfig.toml"), {
+          packageManager: "yarn@4.1.0",
+        }),
+      ).toBe("yarn");
+    });
   });
 
   it("npm via package-lock.json", () => {
@@ -1239,5 +1360,89 @@ describe("detectStack - productionPaths reflect the stack registry", () => {
       dependencies: { next: "^15.0.0" },
     });
     expect(result.productionPaths).toEqual([]);
+  });
+});
+
+// ─── The parsed manifest is recoverable from its own text (#623) ─────────────
+
+/**
+ * A snapshot reads package.json twice — `readJson` for the parsed object and
+ * `readText` for the contents map — and every reader swallows a failure of either
+ * into `undefined`. When only the parsed half is lost, dependency matching still
+ * identifies the framework (it reads the text) while command derivation used to
+ * fall through to the registry's bare `next build` / `next start`. That pairing is
+ * openship#623: a `bun install` that succeeded followed by `next: not found`.
+ */
+const NEXT_PACKAGE_JSON = JSON.stringify({
+  name: "my-next-app",
+  dependencies: { next: "16.0.0", react: "19.0.0" },
+  scripts: { dev: "next dev", build: "next build", start: "next start" },
+});
+
+describe("resolvePackageJson", () => {
+  it("prefers the already-parsed manifest and never re-parses", () => {
+    const parsed = { name: "parsed" };
+    expect(resolvePackageJson(parsed, { "package.json": NEXT_PACKAGE_JSON })).toBe(parsed);
+  });
+
+  it("parses the raw text when the parsed manifest is missing", () => {
+    const recovered = resolvePackageJson(undefined, { "package.json": NEXT_PACKAGE_JSON });
+    expect((recovered?.scripts as Record<string, string>)?.build).toBe("next build");
+  });
+
+  it("matches the manifest key case-insensitively", () => {
+    expect(resolvePackageJson(undefined, { "Package.JSON": NEXT_PACKAGE_JSON })).toBeTruthy();
+  });
+
+  it("returns undefined for malformed, non-object, or absent text", () => {
+    expect(resolvePackageJson(undefined, { "package.json": "{ not json" })).toBeUndefined();
+    expect(resolvePackageJson(undefined, { "package.json": "[1,2]" })).toBeUndefined();
+    expect(resolvePackageJson(undefined, { "package.json": "null" })).toBeUndefined();
+    expect(resolvePackageJson(undefined, {})).toBeUndefined();
+    expect(resolvePackageJson(undefined, undefined)).toBeUndefined();
+  });
+});
+
+describe("detectStack - recovers scripts when only the manifest text survives (#623)", () => {
+  const nextBunFiles = files("package.json", "next.config.ts", "bun.lock");
+
+  it("runs build and start through the package manager, not as bare binaries", () => {
+    const result = detectStack(nextBunFiles, undefined, { "package.json": NEXT_PACKAGE_JSON });
+    expect(result.stack).toBe("nextjs");
+    expect(result.packageManager).toBe("bun");
+    expect(result.installCommand).toBe("bun install");
+    // Was "next build" / "next start" — unresolvable under a bare `sh -c`.
+    expect(result.buildCommand).toBe("bun run build");
+    expect(result.startCommand).toBe("bun run start");
+  });
+
+  it("agrees with the same input passed as a parsed manifest", () => {
+    const fromText = detectStack(nextBunFiles, undefined, { "package.json": NEXT_PACKAGE_JSON });
+    const fromParsed = detectStack(nextBunFiles, JSON.parse(NEXT_PACKAGE_JSON), {
+      "package.json": NEXT_PACKAGE_JSON,
+    });
+    expect(fromText.buildCommand).toBe(fromParsed.buildCommand);
+    expect(fromText.startCommand).toBe(fromParsed.startCommand);
+    expect(fromText.buildImage).toBe(fromParsed.buildImage);
+  });
+
+  it("still falls back to the registry default when the manifest really has no scripts", () => {
+    // The default is a legitimate command now that the recipe puts
+    // node_modules/.bin on PATH — it just must not be chosen over a real script.
+    const result = detectStack(nextBunFiles, undefined, {
+      "package.json": JSON.stringify({ dependencies: { next: "16.0.0" } }),
+    });
+    expect(result.stack).toBe("nextjs");
+    expect(result.buildCommand).toBe("next build");
+  });
+
+  it("recovers the port from scripts too", () => {
+    const result = detectStack(files("package.json"), undefined, {
+      "package.json": JSON.stringify({
+        dependencies: { express: "^4" },
+        scripts: { start: "node index.js --port 4321" },
+      }),
+    });
+    expect(result.port).toBe(4321);
   });
 });

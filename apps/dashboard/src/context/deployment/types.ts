@@ -1,8 +1,24 @@
 import type { Terminal } from "@xterm/xterm";
 import type { FrameworkId, EnvironmentVariable } from "@/components/import-project/types";
 import type { PrepareComposeService, PrepareSingleAppCandidate } from "@/lib/api/deploy";
-import { getBuildImage, STACKS, type ProjectType, type BuildStrategy, type DeployTarget, type RuntimeMode, type StackId, type RoutingConfig } from "@repo/core";
+import {
+  getBuildImage,
+  STACKS,
+  resolveWorkload,
+  type WorkloadType,
+  type ProjectType,
+  type BuildStrategy,
+  type DeployTarget,
+  type RuntimeMode,
+  type StackId,
+  type RoutingConfig,
+  type OpenshipReadiness,
+  type ResourceTier as CoreResourceTier,
+} from "@repo/core";
 import type { BuildLog } from "@/utils/deploymentPhaseDetector";
+import type { BuildSessionLoadResult } from "./load-session";
+import type { PersistedProjectEnv } from "@/lib/project-env-diff";
+import { randomUUID } from "@/lib/random-uuid";
 
 // ─── Monorepo sub-app ────────────────────────────────────────────────────────
 
@@ -75,10 +91,16 @@ export type ComposeServiceInfo = PrepareComposeService;
  * result. All carry the same camelCase fields but with nullable columns.
  */
 export type RawComposeService = {
+  /** The persisted service row's id, when this came from saved rows rather than a
+   *  fresh compose scan. Carried so an edit flow can reveal that service's stored
+   *  env — the reveal endpoint is keyed by service id, and re-deriving it from the
+   *  name later would be a second source of truth for the same fact. */
+  id?: string | null;
   name: string;
   image?: string | null;
   build?: string | null;
   dockerfile?: string | null;
+  buildArgs?: Record<string, string | null> | null;
   ports?: string[] | null;
   dependsOn?: string[] | null;
   environment?: Record<string, string> | null;
@@ -91,6 +113,12 @@ export type RawComposeService = {
   domain?: string | null;
   customDomain?: string | null;
   domainType?: "free" | "custom" | null;
+  publicEndpoints?: Array<{
+    port?: number | string | null;
+    domain?: string | null;
+    customDomain?: string | null;
+    domainType?: "free" | "custom" | null;
+  }> | null;
 };
 
 /**
@@ -99,12 +127,40 @@ export type RawComposeService = {
  * and build-session hydration paths can't drift. Nullable columns collapse to
  * undefined / empty collections.
  */
+/**
+ * Re-attach persisted service ids to a freshly-hydrated compose list.
+ *
+ * A deployment SNAPSHOT carries the full compose config but no service-row ids (it is
+ * also the path used when a deploy failed before its rows existed, where there are none
+ * to carry). It overwrites `config.services` wholesale, so hydrating from a snapshot
+ * after the rows had already loaded silently dropped the ids — and with them the env
+ * editor's ability to reveal stored values.
+ *
+ * Matched on name because that is the only join the two sides share, and within ONE
+ * project's compose file names are unique by construction — compose itself keys services
+ * by name. An id already on the incoming row always wins; this only fills blanks.
+ */
+export function carryServiceIds(
+  next: ComposeServiceInfo[],
+  prev: ComposeServiceInfo[] | undefined,
+): ComposeServiceInfo[] {
+  if (!prev?.length) return next;
+  const idByName = new Map<string, string>();
+  for (const s of prev) if (s.serviceId) idByName.set(s.name, s.serviceId);
+  if (idByName.size === 0) return next;
+  return next.map((s) =>
+    s.serviceId ? s : { ...s, serviceId: idByName.get(s.name) ?? undefined },
+  );
+}
+
 export function normalizeComposeService(raw: RawComposeService): ComposeServiceInfo {
   return {
+    serviceId: raw.id ?? undefined,
     name: raw.name,
     image: raw.image ?? undefined,
     build: raw.build ?? undefined,
     dockerfile: raw.dockerfile ?? undefined,
+    buildArgs: raw.buildArgs ?? undefined,
     ports: raw.ports ?? [],
     dependsOn: raw.dependsOn ?? [],
     environment: raw.environment ?? {},
@@ -117,6 +173,17 @@ export function normalizeComposeService(raw: RawComposeService): ComposeServiceI
     domain: raw.domain ?? undefined,
     customDomain: raw.customDomain ?? undefined,
     domainType: raw.domainType ?? undefined,
+    publicEndpoints:
+      raw.publicEndpoints && raw.publicEndpoints.length > 0
+        ? raw.publicEndpoints.map((endpoint) =>
+            createPublicEndpoint({
+              port: endpoint.port != null ? String(endpoint.port) : "",
+              domain: endpoint.domain ?? "",
+              customDomain: endpoint.customDomain ?? "",
+              domainType: endpoint.domainType === "custom" ? "custom" : "free",
+            }),
+          )
+        : undefined,
   };
 }
 
@@ -124,9 +191,16 @@ export interface PublicEndpoint {
   id: string;
   port: string;
   targetPath: string;
+  /** Preserve an imported nginx `location = <path>` route during migration. */
+  exact?: boolean;
   domain: string;
   customDomain: string;
   domainType: "free" | "custom";
+  /** Canonical redirect: answer a 30x to this hostname (another of the project's
+   *  own) instead of serving the app here. Undefined = serves the app. */
+  redirectTo?: string;
+  /** 301 (default) | 302. Only meaningful alongside `redirectTo`. */
+  redirectStatus?: number;
 }
 
 // ─── Per-service deployment status (live from SSE or loaded from DB) ─────────
@@ -140,6 +214,45 @@ export interface ServiceDeployStatus {
   hostPort?: number;
   image?: string;
   build?: string;
+}
+
+/**
+ * How many services are in each state, for the "0/5 running · 2 built · 1 building"
+ * readout.
+ *
+ * Shared because that sentence is rendered TWICE on the compose deploy screen — the
+ * logs-panel chip and the Deployment Details row, side by side in the same grid —
+ * and each used to filter the same array itself against its own copy of the
+ * strings. A status-set change (counting `deploying` as in-flight) or a wording
+ * change applied to one made the two contradict each other about one stack, at the
+ * same instant, with nothing able to catch it: both i18n keys existed in every
+ * locale, so only their VALUES drifted.
+ *
+ * `status` is a single scalar and the SSE reducer upserts by `serviceId`, so these
+ * counts are mutually exclusive and sum to at most the service count.
+ *
+ * `total` is deliberately NOT here: the two callers legitimately disagree — the
+ * logs panel counts services that have produced log lines but aren't in the roster
+ * yet (`Math.max(services.length, logServiceNames.length)`), the sidebar counts
+ * only known services.
+ */
+export function composeServiceTally(services: readonly ServiceDeployStatus[]): {
+  running: number;
+  built: number;
+  building: number;
+  failed: number;
+} {
+  let running = 0;
+  let built = 0;
+  let building = 0;
+  let failed = 0;
+  for (const service of services) {
+    if (service.status === "running") running += 1;
+    else if (service.status === "built") built += 1;
+    else if (service.status === "building") building += 1;
+    else if (service.status === "failed") failed += 1;
+  }
+  return { running, built, building, failed };
 }
 
 // ─── Build Strategy ──────────────────────────────────────────────────────────
@@ -167,6 +280,24 @@ export interface DeploymentOptions {
   rootDirectory: string;
   hasServer: boolean;
   hasBuild: boolean;
+  /**
+   * The runtime workload axis (#538): `web` listens on a port and is routed,
+   * `worker` runs a long-lived container with no port/route, `static` serves
+   * files from the edge. Absent → derive from `hasServer` (never a worker), so
+   * every legacy config classifies exactly as before. A worker shares
+   * `hasServer=false` with a static site — only this field distinguishes them,
+   * so readers that must tell them apart go through `workloadOf`.
+   */
+  workloadType?: WorkloadType;
+}
+
+/** Resolve an options block's runtime workload, sharing the canonical core
+ *  resolver so a dashboard gate can never disagree with the backend. */
+export function workloadOf(options: {
+  workloadType?: WorkloadType | null;
+  hasServer?: boolean | null;
+}): WorkloadType {
+  return resolveWorkload(options.workloadType, options.hasServer);
 }
 
 export interface DeploymentModeSnapshot {
@@ -190,12 +321,13 @@ export interface DeploymentModeSnapshots {
 }
 
 /**
- * Resource tier IDs for Openship Cloud deploys. The label, RAM/CPU/disk
- * shape and price are placeholder values defined alongside the picker UI
- * — see `CLOUD_RESOURCE_TIERS` in `DeployTargetStep.tsx`. The backend
- * is the source of truth for what each tier actually provisions.
+ * Resource tier IDs for Openship Cloud deploys — DERIVED from the one tier union
+ * in @repo/core, which the backend provisioner reads too. `unlimited` is excluded
+ * because a metered cloud workspace must be provisioned at a concrete size.
+ * The picker's display specs come from the same core table (see
+ * `CLOUD_RESOURCE_TIERS` in `DeployTargetStep.tsx`).
  */
-export type CloudResourceTier = "micro" | "low" | "medium" | "high" | "custom";
+export type CloudResourceTier = Exclude<CoreResourceTier, "unlimited">;
 
 /**
  * User-supplied resource values when `cloudResourceTier === "custom"`.
@@ -214,11 +346,25 @@ export interface CloudResourceCustom {
 export interface DeploymentConfig {
   /** Existing deployable environment to update/deploy, when launched from a project page. */
   projectId?: string;
+  /** One-click catalog app (repo-less services project). Deploys from its saved
+   *  rows with no git source — treated like local/upload in the deploy guards. */
+  isApp?: boolean;
+  /** Catalog template id (e.g. "n8n", "convex") — drives the schema-based app
+   *  settings step in the wizard for apps with `management:"schema"`. */
+  appTemplateId?: string;
   projectName: string;
   repo: string;
   owner: string;
   /** Absolute path for local projects (mutually exclusive with owner/repo git source) */
   localPath?: string;
+  /**
+   * Explicit compose file location, for repos that keep it outside the detected
+   * root (e.g. `deploy/docker-compose/docker-compose.yml`). Set via
+   * `rescanWithComposePath` — it can't be edited locally like other fields
+   * because the whole service list is derived from that file — and persisted so
+   * redeploys re-read the same path.
+   */
+  composePath?: string;
   /** Folder-upload deploy: the upload session whose workspace/staging dir holds
    *  the source. Sent to buildAccess so the build adopts that uploaded source. */
   uploadSessionId?: string;
@@ -226,8 +372,23 @@ export interface DeploymentConfig {
   buildStrategy: BuildStrategy;
   /** Where the app deploys to: "local" (this machine), "server" (remote SSH), or "cloud" (Oblien) */
   deployTarget: DeployTarget;
+  /**
+   * Rollback retention, chosen in the wizard's target panel. Only used for a
+   * project that doesn't exist yet — once it does, the panel edits the project
+   * row directly (there's no reason to stage a change we can persist now).
+   * `rollbackWindow: null` = size it from the target's free disk.
+   */
+  rollbackWindow?: number | null;
+  rollbackStrategy?: "git" | "snapshot";
   /** Which server to deploy to when deployTarget === "server" */
   serverId?: string;
+  /**
+   * "None" routing: deploy with NO public URL (internal / port-only). When true
+   * the deploy sends `publicEndpoints: []` regardless of what's staged, and the
+   * domain picker collapses. Backend treats [] as no route (preflight warns, no
+   * Cloud gate). Free/Custom are expressed via each endpoint's domainType.
+   */
+  noPublicRoute?: boolean;
   /** Display name of the target server (resolved by the API for the detail UI). */
   serverName?: string;
   /** Runtime mode: "bare" (direct process) or "docker" (container-based) */
@@ -239,10 +400,19 @@ export interface DeploymentConfig {
   buildImage: string;
   publicEndpoints: PublicEndpoint[];
   envVars: EnvironmentVariable[];
-  /** Root .env values detected during prepare; user must import before they apply. */
+  /**
+   * Authoritative production-env snapshot used to persist only the wizard's
+   * changes. `null` means an existing project's env was never loaded, which is
+   * intentionally different from a project with no saved variables.
+   */
+  projectEnvBaseline: PersistedProjectEnv[] | null;
+  /** Root .env values detected during prepare; user must import before they apply.
+   *  Explicit openship.json env is placed directly in envVars instead. */
   rootEnvVars: EnvironmentVariable[];
   branch: string;
   branches: string[];
+  branchPage: number;
+  branchesHasMore: boolean;
   services: ComposeServiceInfo[];
   /**
    * Compose/import projects can either deploy each parsed service, or ignore the
@@ -265,6 +435,19 @@ export interface DeploymentConfig {
    *  project create so the backend persists + compiles it. Opaque passthrough. */
   routingConfig?: RoutingConfig | null;
   /**
+   * Deploy-time readiness gate, set in the wizard's collapsed Health section and
+   * seeded by the repo's `openship.json`. Undefined/null = OFF, which is the
+   * default: the deploy reports ready as soon as the workload is up and routed,
+   * and nothing post-start can delay or veto it.
+   */
+  readiness?: OpenshipReadiness | null;
+  /**
+   * What the scan's openship.json parse refused (#641). NOT a user setting — it's
+   * a fresh observation of the repo, so it is never hydrated from the saved
+   * project and never sent back on save.
+   */
+  configDiagnostics?: { errors: string[]; warnings: string[]; wholeFile?: true };
+  /**
    * Resource tier picked for Openship Cloud deploys. Self-hosted servers
    * inherit the host's capacity, so this field is meaningless for them
    * — kept on the config (not nested under cloud) because operators
@@ -277,16 +460,6 @@ export interface DeploymentConfig {
   cloudResourceTier?: CloudResourceTier;
   /** Custom CPU/RAM/disk values, used only when cloudResourceTier === "custom". */
   cloudResourceCustom?: CloudResourceCustom;
-  /**
-   * Per-deploy opt-in (desktop-only; default off) to forward the operator's
-   * LOCAL `gh` identity to a remote server so it can clone on-server using the
-   * relay — instead of building locally + uploading. Only meaningful for a
-   * server-target build; nothing is persisted on the remote.
-   *
-   * Internal now: derived from `cloneStrategy === "server"` on desktop. The
-   * user picks the clone location; this stays the backend relay switch.
-   */
-  forwardGitCredentials?: boolean;
   /**
    * Where a server deploy clones the repo (default "api-host"). "server" makes
    * the build host clone directly — desktop via the credential relay, a
@@ -307,18 +480,22 @@ export const DEFAULT_CONFIG: DeploymentConfig = {
   repo: "",
   owner: "",
   localPath: undefined,
+  composePath: undefined,
   uploadSessionId: undefined,
   buildStrategy: "server",
   deployTarget: "cloud",
-  runtimeMode: "bare",
+  runtimeMode: "docker",
   projectType: "app",
   framework: "nextjs",
   detectedFramework: null,
   packageManager: "npm",
   buildImage: "node:22",
   publicEndpoints: [],
+  noPublicRoute: false,
   branch: "main",
   branches: [],
+  branchPage: 0,
+  branchesHasMore: false,
   services: [],
   serviceDeploymentMode: "single",
   cloudResourceTier: "low",
@@ -334,16 +511,16 @@ export const DEFAULT_CONFIG: DeploymentConfig = {
     rootDirectory: "./",
     hasServer: true,
     hasBuild: true,
+    workloadType: "web",
   },
   envVars: [],
+  projectEnvBaseline: null,
   rootEnvVars: [],
 };
 
 function isSingleFlowAppStack(framework: string | undefined): framework is StackId {
   return Boolean(
-    framework &&
-    framework in STACKS &&
-    !NON_APP_SINGLE_FLOW_STACKS.has(framework as FrameworkId),
+    framework && framework in STACKS && !NON_APP_SINGLE_FLOW_STACKS.has(framework as FrameworkId),
   );
 }
 
@@ -370,7 +547,10 @@ export function getRecommendedSingleAppBuildImage(
 }
 
 export function resolveBuildImageForDeploymentMode(
-  config: Pick<DeploymentConfig, "projectType" | "serviceDeploymentMode" | "framework" | "packageManager" | "buildImage">,
+  config: Pick<
+    DeploymentConfig,
+    "projectType" | "serviceDeploymentMode" | "framework" | "packageManager" | "buildImage"
+  >,
   nextMode: DeploymentConfig["serviceDeploymentMode"] = config.serviceDeploymentMode,
 ): string {
   if (config.projectType !== "services") {
@@ -403,31 +583,22 @@ export function resolveBuildImageForDeploymentMode(
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/**
- * Whether any compose service uses a managed (free) domain that requires
- * Openship Cloud. Checks by domain *type*, not by domain string -
- * works regardless of the configured cloud domain.
- */
-export function servicesNeedCloud(services?: ComposeServiceInfo[]): boolean {
-  if (!services?.length) return false;
-  return services.some((s) => s.exposed && s.domainType !== "custom");
-}
+// The needs-cloud predicate (managed/free domain ⇒ needs cloud) is defined ONCE
+// in @repo/core and re-exported here under the historical names, so existing
+// importers are unchanged and client + server share one definition.
+export { servicesNeedCloud, endpointsNeedCloud as publicEndpointsNeedCloud } from "@repo/core";
 
-export function publicEndpointsNeedCloud(endpoints?: PublicEndpoint[]): boolean {
-  if (!endpoints?.length) return false;
-  return endpoints.some((endpoint) => endpoint.domainType !== "custom");
-}
-
-export function createPublicEndpoint(
-  overrides: Partial<PublicEndpoint> = {},
-): PublicEndpoint {
+export function createPublicEndpoint(overrides: Partial<PublicEndpoint> = {}): PublicEndpoint {
   return {
-    id: overrides.id ?? crypto.randomUUID(),
+    id: overrides.id ?? randomUUID(),
     port: overrides.port ?? "",
     targetPath: overrides.targetPath ?? "",
+    ...(overrides.exact ? { exact: true } : {}),
     domain: overrides.domain ?? "",
     customDomain: overrides.customDomain ?? "",
     domainType: overrides.domainType ?? "free",
+    ...(overrides.redirectTo ? { redirectTo: overrides.redirectTo } : {}),
+    ...(overrides.redirectStatus ? { redirectStatus: overrides.redirectStatus } : {}),
   };
 }
 
@@ -464,8 +635,8 @@ function normalizePublicEndpointForMode(
     return createPublicEndpoint({
       ...endpoint,
       port: opts.isPrimary
-        ? (opts.runtimePort || endpoint.port || "")
-        : (endpoint.port || opts.runtimePort || ""),
+        ? opts.runtimePort || endpoint.port || ""
+        : endpoint.port || opts.runtimePort || "",
       targetPath: "",
     });
   }
@@ -477,30 +648,40 @@ function normalizePublicEndpointForMode(
   });
 }
 
-export function syncPublicEndpointState(
-  config: DeploymentConfig,
-): DeploymentConfig {
-  const linkedRuntimePort = config.options.hasServer
-    ? (
-        config.options.productionPort ||
-        config.publicEndpoints[0]?.port ||
-        ""
-      )
+export function syncPublicEndpointState(config: DeploymentConfig): DeploymentConfig {
+  const workload = workloadOf(config.options);
+
+  // A worker (#538) binds no port and is never routed — it has no public
+  // endpoints at all. Clear them so the wizard neither shows nor submits a
+  // bogus static "/" route (a worker shares hasServer=false with a static site).
+  if (workload === "worker") {
+    return {
+      ...config,
+      publicEndpoints: [],
+      options: { ...config.options, productionPort: "" },
+    };
+  }
+
+  const isWeb = workload === "web";
+  const linkedRuntimePort = isWeb
+    ? config.options.productionPort || config.publicEndpoints[0]?.port || ""
     : config.options.productionPort;
   const endpoints = ensurePublicEndpoints(
     config.publicEndpoints,
-    config.options.hasServer
+    isWeb
       ? {
           port: linkedRuntimePort,
         }
       : {
           targetPath: "/",
         },
-  ).map((endpoint, index) => normalizePublicEndpointForMode(endpoint, {
-    hasServer: config.options.hasServer,
-    runtimePort: linkedRuntimePort,
-    isPrimary: index === 0,
-  }));
+  ).map((endpoint, index) =>
+    normalizePublicEndpointForMode(endpoint, {
+      hasServer: isWeb,
+      runtimePort: linkedRuntimePort,
+      isPrimary: index === 0,
+    }),
+  );
   const primary = endpoints[0];
 
   return {
@@ -508,8 +689,8 @@ export function syncPublicEndpointState(
     publicEndpoints: endpoints,
     options: {
       ...config.options,
-      productionPort: config.options.hasServer
-        ? (linkedRuntimePort || primary?.port || "")
+      productionPort: isWeb
+        ? linkedRuntimePort || primary?.port || ""
         : config.options.productionPort,
     },
   };
@@ -521,30 +702,63 @@ export function usesServiceDeployment(
   return config.projectType === "services" && config.serviceDeploymentMode === "services";
 }
 
+/**
+ * The hostnames a deploy screen may PRINT for a config, in endpoint order.
+ *
+ * Only hosts the config actually names: a custom domain the operator typed, or
+ * `<chosen label>.<baseDomain>`. Empty when the config names none — the caller
+ * then hides the row / disables the link rather than showing a guess.
+ *
+ * It used to synthesize a missing endpoint from a `fallbackDomain` seeded with
+ * `config.projectName` — the RAW project name, not a slug — so "My App" became
+ * a `My App.opsh.io` Domain row AND the target of the primary "Visit Site"
+ * button on the deploy-success screen. That host never existed: the deploy mints
+ * its free route from the project's SLUG, so even the slug-shaped cases pointed
+ * somewhere else. Nothing may name a host this function can't derive from the
+ * config's own endpoints.
+ */
 export function getPublicEndpointHosts(
   endpoints: PublicEndpoint[] | undefined,
   baseDomain: string,
-  fallbackDomain: string,
 ): string[] {
-  return ensurePublicEndpoints(endpoints, {
-    domain: fallbackDomain,
-    domainType: "free",
-  })
-    .map((endpoint) => (
-      endpoint.domainType === "custom"
-        ? endpoint.customDomain
-        : endpoint.domain
-          ? `${endpoint.domain}.${baseDomain}`
-          : fallbackDomain
-            ? `${fallbackDomain}.${baseDomain}`
-            : ""
-    ))
-    .filter((hostname, index, hostnames) => Boolean(hostname) && hostnames.indexOf(hostname) === index);
+  return (endpoints ?? [])
+    .map((endpoint) => {
+      if (endpoint.domainType === "custom") return endpoint.customDomain?.trim() ?? "";
+      const label = endpoint.domain?.trim();
+      return label && baseDomain ? `${label}.${baseDomain}` : "";
+    })
+    .filter(
+      (hostname, index, hostnames) => Boolean(hostname) && hostnames.indexOf(hostname) === index,
+    );
 }
 
-
-
 // ─── State ───────────────────────────────────────────────────────────────────
+
+/** One exposed port's advisory probe result (mirrors the API `PortCheckResult`). */
+export interface PortCheckUI {
+  port: number;
+  listening: boolean;
+  checked: boolean;
+  serviceId?: string;
+  serviceName?: string;
+  skippedReason?: string;
+}
+
+/** One routed path's advisory static-output result (mirrors `OutputCheckResult`). */
+export interface OutputCheckUI {
+  path: string;
+  servedPath?: string;
+  found: boolean;
+  hasIndex: boolean;
+  checked: boolean;
+  /** Status the edge answered for a real request to this route. Absent = no HTTP
+   *  signal — pre-fix records have none. */
+  status?: number;
+  /** The edge answered and it was not a failure. ABSENT = no signal: test
+   *  `served === false`, never `!served`, or every older record reads as broken. */
+  served?: boolean;
+  skippedReason?: string;
+}
 
 export interface DeploymentState {
   deploymentId: string | null;
@@ -553,6 +767,8 @@ export interface DeploymentState {
   deploymentSuccess: boolean;
   deploymentFailed: boolean;
   deploymentCanceled: boolean;
+  /** A cancelled row whose worker lease has not acknowledged completion yet. */
+  cancellationPending: boolean;
   failureMessage: string;
   warningMessage: string;
   /**
@@ -568,6 +784,14 @@ export interface DeploymentState {
    * transient `serviceStatuses`) is gone.
    */
   decisionFailedServiceIds: string[];
+  /**
+   * Advisory post-deploy port-probe results. Server-backed (getBuildStatus
+   * .portCheck + the SSE `complete` event); the dashboard raises a skippable
+   * "wrong port?" modal for any entry that is `checked && !listening`.
+   */
+  portCheck: PortCheckUI[];
+  /** Ports (single-app) / service ids (compose) the user dismissed. */
+  portCheckSkipped: (number | string)[];
   errorCode: string;
   errorDetails: Record<string, unknown> | null;
   buildLogs: BuildLog[];
@@ -615,10 +839,13 @@ export const INITIAL_STATE: DeploymentState = {
   deploymentSuccess: false,
   deploymentFailed: false,
   deploymentCanceled: false,
+  cancellationPending: false,
   failureMessage: "",
   warningMessage: "",
   decisionPending: false,
   decisionFailedServiceIds: [],
+  portCheck: [],
+  portCheckSkipped: [],
   errorCode: "",
   errorDetails: null,
   buildLogs: [],
@@ -663,6 +890,8 @@ export type DeploymentStatus = "building" | "deploying" | "ready" | "failed" | "
 export interface DeploymentContextType {
   // Single source of truth
   config: DeploymentConfig;
+  /** Source detection is in flight; save/deploy must wait for a consistent config. */
+  isRescanning: boolean;
   state: DeploymentState;
   terminalRef: React.MutableRefObject<Terminal | null>;
   canStreamContainer: React.MutableRefObject<boolean>;
@@ -676,12 +905,38 @@ export interface DeploymentContextType {
     owner: string,
     repo: string,
     force?: string,
-    context?: { branch?: string; projectId?: string },
+    context?: {
+      branch?: string;
+      projectId?: string;
+      composePath?: string;
+      env?: Record<string, string>;
+      preserveEnvState?: boolean;
+    },
   ) => Promise<{ success: boolean; error?: string; errorType?: string; buildInProgress?: boolean }>;
   initializeFromLocal: (
     path: string,
-    context?: { projectId?: string },
+    context?: {
+      projectId?: string;
+      composePath?: string;
+      env?: Record<string, string>;
+      preserveEnvState?: boolean;
+    },
   ) => Promise<{ success: boolean; error?: string; errorType?: string }>;
+  /**
+   * Re-run detection pinned to an explicit compose file path (or clear it with
+   * ""), then reload the config from that scan. This is what turns a repo the
+   * detector read as a single app into the compose project the user knows it is —
+   * the compose file sits in a subfolder the heuristics don't promote.
+   *
+   * Unlike the other config fields this one CANNOT be applied locally: the
+   * service list, env, and project type all come from the compose file, so the
+   * repo has to be re-read. Hence an explicit action rather than a plain input.
+   */
+  rescanWithComposePath: (
+    composePath: string,
+  ) => Promise<{ success: boolean; error?: string; errorType?: string }>;
+  /** Re-detect the selected branch before applying its name and build defaults. */
+  rescanWithBranch: (branch: string) => Promise<{ success: boolean; error?: string }>;
   /** Folder-upload hydration — seed from the user-picked stack's defaults
    *  (no auto-detection); falls back to the session scan when no stack given. */
   initializeFromUpload: (
@@ -695,12 +950,23 @@ export interface DeploymentContextType {
   ) => Promise<{ success: boolean; error?: string; errorType?: string }>;
 
   // Build lifecycle
-  startDeployment: (overrides?: { runtimeMode?: RuntimeMode; saveConfigOnly?: boolean }) => Promise<string | null>;
+  startDeployment: (overrides?: {
+    runtimeMode?: RuntimeMode;
+    buildStrategy?: BuildStrategy;
+    saveConfigOnly?: boolean;
+  }) => Promise<string | null>;
   connectToBuild: (deploymentId?: string, startBuild?: boolean) => Promise<void>;
-  loadBuildSession: (deploymentId: string) => Promise<{ success: boolean; error?: string }>;
+  loadBuildSession: (deploymentId: string) => Promise<BuildSessionLoadResult>;
   stopDeployment: () => Promise<void>;
   redeploy: (deploymentId: string) => Promise<string | null>;
   respondToPrompt: (action: string) => Promise<void>;
+  /** Open the shared clone-credential modal for a github-credential error code
+   *  (single handler for the deploy wizard, redeploy, and the build page).
+   *  Returns true when it opened; false when the code isn't credential-related. */
+  maybeOpenCredentialModal: (
+    errorCode: string | null | undefined,
+    opts?: { trigger?: "preflight-fail" | "build-fail"; onResolved?: () => void },
+  ) => boolean;
   reset: () => void;
 
   // Terminal

@@ -22,10 +22,12 @@ const MINUTE_MS = 60_000;
 
 /** All policy ids — keep in sync with `POLICIES` below. */
 export type PolicyId =
+  | "flood-ip"
   | "default-anon"
   | "default-authed"
   | "auth-tight"
   | "auth-loose"
+  | "transfer-chunk"
   | "mcp"
   | "read-authed"
   | "write-authed"
@@ -33,19 +35,37 @@ export type PolicyId =
   | "billing-portal";
 
 export const POLICIES: Record<PolicyId, RateLimitPolicy> = {
+  /** Pre-auth flood ceiling on the whole `/api` tree (see middleware/
+   *  rate-limiter.ts `floodGuard`). Its ONLY job is bounding abusive per-IP
+   *  volume before authMiddleware runs its session DB lookup — a distinct
+   *  bucket from the per-route policies, so it never double-charges them.
+   *  Set well above the most generous per-user policy (`default-authed`, 3000)
+   *  so a single legitimate authed client is always governed by its own
+   *  per-route limit, never clipped by this guard. Coarse and generous on
+   *  purpose; operators behind large shared NATs can raise it. */
+  "flood-ip": {
+    id: "flood-ip",
+    limit: 6000,
+    windowMs: MINUTE_MS,
+    subject: "ip",
+    description: "Pre-auth per-IP flood ceiling on /api — abuse bound, not shaping.",
+  },
+
   /** Conservative default for unauthed routes. Per-IP. */
   "default-anon": {
     id: "default-anon",
-    limit: 100,
+    limit: 300,
     windowMs: MINUTE_MS,
     subject: "ip",
     description: "Default for public/unauthed routes (per-IP).",
   },
 
-  /** Default for authed routes. Per-user — far more accurate than IP. */
+  /** Default for authed routes. Per-user — far more accurate than IP.
+   *  ~50/s: a dashboard render fans out many concurrent reads (github/home,
+   *  session, health/env, org lists) so the per-user ceiling is generous. */
   "default-authed": {
     id: "default-authed",
-    limit: 600,
+    limit: 3000,
     windowMs: MINUTE_MS,
     subject: "user",
     description: "Default for authed routes (per-user).",
@@ -69,6 +89,16 @@ export const POLICIES: Record<PolicyId, RateLimitPolicy> = {
     windowMs: MINUTE_MS,
     subject: "user",
     description: "Authed session ops (logout, refresh) — per-user.",
+  },
+
+  /** Public direct-transfer chunks are cryptographically capability-gated but
+   *  arrive in bursts. Bound abuse per IP without throttling a valid 500 MB move. */
+  "transfer-chunk": {
+    id: "transfer-chunk",
+    limit: 240,
+    windowMs: MINUTE_MS,
+    subject: "ip",
+    description: "Encrypted direct-transfer chunks — per-IP burst allowance.",
   },
 
   /** MCP JSON-RPC endpoint (/api/mcp). Per-IP because the endpoint

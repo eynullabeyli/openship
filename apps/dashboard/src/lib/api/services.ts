@@ -1,8 +1,13 @@
 import { api } from "./client";
 import { endpoints } from "./endpoints";
-import type { ComposeAdvanced } from "@repo/core";
+import type { ComposeAdvanced, ComposeAdvancedPatch } from "@repo/core";
+import type {
+  ServiceEnvironment,
+  ServiceEnvironmentInput,
+  MergeServiceEnvVarsInput,
+} from "@repo/contracts";
 
-export type { ComposeAdvanced, ComposeHealthcheck } from "@repo/core";
+export type { ComposeAdvanced, ComposeAdvancedPatch, ComposeHealthcheck, OpenshipReadiness } from "@repo/core";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -34,6 +39,38 @@ export function sortServicesByPublicFirst<T extends { exposed?: boolean | null }
   return [...services].sort((a, b) => Number(!!b.exposed) - Number(!!a.exposed));
 }
 
+/**
+ * Does this service go through the full build+deploy pipeline, or is it a pure
+ * IMAGE "app" that just launches? This is the single source of truth for the
+ * two-mode service UI split so call sites can't drift:
+ *   - PIPELINE (true): compose stack, monorepo sub-app, or anything that BUILDS
+ *     from source → keeps per-service Redeploy (build page) + reload-env.
+ *   - APP (false): an image app added to a normal/static project → Start/Stop,
+ *     internal IP, no Redeploy, no build page.
+ */
+export function serviceUsesDeployPipeline(
+  service: { kind?: "compose" | "monorepo" | string | null; build?: string | null },
+  projectType?: string | null,
+): boolean {
+  return (
+    projectType === "services" ||
+    projectType === "monorepo" ||
+    serviceKind(service) === "monorepo" ||
+    Boolean(service.build)
+  );
+}
+
+/**
+ * Can this service be launched by the decoupled Start path (pull image + run)?
+ * A source-built service with no image can't — it only builds through the
+ * deploy pipeline, so it must be started via Redeploy rather than Start.
+ */
+export function serviceCanStartWithoutBuild(
+  service: { build?: string | null; image?: string | null },
+): boolean {
+  return !(service.build && !service.image);
+}
+
 export interface Service {
   id: string;
   /** Discriminator. "compose" (default) or "monorepo" sub-app. */
@@ -42,6 +79,7 @@ export interface Service {
   image: string | null;
   build: string | null;
   dockerfile: string | null;
+  buildArgs: Record<string, string | null> | null;
   ports: string[] | null;
   dependsOn: string[] | null;
   environment: Record<string, string> | null;
@@ -55,6 +93,13 @@ export interface Service {
   domain: string | null;
   customDomain: string | null;
   domainType: "free" | "custom" | null;
+  /** Additional public routes (one per port). Entry[0] mirrors the scalars. */
+  publicEndpoints?: Array<{
+    port: number;
+    domainType: "free" | "custom";
+    domain?: string;
+    customDomain?: string;
+  }> | null;
   enabled: boolean;
   sortOrder: number;
   /* ── Monorepo sub-app fields (kind === "monorepo" only) ─────────── */
@@ -76,6 +121,10 @@ export interface ServiceDrift {
   changes: Array<{ field: string; from: unknown; to: unknown }>;
 }
 
+/** A service's LIVE runtime view — read off the host on every request, never
+ *  from the deploy-time status column. `status` is
+ *  running | starting | restarting | stopped | failed | unknown
+ *  ("unknown" = the host couldn't be reached, not a claim about the service). */
 export interface ServiceContainer {
   serviceId: string;
   serviceName: string;
@@ -84,6 +133,31 @@ export interface ServiceContainer {
   ip: string | null;
   hostPort: number | null;
   imageRef: string | null;
+  /** Which identity key matched the container: label | name | trackedId | compose. */
+  matchedBy?: "label" | "name" | "trackedId" | "compose" | null;
+  /** Other containers on the host that also answer to this service (leftovers). */
+  duplicates?: string[];
+}
+
+export interface ServiceVolumeSize {
+  /** The compose volume string, verbatim — aligned by index to service.volumes. */
+  raw: string;
+  source: string;
+  target: string | null;
+  kind: "named" | "bind" | "anonymous";
+  readOnly: boolean;
+  /** On-disk size in bytes (apparent), or null when it couldn't be measured. */
+  bytes: number | null;
+}
+
+export interface ServiceVolumeSizes {
+  /** False for cloud/undeployed services (no host to `du` on) → hide sizes. */
+  measurable: boolean;
+  volumes: ServiceVolumeSize[];
+  /** Sum of measured volumes, or null if none measured. */
+  totalBytes: number | null;
+  /** True when a volume couldn't be measured → totalBytes is a lower bound (≥). */
+  partial: boolean;
 }
 
 export interface ServiceEnvVar {
@@ -105,18 +179,33 @@ export type ServiceInput = {
   image?: string;
   build?: string;
   dockerfile?: string;
+  buildArgs?: Record<string, string | null>;
   ports?: string[];
   dependsOn?: string[];
-  environment?: Record<string, string>;
+  /**
+   * Nulls are UPDATE-only — a key set to null removes it, and `null` clears the
+   * map (#619). Create and sync own the whole set and take `Record<string,string>`,
+   * so a null there is rejected by the API validator. Widened on the shared input
+   * for the same reason `advanced` carries the nullable `ComposeAdvancedPatch`:
+   * one payload shape for both verbs beats two near-identical types.
+   */
+  environment?: Record<string, string | null> | null;
   volumes?: string[];
   command?: string;
   restart?: string;
-  advanced?: ComposeAdvanced;
+  advanced?: ComposeAdvancedPatch;
   exposed?: boolean;
   exposedPort?: string;
   domain?: string;
   customDomain?: string;
   domainType?: "free" | "custom";
+  /** Additional public routes (one per port). Entry[0] mirrors the scalars. */
+  publicEndpoints?: Array<{
+    port?: number | string;
+    domain?: string;
+    customDomain?: string;
+    domainType?: "free" | "custom";
+  }>;
   enabled?: boolean;
   sortOrder?: number;
   /* ── Monorepo sub-app build settings (kind="monorepo" only) ─────────
@@ -145,6 +234,14 @@ export const servicesApi = {
   get: (projectId: string | number, serviceId: string) =>
     api.get<{ success: boolean; service: Service }>(endpoints.services.get(projectId, serviceId)),
 
+  /** Measure the on-disk size of a service's volumes (runs `du` on the host —
+   *  loaded lazily from the Overview tab, not polled). Aligned by index to
+   *  `service.volumes`. `measurable:false` for cloud/undeployed → no sizes. */
+  volumeSizes: (projectId: string | number, serviceId: string) =>
+    api.get<{ success: boolean } & ServiceVolumeSizes>(
+      endpoints.services.volumeSizes(projectId, serviceId),
+    ),
+
   /** Create a service manually */
   create: (projectId: string | number, data: ServiceInput) =>
     api.post<{ success: boolean; service: Service }>(endpoints.services.create(projectId), data),
@@ -160,11 +257,7 @@ export const servicesApi = {
    * keep the ServiceEditorModal payload shape uniform between create
    * and edit without sprouting kind-omitting branches all over.
    */
-  update: (
-    projectId: string | number,
-    serviceId: string,
-    data: Partial<ServiceInput>,
-  ) => {
+  update: (projectId: string | number, serviceId: string, data: Partial<ServiceInput>) => {
     // Strip `kind` defensively. The backend validator rejects unknown
     // and disallowed keys (additionalProperties:false on UpdateServiceBody),
     // but stripping client-side keeps a uniform payload shape between
@@ -198,13 +291,45 @@ export const servicesApi = {
       `${endpoints.services.envGet(projectId, serviceId)}${environment ? `?environment=${environment}` : ""}`,
     ),
 
+  getEnvironment: (
+    projectId: string | number,
+    serviceId: string,
+    input: ServiceEnvironmentInput = {},
+  ) => {
+    const query = new URLSearchParams();
+    if (input.environment) query.set("environment", input.environment);
+    if (input.inspectRuntime !== undefined)
+      query.set("inspectRuntime", String(input.inspectRuntime));
+    return api.get<{ success: boolean; environment: ServiceEnvironment }>(
+      `${endpoints.services.environment(projectId, serviceId)}?${query}`,
+      { timeout: 30_000 },
+    );
+  },
+
+  mergeEnv: (projectId: string | number, serviceId: string, input: MergeServiceEnvVarsInput) =>
+    api.patch<{ success: boolean }>(endpoints.services.envSet(projectId, serviceId), input),
+
+  /** Real values for named keys only. Pass environment for service-scoped
+   * env_var rows; omit it for compose-inline values. */
+  revealEnv: (
+    projectId: string | number,
+    serviceId: string,
+    keys: string[],
+    environment?: "production" | "preview" | "development",
+    options?: { source: "effective" | "runtime"; containerId?: string },
+  ) =>
+    api.post<{ success: boolean; environment: Record<string, string> }>(
+      endpoints.services.envReveal(projectId, serviceId),
+      { keys, ...(environment ? { environment } : {}), ...options },
+    ),
+
   /** Set environment variables for a service */
   setEnv: (
     projectId: string | number,
     serviceId: string,
     data: {
       environment: string;
-      vars: Array<{ key: string; value: string; isSecret?: boolean }>;
+      vars: Array<{ sourceId?: string; key: string; value: string; isSecret?: boolean }>;
     },
   ) =>
     api.put<{ success: boolean; count: number }>(
@@ -212,9 +337,15 @@ export const servicesApi = {
       data,
     ),
 
-  /** Start a service container */
+  /** Start a service. If it has no container yet, this PROVISIONS it (pull image
+   *  + create the container/workspace) — which can take a while — so use a long
+   *  timeout. Decoupled from the project deploy pipeline (no build page). */
   start: (projectId: string | number, serviceId: string) =>
-    api.post<{ success: boolean }>(endpoints.services.start(projectId, serviceId)),
+    api.post<{ success: boolean; containerId?: string }>(
+      endpoints.services.start(projectId, serviceId),
+      undefined,
+      { timeout: 120_000 },
+    ),
 
   /** Stop a service container */
   stop: (projectId: string | number, serviceId: string) =>
@@ -223,6 +354,14 @@ export const servicesApi = {
   /** Restart a service container */
   restart: (projectId: string | number, serviceId: string) =>
     api.post<{ success: boolean }>(endpoints.services.restart(projectId, serviceId)),
+
+  /** Apply saved runtime env and wait for the service replacement to start. */
+  applyEnvironment: (projectId: string | number, serviceId: string) =>
+    api.post<{ success: boolean; containerId: string; warning?: string }>(
+      endpoints.services.applyEnvironment(projectId, serviceId),
+      undefined,
+      { timeout: 120_000 },
+    ),
 
   /** Accept the pending upstream compose change (apply repo values, clear drift) */
   acceptDrift: (projectId: string | number, serviceId: string) =>

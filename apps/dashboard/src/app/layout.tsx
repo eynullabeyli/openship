@@ -3,12 +3,22 @@ import { cookies, headers } from "next/headers";
 import "./globals.css";
 import { ThemeProvider, ThemeScript } from "@/components/theme-provider";
 import { ToastProvider } from "@/components/toast";
-import { I18nProvider, LOCALE_COOKIE } from "@/components/i18n-provider";
+import { I18nProvider } from "@/components/i18n-provider";
+import { brandNameFor } from "@/lib/product-view";
+import { resolveRequestProductView } from "@/lib/server/product-view";
 import { AuthProvider } from "@/context/AuthContext";
 import { NetworkErrorHandler } from "@/components/network-error-handler";
 import { ModalProvider } from "@/context/ModalContext";
 import { DesktopChrome } from "@/components/desktop-chrome";
-import { defaultLocale, isRtl, loadDictionary, locales, type Locale } from "@/i18n";
+import {
+  baseDictionary,
+  defaultLocale,
+  isRtl,
+  loadDictionary,
+  LOCALE_COOKIE,
+  locales,
+  type Locale,
+} from "@/i18n";
 
 /** Resolve the request locale server-side: explicit cookie first, then the
  *  browser's Accept-Language, else the default. Keeps SSR and first paint in
@@ -44,8 +54,7 @@ async function resolveRequestLocale(): Promise<Locale> {
  */
 export const dynamic = "force-dynamic";
 
-export const metadata: Metadata = {
-  title: "Openship",
+const BASE_METADATA: Metadata = {
   description: "Manage your deployments, domains, and infrastructure.",
   icons: {
     icon: [
@@ -64,6 +73,22 @@ export const metadata: Metadata = {
   manifest: '/site.webmanifest',
 };
 
+/**
+ * Title follows the product mode, so a mail-only instance reads "OpenShip Mail"
+ * in the browser tab and in bookmarks. Not translated — see `brandNameFor`.
+ */
+export async function generateMetadata(): Promise<Metadata> {
+  const productView = await resolveRequestProductView();
+  return {
+    ...BASE_METADATA,
+    title: brandNameFor(baseDictionary.brand, productView),
+    description:
+      productView === "mail"
+        ? "Manage your mail server, domains, and mailboxes."
+        : BASE_METADATA.description,
+  };
+}
+
 export default async function RootLayout({ children }: { children: React.ReactNode }) {
   // Desktop runs the API on a dynamic free port. Mirror the server-side
   // OPENSHIP_LOCAL_API_URL into the browser so the client bundle's API base
@@ -73,6 +98,10 @@ export default async function RootLayout({ children }: { children: React.ReactNo
 
   const locale = await resolveRequestLocale();
   const dir = isRtl(locale) ? "rtl" : "ltr";
+  // Resolved here (not in the dashboard layout) because the brand also appears
+  // on screens that render outside the dashboard providers: /login, /authorize,
+  // not-found, and the API-unavailable shell.
+  const productView = await resolveRequestProductView();
   // English is the bundled base (no prop needed); for other locales load the
   // dictionary server-side so the very first render is already translated.
   const initialDictionary =
@@ -101,7 +130,11 @@ export default async function RootLayout({ children }: { children: React.ReactNo
       <body>
         <ThemeProvider>
           <AuthProvider>
-            <I18nProvider initialLocale={locale} initialDictionary={initialDictionary}>
+            <I18nProvider
+              initialLocale={locale}
+              initialDictionary={initialDictionary}
+              productView={productView}
+            >
               <ToastProvider>
                 <ModalProvider>
                   <DesktopChrome />

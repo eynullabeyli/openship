@@ -1,43 +1,55 @@
 "use client";
 
 import {
-  MoreVertical,
-  HelpCircle,
-  MessageSquare,
-  Bug,
-  BookOpen,
-  ExternalLink,
   Check,
   Plus,
-  X,
   ChevronDown,
+  ChevronLeft,
   GitBranch,
+  Tag,
   Loader2,
   FilePlus2,
+  RefreshCw,
+  Trash2,
 } from "lucide-react";
 
 import { DomainSettings } from "../components/DomainSettings";
 import { GitSettings } from "../components/GitSettings";
+import { IncomingWebhooks } from "../components/IncomingWebhooks";
 import { BuildSettings } from "../components/BuildSettings";
 import { LogsSettings } from "../components/LogsSettings";
 import { BackupSettings } from "../components/BackupSettings";
 import { Deployments } from "../components/Deployments";
+import { HealthTab } from "../components/HealthTab";
+import { MonitoringTab } from "../components/MonitoringTab";
 import { AdvancedSettings } from "../components/AdvancedSettings";
 import { OverviewTab } from "../components/OverviewTab";
+import { AppConfiguration } from "../components/AppConfiguration";
+import { isSchemaAppTemplate } from "@/components/app-settings/AppSettingsForm";
 import { ServicesTab } from "../components/ServicesTab";
+import { ProjectTopologyPage } from "@/components/topology/ProjectTopologyPage";
 import { ProjectSidebar, ProjectMobileTabs } from "../components/ProjectSidebar";
+import { ProjectTabSections } from "../components/ProjectTabSections";
 import { DraftProjectView } from "../components/DraftProjectView";
+import { environmentErrorMessage, environmentWizardHref } from "../components/environment-next";
 import { getProjectStatus } from "@/utils/project-status";
 import { useProjectSettings } from "@/context/ProjectSettingsContext";
-import { useProjectInfo } from "@/hooks/useProjectEndpoints";
+import {
+  firstProjectEnvironment,
+  projectEnvironmentHref,
+  removeProjectEnvironment,
+} from "@/context/project-environments";
+import { useProjectInfo, PROJECT_INFO_NOT_FOUND } from "@/hooks/useProjectEndpoints";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useToast } from "@/context/ToastContext";
+import { useModal } from "@/context/ModalContext";
 import { useI18n, interpolate } from "@/components/i18n-provider";
 import { ApiError, getApiErrorMessage, projectsApi } from "@/lib/api";
+import { invalidateSidebarNavCounts } from "@/lib/sidebar-nav-counts";
 import ErrorState from "@/components/shared/ErrorState";
 import { PageContainer } from "@/components/ui/PageContainer";
-import DropdownMenu, { type MenuAction } from "@/components/ui/DropdownMenu";
+import { HelpMenu } from "@/components/HelpMenu";
 import { DismissiblePopover } from "@/components/ui/Popover";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -48,7 +60,7 @@ const branchToEnvironmentName = (branch: string) =>
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(" ") || branch;
 
-const EnvironmentSwitcher = () => {
+const EnvironmentSwitcher = ({ disabled = false }: { disabled?: boolean }) => {
   const { projectData, environments, createEnvironment, activeTab } = useProjectSettings();
   const { t } = useI18n();
   const router = useRouter();
@@ -77,6 +89,8 @@ const EnvironmentSwitcher = () => {
             slug: projectData.environmentSlug || "production",
             type: projectData.environmentType || "production",
             gitBranch: projectData.gitBranch || "main",
+            isApp: !!projectData.isApp,
+            version: null,
           },
       ];
 
@@ -108,9 +122,11 @@ const EnvironmentSwitcher = () => {
     setLoadingBranches(false);
   }, []);
 
+  // ONE panel, two views. `isAdding` is a view of the open menu, not a second
+  // menu — see the render below for why the two-popover version was wrong.
   const activateBranchCreator = useCallback((branchSeed?: string) => {
+    setIsOpen(true);
     setIsAdding(true);
-    setIsOpen(false);
     setManualMode(false);
     setBranchQuery(branchSeed ?? "");
     setManualEnvironmentName("");
@@ -134,14 +150,30 @@ const EnvironmentSwitcher = () => {
     setLoadingBranches(false);
   }, [closeMenus, isOpen]);
 
-  const openBranchCreator = useCallback(() => {
-    if (isAdding) {
-      closeMenus();
-      return;
-    }
+  // Clears the loaded-for marker instead of fetching here: the effect below owns
+  // the one branch load, so refresh and first-open can never drift apart.
+  //
+  // It also FORCES `loadingBranches` back to false rather than refusing while it
+  // is true. Refusing made this button a no-op in exactly the state the user
+  // reaches for it: if a request was ever superseded, the spinner stayed true
+  // forever, so the button was both disabled and early-returning, and a full page
+  // reload was the only way out. Bumping the request id retires whatever is in
+  // flight, so forcing the flag can't be overwritten by a stale response.
+  const refreshBranches = useCallback(() => {
+    branchRequestId.current += 1;
+    setLoadingBranches(false);
+    setBranchesLoadedForProject(null);
+  }, []);
 
-    activateBranchCreator();
-  }, [activateBranchCreator, closeMenus, isAdding]);
+  /** Back out of the creator view to the environment list, same panel. */
+  const closeBranchCreator = useCallback(() => {
+    setIsAdding(false);
+    setManualMode(false);
+    setBranchQuery("");
+    setManualEnvironmentName("");
+    setManualBranch("");
+    setCreatingBranch(null);
+  }, []);
 
   useEffect(() => {
     const shouldCreateEnvironment = searchParams.get("createEnvironment") === "1";
@@ -188,7 +220,11 @@ const EnvironmentSwitcher = () => {
       })
       .catch((error) => {
         if (branchRequestId.current !== requestId) return;
-        const message = error instanceof Error ? error.message : t.projects.env.failedLoadBranches;
+        // The SERVER's reason, not `error.message`. For an `ApiError` that field is
+        // `` `API ${status}: ${statusText}` ``, so a project with no repo connected
+        // reported "API 400: Bad Request" while the body said exactly what to do.
+        // Same extractor the create path next to this one already uses.
+        const message = getApiErrorMessage(error, t.projects.env.failedLoadBranches);
         showToast(message, "error", t.projects.env.toastBranchesTitle);
       })
       .finally(() => {
@@ -197,12 +233,14 @@ const EnvironmentSwitcher = () => {
         setLoadingBranches(false);
       });
 
-    return () => {
-      if (branchRequestId.current === requestId) {
-        branchRequestId.current += 1;
-      }
-    };
-  }, [branchesLoadedForProject, isAdding, projectData.id, showToast]);
+    // NO cleanup that retires this request. It used to bump `branchRequestId` on
+    // every dep change, which made all three guards above fail — including the
+    // `finally`, so `loadingBranches` was never set back to false. The panel then
+    // showed a permanent spinner and `refreshBranches` (disabled while loading)
+    // could not clear it, which is why only a page reload fixed it. The guards on
+    // the response already prevent a stale write; retiring the request as well
+    // only guaranteed nobody would ever settle the flag.
+  }, [branchesLoadedForProject, isAdding, projectData.id, showToast, t]);
 
   if (!projectData.id) return null;
 
@@ -233,10 +271,12 @@ const EnvironmentSwitcher = () => {
       });
       if (created?.id) {
         closeMenus();
-        router.push(`/projects/${created.id}/${activeTab}`);
+        // Straight into the wizard: a brand-new environment has nothing deployed,
+        // so the project page would only offer to finish what this click started.
+        router.push(environmentWizardHref(created));
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : t.projects.env.failedCreateEnvironment;
+      const message = environmentErrorMessage(error, t.projects.env.failedCreateEnvironment);
       showToast(message, "error", t.projects.env.toastEnvironmentTitle);
     } finally {
       setIsCreating(false);
@@ -261,10 +301,10 @@ const EnvironmentSwitcher = () => {
       });
       if (created?.id) {
         closeMenus();
-        router.push(`/projects/${created.id}/${activeTab}`);
+        router.push(environmentWizardHref(created));
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : t.projects.env.failedCreateEnvironment;
+      const message = environmentErrorMessage(error, t.projects.env.failedCreateEnvironment);
       showToast(message, "error", t.projects.env.toastEnvironmentTitle);
     } finally {
       setIsCreating(false);
@@ -272,43 +312,59 @@ const EnvironmentSwitcher = () => {
   };
 
   return (
+    // ONE trigger, ONE panel. This used to be two buttons owning two separately
+    // positioned panels — a pill that listed environments and a `+` that opened a
+    // different dropdown to create one. They were mutually exclusive anyway, so
+    // the split bought nothing and cost the obvious thing: "add an environment"
+    // was a control you had to already know about, sitting outside the menu that
+    // lists environments. Now the list IS the menu, and creating is a view of it.
     <DismissiblePopover
-      open={isOpen || isAdding}
+      open={isOpen}
       onOpenChange={(open) => {
         if (!open) closeMenus();
       }}
-      className="relative flex items-center gap-2"
+      className="relative flex min-w-0 items-center"
     >
       <button
         type="button"
         onClick={openSwitcher}
-        className="inline-flex h-9 max-w-[260px] items-center gap-2 rounded-full border border-border/50 bg-card px-3 text-sm font-medium text-foreground transition-colors hover:bg-muted/40"
+        disabled={disabled}
+        title={disabled ? "Apply or discard pending topology changes before switching environments." : undefined}
+        className="inline-flex h-9 min-w-0 max-w-[260px] items-center gap-2 rounded-full border border-border/50 bg-card px-3 text-sm font-medium text-foreground transition-colors hover:bg-muted/40"
         aria-label={t.projects.env.switchAria}
+        aria-expanded={isOpen}
+        aria-haspopup="menu"
       >
         <span className="truncate">{currentEnvironment.name}</span>
-        <span className="inline-flex min-w-0 items-center gap-1 text-xs text-muted-foreground">
-          <GitBranch className="size-3" />
-          <span className="truncate">{currentEnvironment.gitBranch}</span>
-        </span>
+        {currentEnvironment.isApp ? (
+          currentEnvironment.version ? (
+            <span className="inline-flex min-w-0 items-center gap-1 text-xs text-muted-foreground">
+              <Tag className="size-3" />
+              <span className="truncate">{currentEnvironment.version}</span>
+            </span>
+          ) : null
+        ) : (
+          <span className="inline-flex min-w-0 items-center gap-1 text-xs text-muted-foreground">
+            <GitBranch className="size-3" />
+            <span className="truncate">{currentEnvironment.gitBranch}</span>
+          </span>
+        )}
         <ChevronDown className="size-4 shrink-0 text-muted-foreground" />
       </button>
-      <button
-        type="button"
-        onClick={openBranchCreator}
-        className="inline-flex size-9 items-center justify-center rounded-full border border-border/50 bg-card text-muted-foreground transition-colors hover:bg-muted/40 hover:text-foreground"
-        aria-label={t.projects.env.addBranchAria}
-      >
-        {isAdding ? <X className="size-4" /> : <Plus className="size-4" />}
-      </button>
 
-      {isOpen && (
+      {isOpen && !isAdding && (
         <div
-          className="absolute end-11 top-full z-40 mt-2 w-[320px] overflow-hidden rounded-lg border border-border/50 shadow-xl"
+          className="absolute end-0 top-full z-40 mt-2 w-[340px] overflow-hidden rounded-lg border border-border/50 shadow-xl"
           style={{ backgroundColor: "var(--th-card-bg-solid, var(--card))" }}
         >
           <div className="max-h-[320px] overflow-y-auto p-1">
             {options.map((env) => {
               const active = env.id === projectData.id;
+              // An environment that has never deployed. Derived with the app's ONE
+              // status function rather than a local `!activeDeploymentId` check, so
+              // "draft" means the same thing here as everywhere else — the
+              // environment summary already carries the two fields it reads.
+              const isDraft = getProjectStatus(env) === "draft";
 
               return (
                 <button
@@ -318,34 +374,85 @@ const EnvironmentSwitcher = () => {
                   className="flex w-full items-center justify-between gap-3 rounded-md px-3 py-2 text-start transition-colors hover:bg-muted/50"
                 >
                   <span className="min-w-0">
-                    <span className="block truncate text-sm font-medium text-foreground">{env.name}</span>
-                    <span className="mt-0.5 flex items-center gap-1 text-xs text-muted-foreground">
-                      <GitBranch className="size-3" />
-                      <span className="truncate">{env.gitBranch}</span>
+                    <span className="flex items-center gap-1.5">
+                      <span className="truncate text-sm font-medium text-foreground">{env.name}</span>
+                      {isDraft && (
+                        <span className="shrink-0 rounded-full border border-border bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+                          {t.projects.status.draft}
+                        </span>
+                      )}
                     </span>
+                    {env.isApp ? (
+                      env.version ? (
+                        <span className="mt-0.5 flex items-center gap-1 text-xs text-muted-foreground">
+                          <Tag className="size-3" />
+                          <span className="truncate">{env.version}</span>
+                        </span>
+                      ) : null
+                    ) : (
+                      <span className="mt-0.5 flex items-center gap-1 text-xs text-muted-foreground">
+                        <GitBranch className="size-3" />
+                        <span className="truncate">{env.gitBranch}</span>
+                      </span>
+                    )}
                   </span>
                   {active && <Check className="size-4 shrink-0 text-primary" />}
                 </button>
               );
             })}
           </div>
+          <div className="border-t border-border/50 p-1">
+            <button
+              type="button"
+              onClick={() => activateBranchCreator()}
+              className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-start text-sm font-medium text-foreground transition-colors hover:bg-muted/50"
+            >
+              <Plus className="size-4 text-muted-foreground" />
+              {t.projects.env.newEnvironment}
+            </button>
+          </div>
         </div>
       )}
 
-      {isAdding && (
+      {isOpen && isAdding && (
         <div
           className="absolute end-0 top-full z-40 mt-2 w-[340px] rounded-lg border border-border/50 p-2 shadow-xl"
           style={{ backgroundColor: "var(--th-card-bg-solid, var(--card))" }}
         >
           <div className="space-y-2">
-            <input
-              value={branchQuery}
-              onChange={(event) => setBranchQuery(event.target.value)}
-              placeholder={t.projects.env.searchBranches}
-              className="w-full rounded-lg border border-border/50 bg-background px-3 py-2 text-sm outline-none transition-colors focus:border-primary/40"
-            />
+            <div className="flex items-center gap-1 px-1">
+              <button
+                type="button"
+                onClick={closeBranchCreator}
+                className="inline-flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground"
+                aria-label={t.projects.env.backToEnvironments}
+              >
+                <ChevronLeft className="size-4" />
+              </button>
+              <span className="truncate text-sm font-medium text-foreground">
+                {t.projects.env.newEnvironment}
+              </span>
+            </div>
+            <div className="flex items-stretch gap-2">
+              <input
+                value={branchQuery}
+                onChange={(event) => setBranchQuery(event.target.value)}
+                placeholder={t.projects.env.searchBranches}
+                className="min-w-0 flex-1 rounded-lg border border-border/50 bg-background px-3 py-2 text-sm outline-none transition-colors focus:border-primary/40"
+              />
+              <button
+                type="button"
+                onClick={refreshBranches}
+                disabled={loadingBranches}
+                className="inline-flex w-9 shrink-0 items-center justify-center rounded-lg border border-border/50 bg-background text-muted-foreground transition-colors hover:bg-muted/40 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
+                aria-label={t.projects.env.refreshBranches}
+                title={t.projects.env.refreshBranches}
+              >
+                <RefreshCw className={`size-4 ${loadingBranches ? "animate-spin" : ""}`} />
+              </button>
+            </div>
             <div className="max-h-[280px] overflow-y-auto">
-              {loadingBranches ? (
+              {loadingBranches && branches.length === 0 ? (
                 <div className="flex h-24 items-center justify-center text-muted-foreground">
                   <Loader2 className="size-4 animate-spin" />
                 </div>
@@ -450,21 +557,70 @@ const ProjectSettingsContent = () => {
     projectNotFound,
     errorType,
     activeTab,
+    activeTabGroup,
     tabs,
     id,
+    // Read to tell the delete toast the truth: teardown drops THIS environment and
+    // only retires the app row when it was the last one.
+    environments,
+    removeEnvironment,
   } = useProjectSettings();
   // Project shell waits for project info specifically (not analytics).
   // Analytics is per-card now; the page-level gate is about whether we
   // know enough about the project to even render its tabs.
   const { isLoading: isLoadingProjectInfo, error: projectInfoError } = useProjectInfo(id);
+  const [topologyHasPending, setTopologyHasPending] = useState(false);
 
   const { t } = useI18n();
   const { showToast } = useToast();
+  const { showModal, hideModal } = useModal();
   const router = useRouter();
 
+  const finishEnvironmentDeletion = useCallback(
+    (deletedId: string) => {
+      const nextEnvironment = firstProjectEnvironment(
+        removeProjectEnvironment(environments, deletedId),
+      );
+      // Schedule navigation before invalidating the mounted deleted id. Its
+      // expected 404 refetch must not win a race against the sibling route.
+      router.replace(
+        nextEnvironment
+          ? projectEnvironmentHref(nextEnvironment.id, activeTab)
+          : "/",
+      );
+      removeEnvironment(deletedId);
+      invalidateSidebarNavCounts();
+    },
+    [activeTab, environments, removeEnvironment, router],
+  );
+
+  // Keep the delete state honest: while this project reads as "deleting"
+  // (server flag or optimistic), poll for completion so a finished teardown
+  // (row gone) navigates away instead of leaving a stale "Deleting" page open.
+  // Read-only — never overwrites the in-flight optimistic state.
+  const isDeleting = getProjectStatus(projectData) === "deleting";
+  useEffect(() => {
+    if (!id || !isDeleting) return;
+    const iv = setInterval(async () => {
+      try {
+        await projectsApi.getInfo(id);
+      } catch (err) {
+        if (err instanceof ApiError && err.status === 404) {
+          clearInterval(iv);
+          showToast(t.projects.delete.alreadyDeleted, "success");
+          finishEnvironmentDeletion(id);
+        }
+      }
+    }, 3000);
+    return () => clearInterval(iv);
+  }, [finishEnvironmentDeletion, id, isDeleting, showToast, t.projects.delete.alreadyDeleted]);
+
   const handleDeleteProject = async (
-    deleteApp = true,
     wipeVolumes = false,
+    // Record-only (soft) delete — kept ahead of force/forceOrphan so the delete
+    // modal's (wipeVolumes, recordOnly) call maps positionally, and so it survives
+    // the force/forceOrphan retries below.
+    recordOnly = false,
     force = false,
     forceOrphan = false,
   ) => {
@@ -473,8 +629,8 @@ const ProjectSettingsContent = () => {
 
     try {
       const response = await projectsApi.delete(projectData.id, {
-        deleteApp,
         wipeVolumes,
+        recordOnly,
         force,
         forceOrphan,
       });
@@ -494,12 +650,36 @@ const ProjectSettingsContent = () => {
             t.projects.delete.orphanCleanupTitle,
           );
         } else {
+          // Which sentence is true depends on what the server actually does:
+          // teardown drops THIS environment and soft-deletes the app row only once
+          // its last environment is gone. Reading it off the environment list is
+          // therefore accurate, where the old `deleteApp` flag was a promise nothing
+          // implemented.
+          const wasLastEnvironment = (environments?.length ?? 1) <= 1;
           showToast(
-            deleteApp ? t.projects.delete.successProject : t.projects.delete.successEnvironment,
+            wasLastEnvironment
+              ? t.projects.delete.successProject
+              : t.projects.delete.successEnvironment,
             "success",
           );
         }
-        router.push("/");
+        // Projects this app was linked into: they keep running, but their live
+        // container still holds the connection value until they redeploy.
+        const unlinkedNames = [
+          ...new Set(
+            (Array.isArray(response.unlinked) ? response.unlinked : []).map(
+              (u: { projectName?: string; projectId?: string }) => u.projectName ?? u.projectId,
+            ),
+          ),
+        ].filter(Boolean);
+        if (unlinkedNames.length > 0) {
+          showToast(
+            interpolate(t.projects.delete.unlinked, { projects: unlinkedNames.join(", ") }),
+            "success",
+            t.projects.delete.unlinkedTitle,
+          );
+        }
+        finishEnvironmentDeletion(projectData.id);
         return;
       }
       // 207: rowDeleted=true but unrecoverable steps surfaced. Toast as
@@ -514,7 +694,7 @@ const ProjectSettingsContent = () => {
           "success",
           t.projects.delete.partialCleanupTitle,
         );
-        router.push("/");
+        finishEnvironmentDeletion(projectData.id);
         return;
       }
       // Defensive: 2xx with ok=false but no unrecoverable list. Treat as failure.
@@ -525,7 +705,15 @@ const ProjectSettingsContent = () => {
         t.projects.delete.failed,
       );
     } catch (err) {
-      // Always revert optimistic deletion on any failure - project still exists.
+      // A 404 means another request/tab completed the deletion successfully.
+      // Run the same state/cache/navigation transition as every other success.
+      if (err instanceof ApiError && err.status === 404) {
+        showToast(t.projects.delete.alreadyDeleted, "success");
+        finishEnvironmentDeletion(projectData.id);
+        return;
+      }
+
+      // Actual failure: the project still exists, so undo the optimistic status.
       setProjectData((prev: any) => ({ ...prev, deletedAt: null }));
 
       if (err instanceof ApiError && err.status === 409) {
@@ -546,7 +734,7 @@ const ProjectSettingsContent = () => {
         if (body.code === "PROJECT_HAS_ACTIVE_WORK") {
           if (!force) {
             showToast(t.projects.delete.cancellingActiveWork, "success", t.projects.delete.cleaningUpTitle);
-            void handleDeleteProject(deleteApp, wipeVolumes, true, forceOrphan);
+            void handleDeleteProject(wipeVolumes, recordOnly, true, forceOrphan);
             return;
           }
           showToast(
@@ -570,11 +758,55 @@ const ProjectSettingsContent = () => {
         // the leaked resources later.
         const reasons = (body.unrecoverable ?? []).map((u) => u.step).join(", ");
         console.error("[delete-project] teardown failed", body.unrecoverable);
-        if (
-          body.canForceOrphan &&
-          window.confirm(t.projects.delete.confirmForceOrphan)
-        ) {
-          void handleDeleteProject(deleteApp, wipeVolumes, force, true);
+        // The source teardown couldn't complete. Rather than a jarring
+        // window.confirm (or silently reverting to a plain "Draft"), surface a
+        // themed module offering the storage-only delete (forceOrphan) — atomic
+        // delete stays the default; this is the explicit bypass.
+        if (body.canForceOrphan) {
+          let modalId = "";
+          modalId = showModal({
+            maxWidth: "480px",
+            customContent: (
+              <div className="p-6 space-y-5">
+                <div className="flex items-start gap-3">
+                  <div className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-danger-bg text-danger">
+                    <Trash2 className="size-4" />
+                  </div>
+                  <div className="min-w-0">
+                    <h3 className="text-base font-semibold text-foreground">
+                      {t.projects.delete.forceModalTitle}
+                    </h3>
+                    <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
+                      {t.projects.delete.forceModalBody}
+                    </p>
+                    {reasons && (
+                      <p className="mt-2 text-xs text-muted-foreground/70">{reasons}</p>
+                    )}
+                  </div>
+                </div>
+                <div className="flex items-center justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={() => hideModal(modalId)}
+                    className="inline-flex h-9 items-center rounded-xl px-4 text-sm font-medium text-muted-foreground transition-colors hover:bg-foreground/[0.06] hover:text-foreground"
+                  >
+                    {t.projects.delete.forceModalCancel}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      hideModal(modalId);
+                      void handleDeleteProject(wipeVolumes, recordOnly, force, true);
+                    }}
+                    className="inline-flex h-9 items-center gap-1.5 rounded-xl bg-danger-solid px-4 text-sm font-medium text-white transition-colors hover:bg-danger-solid/90"
+                  >
+                    <Trash2 className="size-3.5" />
+                    {t.projects.delete.forceModalConfirm}
+                  </button>
+                </div>
+              </div>
+            ),
+          });
           return;
         }
         showToast(
@@ -587,63 +819,10 @@ const ProjectSettingsContent = () => {
         return;
       }
 
-      // 404: someone else already deleted the project in another tab.
-      if (err instanceof ApiError && err.status === 404) {
-        showToast(t.projects.delete.alreadyDeleted, "success");
-        router.push("/");
-        return;
-      }
-
       showToast(getApiErrorMessage(err, t.projects.delete.failed), "error", t.projects.delete.failed);
     }
   };
 
-  const helpMenuActions: MenuAction[] = [
-    {
-      id: "support",
-      label: t.projects.help.contactSupport,
-      icon: <HelpCircle className="w-4 h-4" />,
-      onClick: () => {
-        window.open("https://oblien.com/support", "_blank");
-      },
-    },
-    {
-      id: "report-issue",
-      label: t.projects.help.reportIssue,
-      icon: <Bug className="w-4 h-4" />,
-      onClick: () => {
-        window.open("https://github.com/oblien/deployments/issues/new", "_blank");
-      },
-    },
-    {
-      id: "feedback",
-      label: t.projects.help.sendFeedback,
-      icon: <MessageSquare className="w-4 h-4" />,
-      onClick: () => {
-        window.open("https://oblien.com/feedback", "_blank");
-      },
-    },
-    {
-      id: "divider",
-      divider: true,
-    },
-    {
-      id: "documentation",
-      label: t.projects.help.documentation,
-      icon: <BookOpen className="w-4 h-4" />,
-      onClick: () => {
-        window.open("https://oblien.com/docs", "_blank");
-      },
-    },
-    {
-      id: "community",
-      label: t.projects.help.joinCommunity,
-      icon: <ExternalLink className="w-4 h-4" />,
-      onClick: () => {
-        window.open("https://discord.gg/oblien", "_blank");
-      },
-    },
-  ];
 
   const renderTabContent = () => {
     switch (activeTab) {
@@ -655,18 +834,34 @@ const ProjectSettingsContent = () => {
         return <DomainSettings />;
       case "deployments":
         return <Deployments />;
+      case "health":
+        return <HealthTab />;
+      case "monitoring":
+        return <MonitoringTab />;
       case "source":
       case "git":
         return <GitSettings />;
+      case "webhooks":
+        return <IncomingWebhooks />;
       case "runtime":
       case "settings":
-        return <BuildSettings />;
+        // Apps get the 2-mode Configuration surface (App settings | Deployment);
+        // regular projects get the raw build/runtime config.
+        return projectData.isApp && isSchemaAppTemplate(projectData.appTemplateId) ? (
+          <AppConfiguration />
+        ) : (
+          <BuildSettings />
+        );
       case "logs":
         return <LogsSettings />;
       case "backup":
         return <BackupSettings />;
       case "advanced":
-        return <AdvancedSettings onDeleteProject={handleDeleteProject} />;
+        return (
+          <div className="space-y-5">
+            <AdvancedSettings onDeleteProject={handleDeleteProject} />
+          </div>
+        );
       default:
         return <OverviewTab />;
     }
@@ -746,6 +941,20 @@ const ProjectSettingsContent = () => {
       </PageContainer>
     );
   }
+  // A non-404 fetch failure (cloud unreachable, network, 5xx) never delivers
+  // the real project — the empty seed still reads as "draft" below, so guard
+  // here and surface the actual load error instead of a fake draft screen.
+  // (404 / access errors are already handled via projectNotFound above.)
+  if (projectInfoError && projectInfoError !== PROJECT_INFO_NOT_FOUND && !projectDataReady) {
+    return <ErrorState type="load-failed" error={{ details: projectInfoError }} />;
+  }
+
+  // Topology owns the available workspace. A configured draft is useful here too:
+  // its real services are visible before the first deployment, without a wizard.
+  if (activeTab === "topology" && projectData.id === id) {
+    return <ProjectTopologyPage key={id} environmentControl={<EnvironmentSwitcher disabled={topologyHasPending} />} onPendingChange={setTopologyHasPending} />;
+  }
+
   // Draft / never-successfully-deployed projects (no active deployment)
   // get a focused screen instead of the analytics dashboard, which would
   // otherwise render empty. In-flight first builds (queued/building/
@@ -759,7 +968,13 @@ const ProjectSettingsContent = () => {
     // dashboard for the duration of the teardown. A never-deployed project
     // has no activeDeploymentId — that's the discriminator vs. a live delete.
     (status === "deleting" && !projectData.activeDeploymentId);
-  if (isNeverDeployed && activeTab === "overview") {
+  // A draft renders the focused screen for EVERY tab, not just overview:
+  // DraftProjectView is a draft's whole surface ("you never have to enter the
+  // production tabbed UI while a project is still draft"). Config editing lives
+  // in the deploy wizard, not an in-project tab — so a draft that lands on
+  // /runtime (e.g. via the wizard's post-save return, or a stale deep link)
+  // gets the draft screen, never the read-only Configuration tab.
+  if (isNeverDeployed) {
     return (
       <PageContainer>
         <div className="mb-6">
@@ -770,6 +985,8 @@ const ProjectSettingsContent = () => {
             <span>/</span>
             <span className="text-foreground font-medium">{projectData.name || t.projects.detail.projectFallback}</span>
           </div>
+          {/* Logo intentionally omitted here — it lives in the DraftProjectView
+              hero card below; showing it in both duplicates it. */}
           <h1 className="text-2xl font-semibold text-foreground truncate">
             {projectData.name || t.projects.detail.projectFallback}
           </h1>
@@ -798,7 +1015,7 @@ const ProjectSettingsContent = () => {
             <>
               <span>/</span>
               <span className="text-foreground font-medium">
-                {tabs.find((tab) => tab.id === activeTab)?.label}
+                {tabs.find((tab) => tab.id === activeTabGroup)?.label}
               </span>
             </>
           )}
@@ -807,17 +1024,14 @@ const ProjectSettingsContent = () => {
         <div className="flex items-center justify-between gap-4">
           <div className="min-w-0">
             <h1 className="text-2xl font-semibold text-foreground truncate">
-              {tabs.find((tab) => tab.id === activeTab)?.label || t.projects.detail.overviewFallback}
+              {tabs.find((tab) => tab.id === activeTabGroup)?.label || t.projects.detail.overviewFallback}
             </h1>
           </div>
 
           <div className="flex items-center gap-2">
             <EnvironmentSwitcher />
-            <DropdownMenu
-              actions={helpMenuActions}
-              trigger={<MoreVertical className="w-5 h-5 text-muted-foreground" />}
-              align="right"
-            />
+            {/* Shared definition — the same ⋮ the Apps page header carries. */}
+            <HelpMenu />
           </div>
         </div>
       </div>
@@ -827,6 +1041,7 @@ const ProjectSettingsContent = () => {
         {/* ── LEFT COLUMN ── */}
         <div className="space-y-6 min-w-0">
           <ProjectMobileTabs />
+          <ProjectTabSections />
           {renderTabContent()}
         </div>
 

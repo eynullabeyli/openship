@@ -4,14 +4,15 @@
  * The file holds named CONTEXTS — each pins an API + dashboard endpoint, the
  * PAT issued against them, and optionally cached capabilities (see caps.ts).
  * A single `current` name selects the active context; every authenticated
- * command reads from it (see api-client.ts).
+ * command reads from it (see ship-client.ts).
  *
  * A legacy flat config ({ token, apiUrl, dashboardUrl }) is migrated to a
  * single "default" context on first read.
  */
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
+
+import { OS_DIR } from "./paths";
 import { LOCAL_API_URL, LOCAL_DASHBOARD_URL } from "@repo/core";
 
 /** Cached discovery from GET /api/health/env (see caps.ts). */
@@ -56,7 +57,7 @@ export interface ContextInfo {
 
 export const DEFAULT_CONTEXT = "default";
 
-const CONFIG_DIR = join(homedir(), ".openship");
+const CONFIG_DIR = OS_DIR;
 export const CONFIG_PATH = join(CONFIG_DIR, "config.json");
 
 function emptyConfig(): CliConfig {
@@ -171,8 +172,8 @@ export function listContexts(): ContextInfo[] {
 
 /* ---------- Backward-compatible active-context helpers ---------- */
 
-export function getToken(): string | null {
-  return getContext().token ?? null;
+export function getToken(name?: string): string | null {
+  return getContext(name).token ?? null;
 }
 
 export function setToken(

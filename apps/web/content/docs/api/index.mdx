@@ -1,0 +1,121 @@
+---
+title: API overview
+description: Control Openship with the Node.js SDK or REST API.
+---
+
+Create projects, deploy code, and operate your installation from an application or script. Each resource
+has one reference page: shared behavior and fields, with **SDK** and **REST API** tabs for examples.
+
+## Start here
+
+| Your application needs to… | Use |
+| --- | --- |
+| Control an existing self-hosted or Cloud installation | [Remote SDK client](/docs/api/sdk/client) or [REST API](/docs/api/http) |
+| Run Openship inside a Node application | [Native SDK](/docs/api/sdk/native) |
+| Run commands from a terminal or CI | [CLI](/docs/cli) |
+
+The SDK is currently a repository preview. See [installation and release availability](/docs/api/sdk/installation).
+
+## Make a request
+
+Use a token that can read projects in your organization. The SDK returns the application result;
+REST returns the endpoint's JSON response.
+
+<Tabs items={['SDK', 'REST API']} groupId="api-transport" persist>
+<Tab value="SDK">
+
+```ts title="list-projects.mts"
+import { OpenshipClient } from "openship";
+
+const token = process.env.OPENSHIP_TOKEN;
+const organizationId = process.env.OPENSHIP_ORGANIZATION_ID;
+if (!token || !organizationId) throw new Error("Set a token and organization ID");
+
+const ship = new OpenshipClient({
+  baseUrl: "https://ship.example.com",
+  token,
+  organizationId,
+});
+
+const projects = await ship.projects.list({ page: 1, perPage: 20 });
+console.log(projects.data);
+```
+
+</Tab>
+<Tab value="REST API">
+
+```bash
+export OPENSHIP_URL="https://ship.example.com"
+export OPENSHIP_ORGANIZATION_ID="org_123"
+# Set OPENSHIP_TOKEN to your personal access token.
+
+curl "$OPENSHIP_URL/api/projects?page=1&perPage=20" \
+  -H "Authorization: Bearer $OPENSHIP_TOKEN" \
+  -H "X-Organization-Id: $OPENSHIP_ORGANIZATION_ID" \
+  -H "X-Openship-Scope: fixed"
+```
+
+</Tab>
+</Tabs>
+
+### Example conventions
+
+Resource examples use `ship` for a configured remote client or [native user scope](/docs/api/sdk/identity).
+Replace IDs such as `proj_123` with your own. REST examples use the URL and token above; a token's
+organization binding applies to every request. To pin an organization independently of defaults,
+include the two scope headers shown above. [Older APIs must support fixed scopes](/docs/api/sdk/compatibility#fixed-organization-scopes).
+
+Named SDK methods unwrap response envelopes where applicable. For example, `projects.get(id)` returns a
+project, while its REST endpoint returns `{ data: project }`. IDs may be method arguments in the SDK
+and URL, query, or body fields in REST; the code tabs show that mapping.
+
+## Applications
+
+| Resource | Use |
+| --- | --- |
+| [Projects](/docs/api/projects) | Configuration, environments, connections, and storage bindings |
+| [Source files](/docs/api/sources) | Generated code, folder uploads, and source detection |
+| [Deployments](/docs/api/deployments) | Builds, progress, decisions, cancellation, and rollback |
+| [Services](/docs/api/services) | Containers and services within a project |
+| [App catalog](/docs/api/apps) | Templates and application settings |
+| [GitHub](/docs/api/github) | Accounts, repositories, and GitHub App sources |
+
+## Networking
+
+| Resource | Use |
+| --- | --- |
+| [Domains and TLS](/docs/api/domains) | Hostnames, DNS verification, and certificates |
+| [DNS providers](/docs/api/dns) | DNS credentials and zone checks |
+| [Webhooks](/docs/api/webhooks) | Incoming actions and provider deliveries |
+| [Edge administration](/docs/api/edge) | Discover and import existing edge sites |
+| [Server terminal](/docs/api/terminal) / [service terminal](/docs/api/service-terminal) | Interactive WebSocket sessions |
+
+## Operations
+
+| Resource | Use |
+| --- | --- |
+| [Analytics](/docs/api/analytics) | Traffic and resource usage |
+| [Issues and health](/docs/api/issues) | Problems, health snapshots, and rescans |
+| [Updates](/docs/api/updates) | Available versions and update deployment |
+| [Jobs](/docs/api/jobs) | Commands, schedules, and run history |
+| [Backups](/docs/api/backups) / [destinations](/docs/api/backup-destinations) | Policies, archives, and restores |
+| [Notifications](/docs/api/notifications) | Channels, subscriptions, and deliveries |
+| [Notices](/docs/api/notices) | Public installation announcements |
+| [Audit log](/docs/api/audit) | Organization activity |
+
+## Access and infrastructure
+
+| Resource | Use |
+| --- | --- |
+| [Tokens](/docs/api/tokens) / [permissions](/docs/api/permissions) | Credentials, members, invitations, and grants |
+| [Provider credentials](/docs/api/credentials) | Registry and DNS provider secrets |
+| [User settings](/docs/api/settings) | Build, deploy, routing, and Git defaults |
+| [Servers](/docs/api/servers) / [installation settings](/docs/api/system) | Hosts, components, setup, and administration |
+| [Health](/docs/api/health) / [container images](/docs/api/images) | Installation metadata and image catalog |
+| [Mail](/docs/api/mail) | Self-hosted email services |
+| [Migration](/docs/api/migration) / [data transfer](/docs/api/data-transfer) | Server adoption, moves, imports, and exports |
+| [Cloud](/docs/api/cloud) / [billing](/docs/api/billing) | Cloud connections, plans, and usage |
+| [Authentication](/docs/api/auth) / [MCP](/docs/api/mcp) | Browser login and agent protocols |
+
+For transport details, see [HTTP basics](/docs/api/http). For errors, providers, and current native/Cloud
+limits, see [SDK errors](/docs/api/sdk/errors) and [compatibility](/docs/api/sdk/compatibility).

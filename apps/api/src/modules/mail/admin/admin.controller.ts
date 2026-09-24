@@ -10,7 +10,7 @@
  */
 
 import type { Context } from "hono";
-import { env } from "../../../config";
+import { env } from "@repo/platform/engine/config/index";
 import { repos } from "@repo/db";
 import { getRequestContext, type RequestContext } from "../../../lib/request-context";
 import { permission } from "../../../lib/permission";
@@ -26,7 +26,7 @@ import {
   listDomains,
   updateDomain,
   validateDomain,
-} from "./domains.service";
+} from "@repo/platform/engine/modules/mail/admin/domains.service";
 import {
   createMailbox,
   hardDeleteMailbox,
@@ -34,13 +34,28 @@ import {
   listMailboxes,
   MailboxExistsError,
   MailboxNotFoundError,
+  PlatformMailboxProtectedError,
   softDeleteMailbox,
   updateMailbox,
-} from "./mailboxes.service";
+} from "@repo/platform/engine/modules/mail/admin/mailboxes.service";
+import {
+  ensureOpenshipPlatformMailbox,
+  PlatformMailboxError,
+} from "@repo/platform/engine/modules/mail/admin/platform-mailbox.service";
+import {
+  createAlias,
+  deleteAlias,
+  listAliases,
+  updateAliasActive,
+  AliasConflictsWithMailboxError,
+  AliasExistsError,
+  AliasNotFoundError,
+} from "./aliases.service";
 import { getMailServerStats } from "./stats.service";
 import { scanDns } from "./dns-scan.service";
 import { sendTestEmail, TestEmailError } from "./test-email.service";
-import { safeErrorMessage } from "@repo/core";
+import { AppError, isRelayProviderId, safeErrorMessage } from "@repo/core";
+import { handleApiError, requestTag } from "../../../middleware/error-handler";
 import {
   getComponentLogs,
   restartAllComponents,
@@ -52,7 +67,21 @@ import {
   acknowledgeDomainDns,
   getDomainDnsState,
   listPendingDomainDns,
-} from "./domain-dns.service";
+} from "@repo/platform/engine/modules/mail/admin/domain-dns.service";
+import {
+  applyMailDomainDns,
+  planMailDomainDns,
+} from "./domain-dns-provider.service";
+import {
+  configureOutboundRelay,
+  disableOutboundRelay,
+  getOutboundRelay,
+  type ConfigureRelayInput,
+} from "@repo/platform/engine/modules/mail/admin/outbound-relay.service";
+import { sshManager } from "@repo/platform/engine/lib/ssh-manager";
+import { decrypt } from "@repo/platform/engine/lib/encryption";
+import { readState } from "@repo/platform/engine/modules/mail/mail-state";
+import { invalidatePlatformTransport } from "@repo/platform/engine/lib/mail";
 
 /**
  * Org-scoped guard: confirms the path's :serverId belongs to the caller's
@@ -265,6 +294,180 @@ export async function pendingDomainDnsHandler(c: Context) {
   }
 }
 
+/**
+ * GET a dry-run of auto-configuring this mail domain's DNS through a connected
+ * provider (Settings→DNS). Reads only — powers the on-demand button's preview.
+ */
+export async function planDomainDnsHandler(c: Context) {
+  const guard = assertNotCloud(c);
+  if (guard) return guard;
+  const serverId = param(c, "serverId");
+  await permission.assert(getRequestContext(c), { resourceType: "mail_server", resourceId: serverId, action: "read" });
+  const ctx = getRequestContext(c);
+  if (!(await isServerInOrg(ctx, serverId))) {
+    return c.json({ error: "Server not found" }, 404);
+  }
+  const domain = c.req.param("domain");
+  if (!domain) return c.json({ error: "domain required" }, 400);
+  try {
+    const plan = await planMailDomainDns(ctx.organizationId, serverId, domain.toLowerCase());
+    return c.json({ data: plan });
+  } catch (err) {
+    return errorJson(c, err);
+  }
+}
+
+/**
+ * POST auto-configure: write this domain's records through the connected
+ * provider on operator press, then clear the manual banner on full success.
+ */
+export async function applyDomainDnsHandler(c: Context) {
+  const guard = assertNotCloud(c);
+  if (guard) return guard;
+  const serverId = param(c, "serverId");
+  await permission.assert(getRequestContext(c), { resourceType: "mail_server", resourceId: serverId, action: "write" });
+  const ctx = getRequestContext(c);
+  if (!(await isServerInOrg(ctx, serverId))) {
+    return c.json({ error: "Server not found" }, 404);
+  }
+  const domain = c.req.param("domain");
+  if (!domain) return c.json({ error: "domain required" }, 400);
+  try {
+    const result = await applyMailDomainDns(ctx.organizationId, serverId, domain.toLowerCase());
+    return c.json({ data: result });
+  } catch (err) {
+    return errorJson(c, err);
+  }
+}
+
+// ─── Outbound relay (split delivery: self-host inbox + SES/SMTP send) ─────────
+
+/** GET the current outbound relay config (masked — never returns the password). */
+export async function getOutboundRelayHandler(c: Context) {
+  const guard = assertNotCloud(c);
+  if (guard) return guard;
+  const serverId = param(c, "serverId");
+  await permission.assert(getRequestContext(c), { resourceType: "mail_server", resourceId: serverId, action: "read" });
+  const ctx = getRequestContext(c);
+  if (!(await isServerInOrg(ctx, serverId))) {
+    return c.json({ error: "Server not found" }, 404);
+  }
+  try {
+    const relay = await sshManager.withExecutor(serverId, (exec) => getOutboundRelay(exec));
+    return c.json({ relay });
+  } catch (err) {
+    return errorJson(c, err);
+  }
+}
+
+/**
+ * Enable / update the outbound relay. Mutates Postfix on the mail server, so
+ * it's gated at "admin". A blank password on update keeps the stored one
+ * (mirrors the instance-SMTP "leave blank to keep" convention).
+ */
+export async function putOutboundRelayHandler(c: Context) {
+  const guard = assertNotCloud(c);
+  if (guard) return guard;
+  const serverId = param(c, "serverId");
+  await permission.assert(getRequestContext(c), { resourceType: "mail_server", resourceId: serverId, action: "admin" });
+  const ctx = getRequestContext(c);
+  if (!(await isServerInOrg(ctx, serverId))) {
+    return c.json({ error: "Server not found" }, 404);
+  }
+  const body = await c.req.json().catch(() => ({} as Record<string, unknown>));
+  // Unknown ids become `custom`, which requires an explicit host — so a bad id
+  // fails validation loudly instead of quietly relaying somewhere unintended.
+  const provider = isRelayProviderId(body.provider) ? body.provider : "custom";
+
+  // Resolve the effective plaintext password: use the submitted one, else fall
+  // back to the stored (encrypted) one so "change region only" doesn't require
+  // re-typing the SMTP password.
+  let password = typeof body.password === "string" ? body.password : "";
+  if (!password) {
+    try {
+      const state = await sshManager.withExecutor(serverId, (exec) => readState(exec));
+      const enc = state?.outboundRelay?.passwordEncrypted;
+      if (enc) password = decrypt(enc);
+    } catch {
+      /* fall through to the required-password error below */
+    }
+    if (!password) {
+      return c.json({ error: "Relay password is required." }, 400);
+    }
+  }
+
+  // Parse a list of {name,value} DKIM CNAME pairs from untrusted JSON.
+  const parseDkim = (v: unknown): { name: string; value: string }[] | undefined =>
+    Array.isArray(v)
+      ? (v as unknown[])
+          .filter((r): r is { name: string; value: string } =>
+            !!r && typeof r === "object" && typeof (r as { name?: unknown }).name === "string" && typeof (r as { value?: unknown }).value === "string")
+          .map((r) => ({ name: r.name, value: r.value }))
+      : undefined;
+
+  /** Untrusted string[] → trimmed, de-duplicated, empties dropped. */
+  const parseList = (v: unknown): string[] | undefined =>
+    Array.isArray(v)
+      ? [...new Set((v as unknown[]).filter((s): s is string => typeof s === "string").map((s) => s.trim()).filter(Boolean))]
+      : undefined;
+
+  // Per-additional-domain provider identities: { "y.com": { mailFromDomain?, sesDkim? } }.
+  let identities: ConfigureRelayInput["identities"];
+  if (body.identities && typeof body.identities === "object" && !Array.isArray(body.identities)) {
+    identities = {};
+    for (const [dom, raw] of Object.entries(body.identities as Record<string, unknown>)) {
+      if (!raw || typeof raw !== "object") continue;
+      const r = raw as { mailFromDomain?: unknown; sesDkim?: unknown };
+      identities[dom] = {
+        mailFromDomain: typeof r.mailFromDomain === "string" && r.mailFromDomain ? r.mailFromDomain : undefined,
+        sesDkim: parseDkim(r.sesDkim),
+      };
+    }
+  }
+
+  const input: ConfigureRelayInput = {
+    provider,
+    scope: body.scope === "selected" ? "selected" : "all",
+    domains: parseList(body.domains),
+    addresses: parseList(body.addresses),
+    region: typeof body.region === "string" ? body.region : undefined,
+    host: typeof body.host === "string" ? body.host : undefined,
+    port: Number(body.port),
+    username: typeof body.username === "string" ? body.username : "",
+    password,
+    spfInclude: typeof body.spfInclude === "string" && body.spfInclude ? body.spfInclude : undefined,
+    mailFromDomain: typeof body.mailFromDomain === "string" && body.mailFromDomain ? body.mailFromDomain : undefined,
+    sesDkim: parseDkim(body.sesDkim),
+    identities,
+  };
+
+  try {
+    await sshManager.withExecutor(serverId, (exec) => configureOutboundRelay(exec, input));
+    const relay = await sshManager.withExecutor(serverId, (exec) => getOutboundRelay(exec));
+    return c.json({ relay });
+  } catch (err) {
+    return errorJson(c, err);
+  }
+}
+
+/** Disable the outbound relay — revert Postfix to direct-to-MX. */
+export async function deleteOutboundRelayHandler(c: Context) {
+  const guard = assertNotCloud(c);
+  if (guard) return guard;
+  const serverId = param(c, "serverId");
+  await permission.assert(getRequestContext(c), { resourceType: "mail_server", resourceId: serverId, action: "admin" });
+  const ctx = getRequestContext(c);
+  if (!(await isServerInOrg(ctx, serverId))) {
+    return c.json({ error: "Server not found" }, 404);
+  }
+  try {
+    await sshManager.withExecutor(serverId, (exec) => disableOutboundRelay(exec));
+    return c.json({ ok: true });
+  } catch (err) {
+    return errorJson(c, err);
+  }
+}
+
 export async function domainDependentsHandler(c: Context) {
   const guard = assertNotCloud(c);
   if (guard) return guard;
@@ -346,7 +549,7 @@ export async function createMailboxHandler(c: Context) {
     });
     return c.json({ mailbox: row }, 201);
   } catch (err) {
-    if (err instanceof MailboxExistsError) {
+    if (err instanceof MailboxExistsError || err instanceof PlatformMailboxProtectedError) {
       return c.json({ error: err.message }, 409);
     }
     return errorJson(c, err);
@@ -377,6 +580,42 @@ export async function updateMailboxHandler(c: Context) {
     if (err instanceof MailboxNotFoundError) {
       return c.json({ error: err.message }, 404);
     }
+    if (err instanceof PlatformMailboxProtectedError) {
+      return c.json({ error: err.message }, 409);
+    }
+    return errorJson(c, err);
+  }
+}
+
+/**
+ * Explicit repair surface for the protected Openship sender. This is the only
+ * admin endpoint allowed to rotate it; ordinary mailbox CRUD rejects the same
+ * address so state-file credentials and the Dovecot hash cannot drift again.
+ */
+export async function rotatePlatformMailboxHandler(c: Context) {
+  const guard = assertNotCloud(c);
+  if (guard) return guard;
+  const serverId = param(c, "serverId");
+  await permission.assert(getRequestContext(c), {
+    resourceType: "mail_server",
+    resourceId: serverId,
+    action: "admin",
+  });
+  const ctx = getRequestContext(c);
+  if (!(await isServerInOrg(ctx, serverId))) {
+    return c.json({ error: "Server not found" }, 404);
+  }
+
+  try {
+    const creds = await ensureOpenshipPlatformMailbox(serverId, { rotate: true });
+    // A prior nodemailer transport may still hold the old password for up to a
+    // minute. Drop it immediately; the next send rebuilds from the new state.
+    invalidatePlatformTransport(serverId);
+    return c.json({ ok: true, email: creds.email, rotated: creds.rotated });
+  } catch (err) {
+    if (err instanceof PlatformMailboxError) {
+      return c.json({ error: err.message }, 409);
+    }
     return errorJson(c, err);
   }
 }
@@ -403,6 +642,113 @@ export async function deleteMailboxHandler(c: Context) {
     return c.json({ ok: true, mode: hard ? "hard" : "soft" });
   } catch (err) {
     if (err instanceof MailboxNotFoundError) {
+      return c.json({ error: err.message }, 404);
+    }
+    if (err instanceof PlatformMailboxProtectedError) {
+      return c.json({ error: err.message }, 409);
+    }
+    return errorJson(c, err);
+  }
+}
+
+// ─── Admin panel - aliases / forwards / catch-all ────────────────────────────
+
+export async function listAliasesHandler(c: Context) {
+  const guard = assertNotCloud(c);
+  if (guard) return guard;
+  const serverId = param(c, "serverId");
+  await permission.assert(getRequestContext(c), { resourceType: "mail_server", resourceId: serverId, action: "read" });
+  const ctx = getRequestContext(c);
+  if (!(await isServerInOrg(ctx, serverId))) {
+    return c.json({ error: "Server not found" }, 404);
+  }
+  const domain = c.req.query("domain");
+  if (!domain) return c.json({ error: "domain query param required" }, 400);
+  try {
+    const rows = await listAliases(serverId, domain);
+    return c.json({ aliases: rows });
+  } catch (err) {
+    return errorJson(c, err);
+  }
+}
+
+export async function createAliasHandler(c: Context) {
+  const guard = assertNotCloud(c);
+  if (guard) return guard;
+  const serverId = param(c, "serverId");
+  await permission.assert(getRequestContext(c), { resourceType: "mail_server", resourceId: serverId, action: "write" });
+  const ctx = getRequestContext(c);
+  if (!(await isServerInOrg(ctx, serverId))) {
+    return c.json({ error: "Server not found" }, 404);
+  }
+  const body = await c.req.json().catch(() => ({}));
+  try {
+    const row = await createAlias(serverId, {
+      domain: String(body.domain ?? ""),
+      localPart: body.localPart ? String(body.localPart) : undefined,
+      isCatchAll: Boolean(body.isCatchAll),
+      destination: String(body.destination ?? ""),
+    });
+    return c.json({ alias: row }, 201);
+  } catch (err) {
+    if (err instanceof AliasExistsError) {
+      return c.json({ error: err.message }, 409);
+    }
+    if (err instanceof AliasConflictsWithMailboxError) {
+      return c.json({ error: err.message }, 409);
+    }
+    return errorJson(c, err);
+  }
+}
+
+export async function updateAliasHandler(c: Context) {
+  const guard = assertNotCloud(c);
+  if (guard) return guard;
+  const serverId = param(c, "serverId");
+  await permission.assert(getRequestContext(c), { resourceType: "mail_server", resourceId: serverId, action: "write" });
+  const ctx = getRequestContext(c);
+  if (!(await isServerInOrg(ctx, serverId))) {
+    return c.json({ error: "Server not found" }, 404);
+  }
+  const idParam = c.req.param("id");
+  const id = Number(idParam);
+  if (!idParam || !Number.isInteger(id)) {
+    return c.json({ error: "id must be an integer" }, 400);
+  }
+  const body = await c.req.json().catch(() => ({}));
+  if (body.active == null) {
+    return c.json({ error: "active is required" }, 400);
+  }
+  try {
+    const row = await updateAliasActive(serverId, id, Boolean(body.active));
+    return c.json({ alias: row });
+  } catch (err) {
+    if (err instanceof AliasNotFoundError) {
+      return c.json({ error: err.message }, 404);
+    }
+    return errorJson(c, err);
+  }
+}
+
+export async function deleteAliasHandler(c: Context) {
+  const guard = assertNotCloud(c);
+  if (guard) return guard;
+  const serverId = param(c, "serverId");
+  await permission.assert(getRequestContext(c), { resourceType: "mail_server", resourceId: serverId, action: "admin" });
+  const ctx = getRequestContext(c);
+  if (!(await isServerInOrg(ctx, serverId))) {
+    return c.json({ error: "Server not found" }, 404);
+  }
+  const idParam = c.req.param("id");
+  const id = Number(idParam);
+  if (!idParam || !Number.isInteger(id)) {
+    return c.json({ error: "id must be an integer" }, 400);
+  }
+  try {
+    await deleteAlias(serverId, id);
+    return c.json({ ok: true });
+  } catch (err) {
+    if (err instanceof AliasNotFoundError) {
       return c.json({ error: err.message }, 404);
     }
     return errorJson(c, err);
@@ -549,9 +895,23 @@ export async function getComponentLogsHandler(c: Context) {
 // ─── Error mapping ───────────────────────────────────────────────────────────
 
 function errorJson(c: Context, err: unknown) {
+  // A typed AppError already carries its status + code — MailEngineUnavailableError
+  // is the one every read here can raise (a stopped engine / a legacy box whose
+  // container never existed), and it must reach the panel as 409 +
+  // MAIL_ENGINE_NOT_{INSTALLED,RUNNING} so the UI can offer the fix. Flattening it
+  // to 500 is exactly what turned "your mail engine is stopped" into "API 500".
+  // The central mapper owns that translation; don't restate it per error type.
+  if (err instanceof AppError) return handleApiError(err, c);
+
   const message = safeErrorMessage(err);
   // The SSH+psql layer throws plain Error for any non-shape error
   // (connection failure, SQL syntax, validation). 500 is the right default;
   // typed errors above are caught and mapped to 4xx individually.
+  //
+  // Logged HERE because we answer the response ourselves: `app.onError` only sees
+  // errors that were never caught, so every mail-admin 500 left the API log with
+  // nothing but hono's `--> … 500` (the second half of GH-562). The AppError branch
+  // above logs through `handleApiError`, so no path logs twice.
+  console.error(`[MAIL ADMIN ERROR] ${requestTag(c)}`, err);
   return c.json({ error: message }, 500);
 }

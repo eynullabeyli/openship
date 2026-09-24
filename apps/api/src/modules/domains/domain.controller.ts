@@ -1,176 +1,93 @@
-/**
- * Domain controller - Hono request handlers.
- */
-
+/** HTTP paths, status codes, and envelopes over the shared domain operations. */
 import type { Context } from "hono";
+import type { TAddDomainBody } from "@repo/contracts";
+import { getPlatformKernel } from "@repo/platform/engine/lib/platform";
 import { param } from "../../lib/controller-helpers";
-import { getRequestContext } from "../../lib/request-context";
 import { permission } from "../../lib/permission";
-import { audit, auditContextFrom } from "../../lib/audit";
-import * as domainService from "./domain.service";
+import { getRequestContext } from "../../lib/request-context";
+import { operationContext, operationData, applyOperationContext } from "../../lib/operation-context";
 import { maybeProxyCloudProject } from "../../lib/cloud/project-router";
-import type { TAddDomainBody } from "./domain.schema";
+import { streamSSE } from "../../lib/sse";
 
-// ─── Handlers ────────────────────────────────────────────────────────────────
+const operations = () => getPlatformKernel().domains;
+const force = (c: Context) => ({ force: ["true", "1"].includes(c.req.query("force") ?? "") });
+const target = (c: Context) => ({ serverId: c.req.query("serverId")?.trim() || undefined });
 
 export async function list(c: Context) {
-  const ctx = getRequestContext(c);
   const projectId = c.req.query("projectId");
-  if (!projectId) {
-    return c.json({ error: "projectId query parameter required" }, 400);
-  }
+  if (!projectId) return c.json({ error: "projectId query parameter required" }, 400);
   await permission.assert(getRequestContext(c), { resourceType: "project", resourceId: projectId, action: "read" });
-  const proxied = await maybeProxyCloudProject(c, projectId, getRequestContext(c).organizationId);
+  const proxied = await maybeProxyCloudProject(c, projectId, operationContext(c).organizationId);
   if (proxied) return proxied;
-  const domains = await domainService.listDomains(ctx, projectId);
-  return c.json({ data: domains });
+  return c.json({ data: await operationData(c, operations().list(operationContext(c), projectId)) });
 }
 
 export async function add(c: Context) {
-  const ctx = getRequestContext(c);
   const body = await c.req.json<TAddDomainBody>();
-  if (body.projectId) {
-    await permission.assert(getRequestContext(c), { resourceType: "project", resourceId: body.projectId, action: "write" });
-    const proxied = await maybeProxyCloudProject(c, body.projectId, getRequestContext(c).organizationId, {
-      body: JSON.stringify(body),
-    });
-    if (proxied) return proxied;
-  }
-  const result = await domainService.addDomain(ctx, body);
-  audit.recordAsync(auditContextFrom(c, ctx.organizationId, ctx.userId), {
-    eventType: "domain.added",
-    resourceType: "domain",
-    resourceId: result.domain.id,
-    after: {
-      projectId: result.domain.projectId,
-      hostname: result.domain.hostname,
-      isPrimary: result.domain.isPrimary,
-    },
-  });
-  return c.json({ data: result.domain, records: result.records }, 201);
+  const { projectId, ...input } = body;
+  await permission.assert(getRequestContext(c), { resourceType: "project", resourceId: projectId, action: "write" });
+  const proxied = await maybeProxyCloudProject(c, projectId, operationContext(c).organizationId, { body: JSON.stringify(body) });
+  if (proxied) return proxied;
+  const { domain, ...details } = await operationData(c, operations().create(operationContext(c), projectId, input));
+  return c.json({ data: domain, ...details }, 201);
 }
 
+export async function get(c: Context) {
+  return c.json({ data: await operationData(c, operations().get(operationContext(c), param(c, "id"))) });
+}
 export async function remove(c: Context) {
-  const ctx = getRequestContext(c);
-  const id = param(c, "id");
-  await permission.assert(getRequestContext(c), { resourceType: "domain", resourceId: id, action: "admin" });
-  await domainService.removeDomain(ctx, id);
-  audit.recordAsync(auditContextFrom(c, ctx.organizationId, ctx.userId), {
-    eventType: "domain.removed",
-    resourceType: "domain",
-    resourceId: id,
-    after: null,
-  });
-  return c.json({ message: "domain removed" });
+  return c.json(await operationData(c, operations().remove(operationContext(c), param(c, "id"))));
 }
-
 export async function verify(c: Context) {
-  const ctx = getRequestContext(c);
-  const id = param(c, "id");
-  await permission.assert(getRequestContext(c), { resourceType: "domain", resourceId: id, action: "write" });
-  const result = await domainService.verifyDomain(ctx, id);
-
-  // Audit verify attempts (both success and failure) so DNS verification
-  // is traceable in the audit log alongside domain.added / domain.removed.
-  // Useful for incident response — if a domain is hijacked via brief CNAME
-  // control, the audit trail shows exactly when and from where the verify
-  // ran.
-  audit.recordAsync(auditContextFrom(c, ctx.organizationId, ctx.userId), {
-    eventType: result.verified ? "domain.verified" : "domain.verify_failed",
-    resourceType: "domain",
-    resourceId: id,
-    after: {
-      verified: result.verified,
-      cnameVerified: result.cnameVerified,
-      txtVerified: result.txtVerified,
-    },
-  });
-
-  // Failed verification returns 422 so the dashboard's React Query / fetch
-  // wrapper can use the standard error path while still reading
-  // message/cnameVerified/txtVerified from the body. 200 on success.
-  return c.json(result, result.verified ? 200 : 422);
+  const data = await operationData(c, operations().verify(operationContext(c), param(c, "id"), force(c)));
+  // Preserve the dashboard's verification-failure status and public result body.
+  return c.json(data, data.verified ? 200 : 422);
 }
-
+export async function verifyStream(c: Context) {
+  const context = operationContext(c);
+  const id = param(c, "id");
+  const input = force(c);
+  applyOperationContext(c, context);
+  return streamSSE(c, async (stream) => {
+    const abort = new AbortController();
+    stream.onAbort(() => abort.abort());
+    try {
+      for await (const event of operations().verifyStream(context, id, input, { signal: abort.signal })) {
+        // Flush the terminal event before returning and closing Hono's stream.
+        await stream.writeSSE(event);
+      }
+    } finally {
+      abort.abort();
+    }
+  });
+}
 export async function records(c: Context) {
-  const ctx = getRequestContext(c);
-  const id = param(c, "id");
-  await permission.assert(getRequestContext(c), { resourceType: "domain", resourceId: id, action: "read" });
-  const result = await domainService.getDomainRecords(ctx, id);
-  return c.json({ data: result });
+  return c.json({ data: await operationData(c, operations().records(operationContext(c), param(c, "id"), target(c))) });
 }
-
-/** POST /domains/:id/primary - make this domain the project's primary */
+export async function dnsPlan(c: Context) {
+  return c.json({ data: await operationData(c, operations().dnsPlan(operationContext(c), param(c, "id"), target(c))) });
+}
+export async function dnsApply(c: Context) {
+  return c.json({ data: await operationData(c, operations().dnsApply(operationContext(c), param(c, "id"), target(c))) });
+}
 export async function setPrimary(c: Context) {
-  const ctx = getRequestContext(c);
-  const id = param(c, "id");
-  await permission.assert(getRequestContext(c), { resourceType: "domain", resourceId: id, action: "write" });
-  const domain = await domainService.setPrimaryDomain(ctx, id);
-  audit.recordAsync(auditContextFrom(c, ctx.organizationId, ctx.userId), {
-    eventType: "domain.set_primary",
-    resourceType: "domain",
-    resourceId: id,
-    after: { projectId: domain.projectId, hostname: domain.hostname, isPrimary: true },
-  });
-  return c.json({ data: domain });
+  return c.json({ data: await operationData(c, operations().setPrimary(operationContext(c), param(c, "id"))) });
 }
-
-/** POST /domains/preview - get DNS records for a hostname (no DB write) */
 export async function preview(c: Context) {
-  const body = await c.req.json<{ hostname: string }>();
-  if (!body.hostname?.trim()) {
-    return c.json({ error: "hostname is required" }, 400);
-  }
-  const result = await domainService.previewRecords(body.hostname.trim().toLowerCase());
-  return c.json({ data: result });
+  return c.json({ data: await operationData(c, operations().preview(operationContext(c), await c.req.json())) });
 }
-
-/** POST /domains/:id/renew - renew SSL for a single domain */
 export async function renewSsl(c: Context) {
-  const ctx = getRequestContext(c);
-  const id = param(c, "id");
-  await permission.assert(getRequestContext(c), { resourceType: "domain", resourceId: id, action: "write" });
-  const result = await domainService.renewDomainSsl(ctx, id);
-  return c.json({ data: result });
+  return c.json({ data: await operationData(c, operations().renewSsl(operationContext(c), param(c, "id"))) });
 }
-
-/** POST /domains/:id/verify-ssl - read-only recheck that the cert is issued/valid */
 export async function verifySsl(c: Context) {
-  const ctx = getRequestContext(c);
-  const id = param(c, "id");
-  await permission.assert(getRequestContext(c), { resourceType: "domain", resourceId: id, action: "write" });
-  const result = await domainService.verifyDomainSsl(ctx, id);
-  return c.json({ data: result });
+  return c.json({ data: await operationData(c, operations().verifySsl(operationContext(c), param(c, "id"))) });
 }
-
-/** POST /domains/renew-all - batch SSL renewal for the requesting org's domains */
+export async function uploadCert(c: Context) {
+  return c.json({ data: await operationData(c, operations().uploadCert(operationContext(c), param(c, "id"), await c.req.json())) });
+}
 export async function renewAllSsl(c: Context) {
-  const ctx = getRequestContext(c);
-  const result = await domainService.renewOrgCerts(ctx);
-  return c.json({ data: result });
+  return c.json({ data: await operationData(c, operations().renewAllSsl(operationContext(c))) });
 }
-
-/**
- * POST /domains/verify-pending - admin/cron endpoint.
- *
- * Re-runs DNS verification for every custom domain still in `pending`
- * state and added more than `minAgeMinutes` ago. Wire this up to a
- * scheduled job (Kubernetes CronJob / systemd timer / external scheduler)
- * so domains whose DNS finishes propagating after the user closed the
- * tab eventually flip to verified without manual re-clicks.
- *
- * Body: { minAgeMinutes?: number; limit?: number }
- */
 export async function verifyPending(c: Context) {
-  // Auth is the standard authMiddleware applied at the routes file —
-  // any logged-in user can trigger a run; the work itself runs against
-  // each domain's own project owner via verifyDomain, so the requester
-  // can only kick off the sweep, not cross-tenant verify.
-  type Body = { minAgeMinutes?: number; limit?: number };
-  const body: Body = await c.req.json<Body>().catch(() => ({} as Body));
-  const result = await domainService.verifyPendingDomains({
-    minAgeMinutes: typeof body.minAgeMinutes === "number" ? body.minAgeMinutes : undefined,
-    limit: typeof body.limit === "number" ? body.limit : undefined,
-  });
-  return c.json({ data: result });
+  return c.json({ data: await operationData(c, operations().verifyPending(operationContext(c), await c.req.json().catch(() => ({})))) });
 }

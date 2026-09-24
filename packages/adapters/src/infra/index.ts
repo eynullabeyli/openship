@@ -2,7 +2,7 @@
  * Infrastructure layer barrel exports.
  */
 
-export type { RoutingProvider, SslProvider } from "./types";
+export type { RoutingProvider, SslProvider, ProvisionCertOptions } from "./types";
 
 export { NginxProvider, type NginxProviderOptions } from "./nginx";
 export { CloudInfraProvider } from "./cloud";
@@ -11,8 +11,14 @@ export {
   buildReloadCommand,
   deployLuaScripts,
   detectOpenRestyPaths,
+  ensureLuaScripts,
   ensureOpenRestyConfig,
+  luaSourceAvailable,
+  EDGE_CONTAINER_MOUNTS,
+  EDGE_HOST_PATHS,
+  EDGE_HOST_STATE_DIR,
   LUA_LOGGER_PATH,
+  OPENRESTY_DEFAULT_PATHS,
   OPENRESTY_LUA_DIR,
   OPENRESTY_MGMT_PORT,
   type OpenRestyPaths,

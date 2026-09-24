@@ -1,0 +1,60 @@
+---
+title: Servers and operations
+description: Manage servers, backup workflows, mail, and instance configuration.
+---
+
+These operations require an authorized connection to a self-hosted installation. Provider and
+host permissions still apply in native mode.
+
+## Servers
+
+```bash
+openship server list
+openship server check srv_123
+```
+
+Use the [server reference](/docs/cli/reference/server) to register connections, install components,
+set rate limits, and monitor a server. The [Servers API](/docs/api/servers) also exposes container,
+Git credential, and tunnel operations. Start with the [server guide](/docs/guides/custom-servers)
+for prerequisites.
+
+## Backups and restores
+
+The workflow has four parts:
+
+| Step | Commands |
+| --- | --- |
+| Configure and verify storage | [backup destination](/docs/cli/reference/backup/destination) |
+| Choose a source, schedule, and retention | [backup policy](/docs/cli/reference/backup/policy) |
+| Inspect executions or prepare a restore | [backup run](/docs/cli/reference/backup/run) |
+| Inspect, apply, or cancel a prepared restore | [backup restore](/docs/cli/reference/backup#openship-backup-restore) |
+
+```bash
+openship backup destination list
+openship backup policy list --project proj_123
+openship backup policy run policy_123
+openship backup run list --project proj_123
+```
+
+Preparing a restore does not apply it. Inspect the returned restore session and confirmation
+requirements before using the apply command. See [backups and restores](/docs/guides/backups-restore).
+
+## Mail
+
+Use [mail commands](/docs/cli/reference/mail) to provision or adopt a server, manage domains and
+mailboxes, and inspect delivery health. The [email guide](/docs/guides/email-webmail) covers DNS,
+relay configuration, and webmail. Mail commands currently require an HTTP context.
+
+## Installation settings and data
+
+Use [system commands](/docs/cli/reference/system) for instance settings, onboarding, filesystem
+browsing, and data transfer. Settings have native SDK support; remaining setup and migration actions
+require HTTP.
+
+For moving an installation, follow [control-plane migration](/docs/guides/migrate-control-plane).
+For moving a workload, follow [server-to-server migration](/docs/guides/server-to-server-migration).
+
+## Reverse proxy
+
+The [edge workflow](/docs/cli/edge) covers setup, domains, and traffic rules. Its complete options are
+in the [edge reference](/docs/cli/reference/edge).

@@ -1,15 +1,67 @@
 import { api } from "./client";
 import type { PrepareComposeService, PrepareProjectResponse } from "./deploy";
-import type { RoutingConfig } from "@repo/core";
+import type { BranchPageResponse } from "./github";
+import type {
+  RoutingConfig,
+  RouteRuleSpec,
+  ProxySettings,
+  OpenshipReadiness,
+  WorkloadType,
+  DeploymentHistoryQuery,
+} from "@repo/core";
+import type { DeploymentPage, RollbackCapacity } from "@repo/contracts";
 import { endpoints } from "./endpoints";
+import type { ReleaseImageSource } from "../release-image-source";
+import {
+  normalizeProjectResourcesResponse,
+  type ProjectResourcesResponse,
+} from "./project-resources";
 
 /* ------------------------------------------------------------------ */
 /*  Projects API                                                      */
 /* ------------------------------------------------------------------ */
 
+/**
+ * One thing waiting on a human. Mirrors `PendingAction` in the API's
+ * pending-actions.service — the item carries its own resolutions, so the UI
+ * renders buttons from data instead of hard-coding which call fixes what.
+ */
+export interface PendingActionResolution {
+  label: string;
+  destructive?: boolean;
+  method: "POST" | "DELETE";
+  /** Concrete, params already substituted (e.g. /api/deployments/dep_1/redeploy). */
+  path: string;
+  body?: Record<string, unknown>;
+}
+
+export interface PendingAction {
+  id: string;
+  kind:
+    | "deploy_blocked"
+    | "prompt"
+    | "partial_decision"
+    | "routing_unsynced"
+    | "domain_unverified"
+    | "ssl_error"
+    | "port_advisory";
+  /** `advisory` items are hints, never escalated to blockers. */
+  severity: "action_required" | "advisory";
+  title: string;
+  message: string;
+  details?: Record<string, unknown>;
+  /** Only on `prompt` — when the held deploy gives up and aborts. */
+  expiresAt?: string;
+  resolveWith: PendingActionResolution[];
+}
+
+/** Fixed rollback limit: project override, otherwise the instance default (5). */
+export type RollbackCapacityUI = RollbackCapacity;
+
 /** Build + runtime options accepted by POST /:id/options (updateOptions). All
  *  optional — only the fields sent are written. Mirrors the backend allowlist. */
 export interface ProjectOptionsBody {
+  gitBranch?: string;
   framework?: string;
   packageManager?: string;
   buildImage?: string;
@@ -18,12 +70,70 @@ export interface ProjectOptionsBody {
   startCommand?: string;
   outputDirectory?: string;
   productionPaths?: string;
+  /** Persistent mounts. `null` clears the override and restores the framework's
+   *  defaults; `[]` turns persistence off. */
+  volumes?: string[] | null;
   rootDirectory?: string;
+  /** Compose file location (file or directory); "" / null clears the pin. */
+  composePath?: string | null;
   productionPort?: number;
   productionMode?: string;
   hasServer?: boolean;
   hasBuild?: boolean;
+  /** Runtime workload axis (#538) — the only way to persist a portless worker.
+   *  Omit to derive from hasServer (web/static, never worker). */
+  workloadType?: WorkloadType;
   runtimeMode?: "bare" | "docker";
+}
+
+/** A bucket bound to a project, as returned by the API (never any credentials —
+ *  those live in the project's encrypted env store). */
+export interface ObjectStorageBinding {
+  provider: string;
+  endpoint?: string | null;
+  region?: string | null;
+  bucket: string;
+  forcePathStyle?: boolean | null;
+  sourceProjectId?: string | null;
+  envKeys: string[];
+  boundAt: string;
+}
+
+export interface ObjectStorageProviderSpec {
+  id: string;
+  label: string;
+  endpointPlaceholder: string;
+  defaultRegion: string;
+  forcePathStyle: boolean;
+}
+
+export interface ObjectStorageView {
+  binding: ObjectStorageBinding | null;
+  /** Local persistent mounts — declared (null = inheriting) and resolved. */
+  volumes: string[] | null;
+  resolvedVolumes: string[];
+  envPreset: string;
+  envKeys: string[];
+  candidates: Array<{
+    projectId: string;
+    name: string;
+    appTemplateId: string | null;
+    defaultBucket: string;
+  }>;
+  providers: Record<string, ObjectStorageProviderSpec>;
+}
+
+/** Bind body: either `sourceProjectId` (an installed storage app) or an explicit
+ *  provider + credentials. `bucket` is required either way. */
+export interface BindObjectStorageBody {
+  bucket: string;
+  sourceProjectId?: string;
+  mode?: "internal" | "public";
+  provider?: string;
+  endpoint?: string;
+  region?: string;
+  accessKeyId?: string;
+  secretAccessKey?: string;
 }
 
 export interface ScanProjectResponse {
@@ -43,6 +153,85 @@ export interface ScanProjectResponse {
   productionPaths: PrepareProjectResponse["productionPaths"];
   port: PrepareProjectResponse["port"];
   services?: PrepareComposeService[];
+  rootEnv?: PrepareProjectResponse["rootEnv"];
+  openshipEnvKeys?: PrepareProjectResponse["openshipEnvKeys"];
+  configDiagnostics?: PrepareProjectResponse["configDiagnostics"];
+}
+
+/** A route_rule row as returned by the API. */
+export interface RouteRuleRow {
+  id: string;
+  projectId: string;
+  domainId: string | null;
+  pathPrefix: string | null;
+  spec: RouteRuleSpec;
+  enabled: boolean;
+}
+
+/**
+ * One proxy directive's saved-vs-served state, from GET projects/:id/edge-config.
+ *
+ * `liveRaw` exists separately from `live` because a vhost can legally hold a value
+ * our validators reject (`20M`, `1d`): the UI must show what the box serves even
+ * when it isn't adoptable, rather than reporting "not set" for a value that is set.
+ */
+export interface EdgeDirectiveState {
+  key: string;
+  directive: string;
+  group: string;
+  expected?: string | number | boolean;
+  live?: string | number | boolean;
+  liveRaw?: string;
+  drift: boolean;
+}
+
+export interface EdgeConfigHostState {
+  hostname: string;
+  found: boolean;
+  tls: boolean;
+  directives: EdgeDirectiveState[];
+  adoptable: ProxySettings;
+  driftCount: number;
+}
+
+/** `reachable: false` = we couldn't read the box, NOT "no drift". */
+export interface EdgeConfigReport {
+  reachable: boolean;
+  proxyKind?: string;
+  ours?: boolean;
+  nginxVersion?: string;
+  saved: ProxySettings;
+  hosts: EdgeConfigHostState[];
+  error?: string;
+}
+
+/** A service_incident row as returned by the API (Health tab). */
+export interface ServiceIncidentRow {
+  id: string;
+  projectId: string | null;
+  serviceId: string | null;
+  serviceKey: string;
+  serviceName: string;
+  serverId: string | null;
+  containerId: string | null;
+  kind: "down" | "crash_loop" | "unhealthy" | "server_unreachable";
+  status: "open" | "resolved";
+  reason: string | null;
+  exitCode: number | null;
+  restartCount: number;
+  oomKilled: boolean;
+  logExcerpt: string | null;
+  openedAt: string;
+  resolvedAt: string | null;
+  lastSeenAt: string;
+}
+
+/** Body for creating / updating a route rule. */
+export interface RouteRuleInput {
+  domainId?: string | null;
+  pathPrefix?: string | null;
+  spec?: RouteRuleSpec;
+  enabled?: boolean;
 }
 
 export const projectsApi = {
@@ -56,6 +245,10 @@ export const projectsApi = {
   ensure: (body: {
     projectId?: string;
     name: string;
+    /** Rollback retention picked in the wizard before the project existed.
+     *  `null` window inherits the instance default. */
+    rollbackWindow?: number | null;
+    defaultRollbackStrategy?: "git" | "snapshot";
     slug?: string;
     gitOwner?: string;
     /** Source discriminator; "upload" for browser folder-upload projects. */
@@ -70,6 +263,8 @@ export const projectsApi = {
     outputDirectory?: string;
     productionPaths?: string;
     rootDirectory?: string;
+    /** Compose file location, for a compose file outside the detected root. */
+    composePath?: string;
     startCommand?: string;
     buildImage?: string;
     port?: number;
@@ -82,6 +277,8 @@ export const projectsApi = {
     }>;
     hasServer?: boolean;
     hasBuild?: boolean;
+    /** Runtime workload axis (#538) — persists a portless worker; omit to derive. */
+    workloadType?: WorkloadType;
     /** Project flavor - "monorepo" persists the sub-app + workspace fields below. */
     projectType?: "app" | "docker" | "services" | "monorepo";
     monorepoApps?: Array<{
@@ -109,14 +306,18 @@ export const projectsApi = {
     };
     /** Routing config parsed from the repo's vercel.json (opaque passthrough). */
     routingConfig?: RoutingConfig | null;
+    /**
+     * Deploy-time readiness gate. Omitted/null = OFF (the default) — the deploy
+     * does no post-start waiting. Opaque passthrough to the project column.
+     */
+    readiness?: OpenshipReadiness | null;
   }) => api.post<any>(endpoints.projects.ensure, body),
 
   /** List local projects only */
   getLocal: () => api.get<{ success: boolean; projects: any[] }>(endpoints.projects.local),
 
   /** Scan a local directory for framework detection */
-  scan: (path: string) =>
-    api.post<ScanProjectResponse>(endpoints.projects.scan, { path }),
+  scan: (path: string) => api.post<ScanProjectResponse>(endpoints.projects.scan, { path }),
 
   /** Import a local folder as a project */
   importLocal: (data: {
@@ -175,16 +376,18 @@ export const projectsApi = {
   delete: (
     id: string | number,
     body: {
-      deleteApp?: boolean;
       wipeVolumes?: boolean;
       force?: boolean;
       forceOrphan?: boolean;
+      /** Record-only: drop the Openship row, keep the server workload (self-hosted). */
+      recordOnly?: boolean;
     } = {},
   ) => {
-    const { force, forceOrphan, ...rest } = body;
+    const { force, forceOrphan, recordOnly, ...rest } = body;
     const query = new URLSearchParams();
     if (force) query.set("force", "true");
     if (forceOrphan) query.set("forceOrphan", "true");
+    if (recordOnly) query.set("recordOnly", "true");
     const qs = query.toString();
     const path = qs ? `${endpoints.projects.item(id)}?${qs}` : endpoints.projects.item(id);
     // Teardown destroys containers/images/volumes over SSH (round-trips + per-
@@ -216,9 +419,26 @@ export const projectsApi = {
       };
     }>(`${endpoints.projects.item(id)}/deletion-preview`),
 
-  /** Update name or description — pass any subset of TUpdateProjectBody fields. */
+  /** Retention edits include artifact cleanup on the project's host. */
   update: (id: string | number, fields: Record<string, unknown>) =>
-    api.patch<any>(endpoints.projects.item(id), fields),
+    api.patch<any>(endpoints.projects.item(id), fields,
+      fields.rollbackWindow !== undefined ? { timeout: 120_000 } : undefined),
+
+  /**
+   * Read-only edge health for the project's server: is OpenResty already the
+   * edge on 80/443 (`ready`/`classification === "ours"`), or does it need setup?
+   * `reachable:false` = the box didn't answer a fast connect probe (offline).
+   */
+  getEdgeStatus: (id: string | number) =>
+    api.get<{
+      ready: boolean;
+      reachable?: boolean | null;
+      classification?: "free" | "ours" | "known" | "unknown";
+      canProceedClean?: boolean;
+      managed?: "cloud";
+      reason?: string;
+      occupants?: Array<{ port: number; proxy: string | null; label: string | null }>;
+    }>(endpoints.projects.edgeStatus(id)),
 
   /**
    * Get the per-project clone-token state. Returns only `{ hasToken, setAt }`
@@ -235,11 +455,7 @@ export const projectsApi = {
    *   - token: string     → encrypt + store
    */
   updateCloneToken: (id: string | number, body: { token: string | null }) =>
-    api.patch<{ hasToken: boolean; setAt: string | null }>(
-      endpoints.projects.cloneToken(id),
-      body,
-    ),
-
+    api.patch<{ hasToken: boolean; setAt: string | null }>(endpoints.projects.cloneToken(id), body),
 
   /**
    * Update build + runtime options (any subset). Also the atomic config-save
@@ -249,19 +465,43 @@ export const projectsApi = {
   setOptions: (id: string | number, options: ProjectOptionsBody) =>
     api.post<any>(endpoints.projects.options(id), options),
 
-  /** Commit-drift status for the "project outdated" banner: branch HEAD vs the
-   *  active deployment's commit. */
+  /** Object storage: the bucket bound to this project's filesystem config, plus
+   *  the installed apps and providers it could be bound to. */
+  getObjectStorage: (id: string | number) =>
+    api.get<{ data: ObjectStorageView }>(endpoints.projects.storage(id)),
+
+  /** Bind a bucket — an installed MinIO app (`sourceProjectId`) or an external
+   *  provider. Verified server-side before any env is written. */
+  bindObjectStorage: (id: string | number, body: BindObjectStorageBody) =>
+    api.post<{ data: { binding: ObjectStorageBinding; requiresRedeploy: true } }>(
+      endpoints.projects.storage(id),
+      body,
+    ),
+
+  /** Remove the binding and the env vars it injected. */
+  unbindObjectStorage: (id: string | number) =>
+    api.delete<{ data: { removed: boolean } }>(endpoints.projects.storage(id)),
+
+  /** Source-drift status for the "project outdated" banner. `mode` discriminates:
+   *  "commit" (git HEAD vs deployed sha) or "release" (newest advertised version
+   *  vs the deployed release version). */
   getCommitStatus: (id: string | number) =>
     api.get<{
       data: {
         supported: boolean;
+        mode?: "commit" | "release";
         behind?: boolean;
-        /** True when the latest commit is already building/deploying. */
+        /** True when the latest commit/version is already building/deploying. */
         latestInProgress?: boolean;
+        /* commit mode */
         branch?: string;
         latestSha?: string | null;
         latestMessage?: string | null;
         deployedSha?: string | null;
+        /* release mode */
+        latestVersion?: string | null;
+        currentVersion?: string | null;
+        pinned?: boolean;
       };
     }>(`projects/${id}/commit-status`),
 
@@ -272,21 +512,79 @@ export const projectsApi = {
   /** Retry the free .opsh.io edge-route sync (no rebuild). ok:false + warning
    *  when it still can't sync; clears the routing warning on success. */
   retryRouting: (id: string | number) =>
-    api.post<{ ok: boolean; warning?: string; error?: string }>(endpoints.projects.retryRouting(id)),
+    api.post<{ ok: boolean; warning?: string; error?: string }>(
+      endpoints.projects.retryRouting(id),
+    ),
+
+  /**
+   * Everything waiting on a human for this project — a blocked deploy, a deploy
+   * held on a decision, a keep/reject, unsynced routing, unverified domains,
+   * broken certs, plus port advisories. Each item carries `resolveWith`: the
+   * concrete calls that resolve it.
+   *
+   * On-demand (not on the project read), same as getCommitStatus / checkPorts.
+   */
+  getPendingActions: (id: string | number) =>
+    api.get<{ data: { actions: PendingAction[] } }>(endpoints.projects.pendingActions(id)),
 
   /** Clear CDN / proxy cache */
   clearCache: (id: string | number) => api.post<any>(endpoints.projects.clearCache(id)),
 
-  /** Clear build artifacts */
-  clearBuild: (id: string | number) => api.post<any>(endpoints.projects.clearBuild(id)),
+  /** Clear unused Docker build cache on this project's host. The cache is host-wide. */
+  clearBuild: (id: string | number) =>
+    api.post<{
+      success: true;
+      hostScoped: true;
+      target: "local" | "server";
+      serverId: string | null;
+      cachesDeleted: number;
+      bytesReclaimed: number;
+    }>(endpoints.projects.clearBuild(id)),
+
+  /** Container incidents recorded by the health watch. `watching: false` means
+   *  the watch job is off — an empty list then proves nothing. */
+  listIncidents: (id: string | number) =>
+    api.get<{
+      open: ServiceIncidentRow[];
+      resolved: ServiceIncidentRow[];
+      historyDays: number;
+      serverUnreachable: ServiceIncidentRow | null;
+      watching: boolean;
+    }>(endpoints.projects.incidents(id)),
+
+  /**
+   * What the edge is ACTUALLY serving for this project's hostnames, next to what
+   * the project saved. Read-only; `reachable: false` when the box can't be read
+   * (which is not the same as "no drift"). Self-hosted only.
+   */
+  getEdgeConfig: (id: string | number) =>
+    api.get<EdgeConfigReport>(endpoints.projects.edgeConfig(id)),
+
+  /* ── Route rules (self-hosted edge: rate-limit / ban / allow-deny) ── */
+  listRouteRules: (id: string | number) =>
+    api.get<{ rules: RouteRuleRow[] }>(endpoints.projects.routeRules(id)),
+  createRouteRule: (id: string | number, body: RouteRuleInput) =>
+    api.post<{ rule: RouteRuleRow }>(endpoints.projects.routeRules(id), body),
+  updateRouteRule: (id: string | number, ruleId: string, body: RouteRuleInput) =>
+    api.patch<{ rule: RouteRuleRow }>(endpoints.projects.routeRule(id, ruleId), body),
+  deleteRouteRule: (id: string | number, ruleId: string) =>
+    api.delete<{ success: boolean }>(endpoints.projects.routeRule(id, ruleId)),
 
   /** Create a new deployment session */
   createDeploymentSession: (id: string | number) =>
     api.post<any>(endpoints.projects.deploymentSession(id)),
 
-  /** Connect a custom domain */
-  connectDomain: (id: string | number, body: { domain: string; includeWww: boolean }) =>
-    api.post<any>(endpoints.projects.connect(id), body),
+  /** Connect a custom domain. `externalIngress` = TLS/ingress handled upstream
+   *  (Cloudflare Tunnel / LB): no certbot, plain-HTTP route; Cloud requires an ownership TXT record. */
+  connectDomain: (
+    id: string | number,
+    body: {
+      domain: string;
+      includeWww: boolean;
+      externalIngress?: boolean;
+      sslChallenge?: "http-01" | "dns-01";
+    },
+  ) => api.post<any>(endpoints.projects.connect(id), body),
 
   /**
    * MERGE env vars (partial): upsert + delete only the named keys, leaving every
@@ -323,8 +621,17 @@ export const projectsApi = {
     body: { owner: string; repo: string; branch?: string; installationId?: number },
   ) => api.post<any>(endpoints.projects.gitLink(id), body),
 
+  /** Atomically transition a single-app project to a tracked prebuilt image. */
+  setReleaseImageSource: (id: string | number, source: ReleaseImageSource) =>
+    api.put<{ data: Record<string, unknown> & { releaseSource: ReleaseImageSource } }>(
+      endpoints.projects.releaseImageSource(id),
+      source,
+    ),
+
   /** List branches */
   getBranches: (id: string | number) => api.get<any>(endpoints.projects.branches(id)),
+  getBranchPage: (id: string | number, page: number) =>
+    api.get<BranchPageResponse>(endpoints.projects.branches(id), { params: { page } }),
 
   /** Set active branch */
   setBranch: (id: string | number, branch: string) =>
@@ -338,19 +645,42 @@ export const projectsApi = {
   setWebhookDomain: (id: string | number, domain: string | null) =>
     api.post<any>(endpoints.projects.webhookDomain(id), { domain }),
 
+  /** Read resources + the target machine's probed capacity (the ceiling for a
+   *  custom value) + whether this target requires an explicit limit (cloud). */
+  getResources: async (id: string | number): Promise<ProjectResourcesResponse> =>
+    normalizeProjectResourcesResponse(await api.get<unknown>(endpoints.projects.resources(id))),
+
+  /** Rollback retention: the configured window (explicit or instance default), the
+   *  measured per-release size, and the deploy host's free disk. Everything is
+   *  read from values measured at the last deploy plus a cached probe, so this
+   *  is cheap enough to call whenever the retention control is shown. */
+  getRollbackCapacity: (id: string | number, signal?: AbortSignal) =>
+    api.get<{ data: RollbackCapacityUI }>(endpoints.projects.rollbackCapacity(id), { signal }),
+
   /** Set resources (POST - tier-based) */
-  setResources: (id: string | number, resources: Record<string, any>) =>
-    api.post<any>(endpoints.projects.resources(id), resources),
+  setResources: async (
+    id: string | number,
+    resources: Record<string, unknown>,
+  ): Promise<ProjectResourcesResponse> =>
+    normalizeProjectResourcesResponse(
+      await api.post<unknown>(endpoints.projects.resources(id), resources),
+    ),
 
   /** Update resources (PATCH - raw values). Backend registers PATCH/POST for
    *  /:id/resources (both bound to ctrl.updateResources); there is no PUT. */
-  updateResources: (id: string | number, resources: Record<string, any>) =>
-    api.patch<any>(endpoints.projects.resources(id), resources),
+  updateResources: async (
+    id: string | number,
+    resources: Record<string, unknown>,
+  ): Promise<ProjectResourcesResponse> =>
+    normalizeProjectResourcesResponse(
+      await api.patch<unknown>(endpoints.projects.resources(id), resources),
+    ),
 
   /** Set sleep-mode */
   setSleepMode: (id: string | number, sleep_mode: string) =>
     api.post<any>(endpoints.projects.sleepMode(id), { sleep_mode }),
 
   /** List deployments for a project */
-  getDeployments: (id: string | number) => api.get<any>(endpoints.projects.deployments(id)),
+  getDeployments: (id: string | number, params?: DeploymentHistoryQuery, signal?: AbortSignal) =>
+    api.get<DeploymentPage>(endpoints.projects.deployments(id), { params: { ...params }, signal }),
 };

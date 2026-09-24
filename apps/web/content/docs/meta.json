@@ -1,19 +1,22 @@
 {
   "title": "Documentation",
-  "root": true,
   "pages": [
     "index",
-    "quickstart",
-    "---Getting Started---",
-    "installation",
-    "first-deployment",
+    "---Get started---",
+    "getting-started",
+    "---Build and operate---",
+    "guides",
+    "dashboard",
+    "---Developers---",
+    "api",
+    "cli",
+    "mcp",
+    "reference",
     "---Platform---",
     "architecture",
-    "compose-services",
     "security",
-    "---Reference---",
-    "cli",
-    "api",
-    "mcp"
-  ]
+    "---Help---",
+    "troubleshooting"
+  ],
+  "root": true
 }

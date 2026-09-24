@@ -28,6 +28,7 @@ import { Plus, X } from "lucide-react";
 import { ServerTerminal, type ServerTerminalHandle } from "./ServerTerminal";
 import { useTheme } from "@/components/theme-provider";
 import { useI18n, interpolate } from "@/components/i18n-provider";
+import { randomUUID } from "@/lib/random-uuid";
 
 interface ServerTerminalTabsProps {
   serverId: string;
@@ -54,11 +55,9 @@ interface ShellEntry {
 }
 
 function genId(): string {
-  // Crypto for collision-free IDs without pulling in a uuid dep.
-  return (
-    globalThis.crypto?.randomUUID?.() ??
-    `shell-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
-  );
+  // Crypto for collision-free IDs without pulling in a uuid dep. The secure
+  // context fallback lives in the shared helper.
+  return randomUUID();
 }
 
 const STORAGE_PREFIX = "openship.terminal.shells";
@@ -221,7 +220,7 @@ export function ServerTerminalTabs({
                   <span
                     className={
                       "size-1.5 rounded-full transition-colors " +
-                      (isActive ? "bg-emerald-500" : "bg-muted-foreground/40")
+                      (isActive ? "bg-success-solid" : "bg-muted-foreground/40")
                     }
                   />
                   {shell.label}

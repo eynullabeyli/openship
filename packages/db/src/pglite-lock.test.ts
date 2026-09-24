@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, utimesSync } from "node:fs";
 import { tmpdir, hostname } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -69,6 +69,22 @@ describe("acquirePgliteLock", () => {
     expect(JSON.parse(readFileSync(lk(dir), "utf8")).pid).toBe(process.pid);
   });
 
+  it.each(["", '{"pid":'])("does not steal a lock whose owner may still be publishing its record: %j", async text => {
+    const dir = freshDir();
+    writeFileSync(lk(dir), text);
+    await expect(acquirePgliteLock(dir, { waitMs: 0, takeover: false })).rejects.toThrow("initialization in progress");
+    expect(readFileSync(lk(dir), "utf8")).toBe(text);
+  });
+
+  it("reclaims a stale incomplete record left by a writer that crashed", async () => {
+    const dir = freshDir();
+    writeFileSync(lk(dir), '{"pid":');
+    const stale = new Date(Date.now() - 11_000);
+    utimesSync(lk(dir), stale, stale);
+    await acquirePgliteLock(dir, { waitMs: 0, takeover: false });
+    expect(JSON.parse(readFileSync(lk(dir), "utf8")).pid).toBe(process.pid);
+  });
+
   it("refuses a dir held by a live process after the bounded wait", async () => {
     const dir = freshDir();
     // Our own pid stands in for a live sibling instance.
@@ -85,14 +101,34 @@ describe("acquirePgliteLock", () => {
     expect(JSON.parse(readFileSync(lk(dir), "utf8")).pid).toBe(process.pid);
   });
 
-  it("refuses a lock owned by another host without deleting it", async () => {
+  it("refuses a lock owned by another machine without deleting it", async () => {
     const dir = freshDir();
+    // A genuinely different machine is identified by machineId, not hostname.
     writeFileSync(
       lk(dir),
-      JSON.stringify({ pid: 4242, startedAt: Date.now(), host: "some-other-host" }),
+      JSON.stringify({
+        pid: 4242,
+        startedAt: Date.now(),
+        host: "some-other-host",
+        machineId: "a-different-machine-uuid",
+      }),
     );
 
-    await expect(acquirePgliteLock(dir, { waitMs: 50 })).rejects.toThrow(/different host/);
+    await expect(acquirePgliteLock(dir, { waitMs: 50 })).rejects.toThrow(/different machine/);
     expect(existsSync(lk(dir))).toBe(true);
+  });
+
+  it("reclaims a pre-fix lock (no machineId, dead pid) despite hostname drift", async () => {
+    // Regression: os.hostname() drifts on macOS (e.g. bluemac.local → bluemac),
+    // so a same-machine lock written by an older build (no machineId, a stale
+    // hostname) must be reclaimed via pid liveness — NOT rejected as a different
+    // host and left wedging the data dir shut.
+    const dir = freshDir();
+    const pid = await deadPid();
+    writeFileSync(lk(dir), JSON.stringify({ pid, startedAt: 0, host: "some-drifted-hostname" }));
+
+    await acquirePgliteLock(dir, { waitMs: 200 });
+
+    expect(JSON.parse(readFileSync(lk(dir), "utf8")).pid).toBe(process.pid);
   });
 });

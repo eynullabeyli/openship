@@ -17,13 +17,14 @@ export interface PreflightResult {
     ssh: { ok: boolean; detail: string };
     releaseDist: { ok: boolean; detail: string };
     domain: { ok: boolean; detail: string };
+    deployment?: { ok: boolean; detail: string };
   };
 }
 
 export interface StartServerResult {
   ok: true;
   projectId: string;
-  appId: string;
+  groupId: string;
   migrationTargetUrl: string;
 }
 

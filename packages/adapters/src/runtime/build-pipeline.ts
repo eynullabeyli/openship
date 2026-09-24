@@ -12,7 +12,25 @@
  */
 
 import type { BuildConfig, BuildStep, LogEntry, LogCallback } from "../types";
-import { safeErrorMessage } from "@repo/core";
+import { safeErrorMessage, packageManagerEnsureCommand, nodeBinPathExport } from "@repo/core";
+import {
+  sq,
+  injectGitToken,
+  assembleGitClone,
+  gitShellCommand,
+  GIT_SUBMODULE_UPDATE_ARGS,
+} from "./git-clone";
+import { materializeGitSsh, shellGitSshWriter, type GitSshMaterial } from "./git-ssh-material";
+
+// Re-exported for the docker adapters that import these from here.
+export {
+  sq,
+  injectGitToken,
+  gitCredentialPair,
+  toGitHubSshUrl,
+  assembleGitClone,
+  gitShellCommand,
+} from "./git-clone";
 
 // ─── BuildLogger - single source of truth for step + log events ─────────────
 
@@ -25,7 +43,15 @@ import { safeErrorMessage } from "@repo/core";
  * instead of constructing raw LogEntry objects.
  */
 export class BuildLogger {
-  constructor(private readonly onLog?: LogCallback) {}
+  constructor(
+    private readonly onLog?: LogCallback,
+    private readonly onBuildOutput?: (data: string, streamId: string) => void,
+  ) {}
+
+  /** Observe command output before rendering, without emitting another log entry. */
+  observeBuildOutput(data: string, streamId = "default"): void {
+    this.onBuildOutput?.(data, streamId);
+  }
 
   /** Emit a plain log line. */
   log(
@@ -110,12 +136,74 @@ export interface BuildEnvironment {
    * Must reject/throw on non-zero exit code.
    */
   exec(command: string, onLog: LogCallback): Promise<void>;
+
+  /**
+   * Write a SECRET file (0600) to the build host WITHOUT its bytes appearing in
+   * the streamed log — used for the SSH private key + known_hosts in ssh clone
+   * mode. Runtimes that can't do this safely (no out-of-band write) omit it;
+   * the clone step then refuses SSH auth with an actionable error rather than
+   * risk leaking the key through `exec`.
+   */
+  writeSecretFile?(path: string, content: string): Promise<void>;
 }
 
 // ─── Pipeline ────────────────────────────────────────────────────────────────
 
+/**
+ * Thrown by a `BuildEnvironment.exec`/`preflight` when the build was cancelled
+ * (its AbortController fired). Lets `runBuildPipeline` report `status:"cancelled"`
+ * instead of a generic `"failed"`, so the caller routes to onCancelled and the
+ * terminal deployment status sticks as "cancelled".
+ */
+export class BuildCancelledError extends Error {
+  constructor(message = "Build cancelled") {
+    super(message);
+    this.name = "BuildCancelledError";
+  }
+}
+
+/**
+ * Kill every process whose CWD is (under) a build's private directory — SIGTERM,
+ * then SIGKILL the survivors.
+ *
+ * Aborting a build only gates our own API BETWEEN commands: the in-flight remote
+ * command (git / npm / `docker build`) keeps running on the target until someone
+ * signals it. Killing it also closes the streamExec channel, so the build unwinds
+ * to a cancelled result instead of finishing work nobody wants.
+ *
+ * The ` (deleted)` patterns are load-bearing. A cancelled build's own `finally`
+ * fires `rm -rf <contextDir>` the moment it unwinds, and Linux then reports the
+ * process's cwd link as "<dir> (deleted)" — which the bare patterns miss, leaving
+ * exactly the orphaned build this sweep exists to kill.
+ *
+ * `includeSuffixed` also matches `<dir>-*`: a compose deploy builds one image per
+ * service under `<buildSessionId>-<serviceId>`, while cancel only knows the parent
+ * session id.
+ *
+ * Best-effort: a no-op for local builds and non-Linux targets (nothing runs under
+ * this dir there) and when the command has already exited.
+ */
+export async function killProcessesUnderDir(
+  executor: { exec(command: string): Promise<string> },
+  dir: string,
+  opts?: { includeSuffixed?: boolean },
+): Promise<void> {
+  const quoted = sq(dir);
+  const roots = opts?.includeSuffixed ? [quoted, `${quoted}-*`] : [quoted];
+  const patterns = roots.flatMap((root) => [
+    root,
+    `${root}/*`,
+    `${root}" (deleted)"`,
+    `${root}/*" (deleted)"`,
+  ]);
+  const scan = (sig: string) =>
+    `for p in /proc/[0-9]*; do c=$(readlink "$p/cwd" 2>/dev/null); ` +
+    `case "$c" in ${patterns.join("|")}) kill -${sig} "\${p##*/}" 2>/dev/null || true;; esac; done`;
+  await executor.exec(`${scan("TERM")}; sleep 2; ${scan("KILL")}`).catch(() => {});
+}
+
 export interface BuildPipelineResult {
-  status: "deploying" | "failed";
+  status: "deploying" | "failed" | "cancelled";
   /** Which step failed (undefined if success) */
   failedStep?: BuildStep;
   durationMs: number;
@@ -198,43 +286,83 @@ export async function runBuildPipeline(
           //   GIT_ASKPASS=/bin/echo — backstop so a missing credential fails
           //     fast (token mode only; the relay supplies creds via the helper).
           //   --progress — keep the log stream alive on non-tty build pipes.
-          const useHelper = !!config.gitCredentialHelperPath;
-          const cloneUrl = useHelper
-            ? config.repoUrl
-            : injectGitToken(config.repoUrl, config.gitToken);
-          const GIT_ENV = useHelper
-            ? `GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0=${sq(config.gitCredentialHelperPath!)} GIT_CONFIG_KEY_1=credential.useHttpPath GIT_CONFIG_VALUE_1=true`
-            : "GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/echo";
-          // Disable host credential helpers in token mode; in relay mode the
-          // helper is exactly what we want, so leave it enabled.
-          const CRED = useHelper ? "" : "-c credential.helper=";
-          if (config.commitSha) {
-            // Depth 50 strikes a balance: deep enough to reach the
-            // commit for the vast majority of rollbacks, but still
-            // far cheaper than a full history fetch. Older rollback
-            // targets fall through to the unshallow fallback below.
-            try {
-              await exec(
-                `${GIT_ENV} git ${CRED} clone --progress --depth 50 --branch ${sq(config.branch)} ${sq(cloneUrl)} ${sq(env.projectDir)} && cd ${sq(env.projectDir)} && git ${CRED} -c advice.detachedHead=false checkout ${sq(config.commitSha)}`,
-              );
-            } catch (initialErr) {
-              // Fallback: SHA not in the shallow window (rollback
-              // targets more than 50 commits old). Unshallow the
-              // clone and retry the checkout. We rethrow the
-              // original error if the unshallow itself fails so the
-              // user sees the most actionable message.
-              logger.log(
-                `Checkout of ${config.commitSha} failed inside the depth-50 clone; running git fetch --unshallow and retrying.`,
-                "warn",
-              );
-              await exec(
-                `cd ${sq(env.projectDir)} && ${GIT_ENV} git ${CRED} fetch --progress --unshallow && git ${CRED} -c advice.detachedHead=false checkout ${sq(config.commitSha)}`,
+          // SSH mode (per-server key / deploy key): write the 0600 key +
+          // known_hosts OUT OF BAND (via writeSecretFile, never through `exec`,
+          // so the key bytes never reach the log) and clone over git@github.com.
+          // Requires a runtime that can write a secret file; otherwise refuse
+          // rather than risk leaking the key.
+          let sshMaterial: GitSshMaterial | undefined;
+          if (config.gitSsh) {
+            const writeSecretFile = env.writeSecretFile;
+            if (!writeSecretFile) {
+              throw new Error(
+                "SSH-based GitHub auth isn't supported on this build runtime — use a token or the tunnel relay.",
               );
             }
-          } else {
-            await exec(
-              `${GIT_ENV} git ${CRED} clone --progress --depth 1 --branch ${sq(config.branch)} ${sq(cloneUrl)} ${sq(env.projectDir)}`,
+            sshMaterial = await materializeGitSsh(
+              shellGitSshWriter({ exec, writeSecret: writeSecretFile }),
+              `${env.projectDir}.gitssh`,
+              config.gitSsh,
             );
+          }
+
+          // Centralized clone assembly (token / relay / ssh / ambient) — see git-clone.ts.
+          const gitInvocation = assembleGitClone({
+            repoUrl: config.repoUrl,
+            gitToken: config.gitToken,
+            gitCredentialHelperPath: config.gitCredentialHelperPath,
+            ssh: sshMaterial,
+            ambient: config.gitAmbient,
+          });
+          const { cloneUrl, credFlag: CRED } = gitInvocation;
+
+          try {
+            if (config.commitSha) {
+              // Depth 50 strikes a balance: deep enough to reach the
+              // commit for the vast majority of rollbacks, but still
+              // far cheaper than a full history fetch. Older rollback
+              // targets fall through to the unshallow fallback below.
+              await exec(
+                gitShellCommand(
+                  gitInvocation,
+                  `clone --progress --depth 50 --branch ${sq(config.branch)} ${sq(cloneUrl)} ${sq(env.projectDir)}`,
+                ),
+              );
+              const commitPresent = await exec(
+                `cd ${sq(env.projectDir)} && git ${CRED} cat-file -e ${sq(`${config.commitSha}^{commit}`)}`,
+              ).then(
+                () => true,
+                () => false,
+              );
+              if (!commitPresent) {
+                logger.log(
+                  `Commit ${config.commitSha} is not in the depth-50 clone; fetching full history before checkout.`,
+                  "warn",
+                );
+                await exec(
+                  `cd ${sq(env.projectDir)} && ${gitShellCommand(gitInvocation, "fetch --progress --unshallow")}`,
+                );
+              }
+              await exec(
+                `cd ${sq(env.projectDir)} && ${gitShellCommand(
+                  gitInvocation,
+                  `-c advice.detachedHead=false checkout ${sq(config.commitSha)}`,
+                )}`,
+              );
+            } else {
+              await exec(
+                gitShellCommand(
+                  gitInvocation,
+                  `clone --progress --depth 1 --branch ${sq(config.branch)} ${sq(cloneUrl)} ${sq(env.projectDir)}`,
+                ),
+              );
+            }
+            await exec(
+              `cd ${sq(env.projectDir)} && ${gitShellCommand(gitInvocation, GIT_SUBMODULE_UPDATE_ARGS.join(" "))}`,
+            );
+          } finally {
+            // Always remove the ephemeral SSH key material, success or fail.
+            await sshMaterial?.cleanup();
           }
         },
       );
@@ -250,15 +378,12 @@ export async function runBuildPipeline(
 
     // Put the project's locally-installed CLIs on PATH so a build/install command
     // that invokes a dependency binary directly — e.g. a vercel.json
-    // `buildCommand: "vite build"`, or `tsc` / `next` / `astro` — resolves it,
-    // mirroring how Vercel / Netlify / npm-scripts prepend `node_modules/.bin`.
+    // `buildCommand: "vite build"`, or `tsc` / `next` / `astro` — resolves it.
     // Both the build dir and the repo root are added (monorepos hoist deps up).
-    // Scoped to JS package managers: Go/Rust/Python/etc. have no `node_modules`,
-    // so the prefix would only add non-existent dirs to PATH.
-    const JS_PACKAGE_MANAGERS = new Set(["npm", "yarn", "pnpm", "bun"]);
-    const binPathExport = JS_PACKAGE_MANAGERS.has(config.packageManager)
-      ? `export PATH=${sq(`${buildDir}/node_modules/.bin`)}:${sq(`${env.projectDir}/node_modules/.bin`)}:"$PATH"`
-      : "";
+    // Shared with the Dockerfile generator, which needs the same PATH for the
+    // same reason — deriving it twice is how the two surfaces drifted apart and
+    // left the docker build strategy failing at exit 127 (openship#623).
+    const binPathExport = nodeBinPathExport(config.packageManager, [buildDir, env.projectDir]);
 
     const inDir = (cmd: string) => {
       const full = `cd ${sq(buildDir)} && ${cmd}`;
@@ -266,14 +391,24 @@ export async function runBuildPipeline(
       return prefix ? `${prefix} && ${full}` : full;
     };
 
+    // Ensure the detected package manager is on PATH before the first pnpm/yarn
+    // invocation (corepack for pnpm/yarn; no-op for npm/bun/non-node) — fixes
+    // "pnpm: not found". `corepack enable` persists the shim to disk, so once
+    // install has run the build step inherits it; only prepend it to build when
+    // install was skipped (build-command-only config).
+    const pmEnsure = packageManagerEnsureCommand(config.packageManager);
+
     // ── Step 2: Install ────────────────────────────────────────────
     currentStep = "install";
     if (config.installCommand) {
+      const installCmd = pmEnsure
+        ? `${pmEnsure} && ${config.installCommand}`
+        : config.installCommand;
       await logger.runStep(
         "install",
         `Installing dependencies (${config.packageManager})`,
         async () => {
-          await exec(inDir(config.installCommand));
+          await exec(inDir(installCmd));
         },
       );
     } else {
@@ -283,8 +418,12 @@ export async function runBuildPipeline(
     // ── Step 3: Build ──────────────────────────────────────────────
     if (config.buildCommand) {
       currentStep = "build";
+      const buildCmd =
+        pmEnsure && !config.installCommand
+          ? `${pmEnsure} && ${config.buildCommand}`
+          : config.buildCommand;
       await logger.runStep("build", `Building (${config.buildCommand})`, async () => {
-        await exec(inDir(config.buildCommand!));
+        await exec(inDir(buildCmd));
       });
     } else {
       logger.step("build", "skipped", "No build command configured");
@@ -295,6 +434,11 @@ export async function runBuildPipeline(
     return { status: "deploying", durationMs };
   } catch (err) {
     const durationMs = Date.now() - startTime;
+    // A cancel is not a failure — report it distinctly so the caller marks the
+    // deployment "cancelled" (not "failed") and doesn't roll it into onFailure.
+    if (err instanceof BuildCancelledError) {
+      return { status: "cancelled", durationMs, errorMessage: err.message };
+    }
     const errorMessage = safeErrorMessage(err);
 
     return { status: "failed", failedStep: currentStep, durationMs, errorMessage };
@@ -311,9 +455,6 @@ function resolveBuildDirectory(projectDir: string, rootDirectory?: string): stri
 }
 
 /** Shell-quote a value for use in `sh -c` commands. */
-export function sq(value: string): string {
-  return `'${value.replace(/'/g, "'\\''")}'`;
-}
 /** Detect log level from a raw log line. Shared across all runtimes. */
 export function parseLogLevel(message: string): LogEntry["level"] {
   if (/\b(error|fatal|panic)\b/i.test(message)) return "error";
@@ -336,33 +477,15 @@ export function parseLogLevel(message: string): LogEntry["level"] {
 export function detectBuildKillHint(output: string): string | null {
   if (!output) return null;
   const tail = output.slice(-4096);
-  if (/\bsigkill\b|\bKilled\b|out of memory|JavaScript heap out of memory|Allocation failed/i.test(tail)) {
+  if (
+    /\bsigkill\b|\bKilled\b|out of memory|JavaScript heap out of memory|Allocation failed/i.test(
+      tail,
+    )
+  ) {
     return (
       "Build process was killed - typically because the target ran out of memory during the build. " +
       "Increase RAM on the target, add swap, or build locally and ship the dist."
     );
   }
   return null;
-}
-
-/**
- * Inject a token into an HTTPS git URL for private repo access.
- *
- * Converts `https://github.com/owner/repo.git`
- * into    `https://x-access-token:<token>@github.com/owner/repo.git`
- *
- * Returns the original URL unchanged if no token is provided or
- * the URL is not HTTPS (e.g. ssh://).
- */
-export function injectGitToken(repoUrl: string, token?: string): string {
-  if (!token) return repoUrl;
-  try {
-    const url = new URL(repoUrl);
-    if (url.protocol !== "https:") return repoUrl;
-    url.username = "x-access-token";
-    url.password = token;
-    return url.toString();
-  } catch {
-    return repoUrl;
-  }
 }

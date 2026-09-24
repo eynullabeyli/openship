@@ -1,6 +1,11 @@
 import type { Oblien, WorkspaceHandle } from "oblien";
 
-import { DEFAULT_RESOURCE_CONFIG, type LogCallback, type ResourceConfig } from "../../types";
+import {
+  DEFAULT_RESOURCE_CONFIG,
+  cloudCpus,
+  type LogCallback,
+  type ResourceConfig,
+} from "../../types";
 import type { WorkspaceRuntimePlan } from "../../dockerfile";
 import { sq, type BuildLogger } from "../build-pipeline";
 import { SYSTEM, safeErrorMessage } from "@repo/core";
@@ -32,6 +37,7 @@ interface CloudComposeGroupState {
 
 interface CloudComposeSupportDeps {
   client: Oblien;
+  namespace?: string;
   builtArtifacts: Map<string, CloudBuiltArtifact>;
   workspace(workspaceId: string): WorkspaceHandle;
   provisionWorkspace(
@@ -73,13 +79,48 @@ function firstContainerPort(portSpecs: string[]): number | undefined {
   return undefined;
 }
 
-function restartPolicyForWorkload(policy?: string): "always" | "on-failure" | "never" {
-  if (policy === "no" || policy === "never") return "never";
-  if (policy === "on-failure") return "on-failure";
+export function restartPolicyForWorkload(policy?: string): "always" | "on-failure" | "never" {
+  const base = policy?.split(":")[0];
+  if (base === "no" || base === "never") return "never";
+  if (base === "on-failure") return "on-failure";
   return "always";
 }
 
-function exposeTarget(port: number, serviceName: string, slug?: string, domain: string = SYSTEM.DOMAINS.CLOUD_DOMAIN) {
+/**
+ * Resolve the cloud workload `cmd` (#332). Cloud sets the working dir via the
+ * workload's `working_dir`, so a compose `commandArgv` runs as argv VERBATIM
+ * (no `sh -c`, no `cd`) — the entrypoint+CMD fix. A legacy string command / a
+ * built-app start command keeps the `sh -c "cd … && <cmd>"` wrap. Returns
+ * undefined → the workspace image's default process runs:
+ *   - `commandArgv` non-empty → argv verbatim
+ *   - `commandArgv` == []      → undefined (clear the compose CMD → image default)
+ *   - `commandArgv` == null    → sh -c wrap of `startCommand`, or undefined if none
+ */
+export function resolveCloudWorkloadCmd(opts: {
+  commandArgv?: string[] | null;
+  startCommand?: string;
+  workdir: string;
+  /**
+   * `export PATH=...` prelude from nodeBinPathExport, for a start command that
+   * names a dependency binary (`next start`). Applies ONLY to the string
+   * start-command branch: a compose service runs its own image's argv, where
+   * the image — not our buildpack — owns PATH. Empty string = nothing to add.
+   */
+  binPathExport?: string;
+}): string[] | undefined {
+  const { commandArgv, startCommand, workdir, binPathExport } = opts;
+  if (commandArgv != null) return commandArgv.length > 0 ? commandArgv : undefined;
+  if (!startCommand) return undefined;
+  const body = `cd ${sq(workdir)} && ${startCommand}`;
+  return ["sh", "-c", binPathExport ? `${binPathExport} && ${body}` : body];
+}
+
+function exposeTarget(
+  port: number,
+  serviceName: string,
+  slug?: string,
+  domain: string = SYSTEM.DOMAINS.CLOUD_DOMAIN,
+) {
   const service = `service "${serviceName}" on port ${port}`;
   return slug ? `${service} for slug "${slug}" (${slug}.${domain})` : service;
 }
@@ -130,11 +171,41 @@ export class CloudComposeSupport {
     return { id };
   }
 
+  /** Seed an already-running peer into the group WITHOUT deploying it, so the
+   *  next finalizeGroup rewrites the full mesh (/etc/hosts + private links)
+   *  including it. Used by the decoupled single-service add — only the new
+   *  service is deployed, but its peers must remain reachable by name. */
+  registerExistingWorkload(
+    group: MultiServiceGroupHandle,
+    service: { serviceName: string; workspaceId: string; ip?: string; portSpecs?: string[] },
+  ): void {
+    const groupState = this.groups.get(group.id);
+    if (!groupState) return;
+    // Never clobber a service that was actually (re)deployed this run.
+    if (groupState.services.has(service.serviceName)) return;
+    const ports = [
+      ...new Set(
+        (service.portSpecs ?? [])
+          .map((item) => firstContainerPort([item]))
+          .filter((item): item is number => typeof item === "number"),
+      ),
+    ];
+    groupState.services.set(service.serviceName, {
+      serviceName: service.serviceName,
+      workspaceId: service.workspaceId,
+      ip: service.ip,
+      ports,
+    });
+  }
+
   async deployServiceWorkload(
     group: MultiServiceGroupHandle,
     config: MultiServiceDeployConfig,
     onLog?: LogCallback,
   ): Promise<MultiServiceDeployResult> {
+    if (config.volumes?.length) {
+      throw new Error("Persistent volume mounts are not supported on Openship Cloud. Choose a server for this service.");
+    }
     const log = onLog ?? (() => {});
     const groupState = this.groups.get(group.id) ?? {
       id: group.id,
@@ -144,6 +215,19 @@ export class CloudComposeSupport {
 
     const builtArtifact = this.deps.builtArtifacts.get(config.image);
     let workspaceId: string | undefined;
+
+    // An image-backed cloud service normally reuses its existing workspace so
+    // its only durable disk survives. Reuse cannot refresh the workspace's base
+    // image, while replacing the workspace would silently discard that data.
+    // Fail closed instead of claiming a mutable-tag webhook redeploy succeeded
+    // with the old image. A source build is exempt because its newly-built
+    // workspace is present in builtArtifacts and becomes the replacement.
+    if (config.forcePull && config.previousWorkspaceId && !builtArtifact) {
+      throw new Error(
+        `Cannot refresh image "${config.image}" for cloud service "${config.serviceName}" ` +
+          "without replacing its persistent workspace. Use a self-hosted Docker target for forced image refreshes.",
+      );
+    }
 
     try {
       workspaceId =
@@ -172,6 +256,13 @@ export class CloudComposeSupport {
         config.publicPort ?? firstContainerPort(config.ports) ?? builtArtifact?.runtime.exposedPort;
       const workdir = builtArtifact?.runtime.workdir ?? "/";
       const startCommand = config.command ?? builtArtifact?.runtime.startCommand;
+      // #332: see resolveCloudWorkloadCmd — compose argv runs verbatim (cwd set
+      // via working_dir, no `sh -c`); legacy/built start commands keep the wrap.
+      const workloadCmd = resolveCloudWorkloadCmd({
+        commandArgv: config.commandArgv,
+        startCommand,
+        workdir,
+      });
 
       log({
         timestamp: now(),
@@ -179,7 +270,7 @@ export class CloudComposeSupport {
         level: "info",
       });
 
-      if (startCommand) {
+      if (workloadCmd) {
         log({
           timestamp: now(),
           message: `Creating workload for service "${config.serviceName}"...\n`,
@@ -193,7 +284,7 @@ export class CloudComposeSupport {
           ws.workloads.create({
             id: "app",
             name: "app",
-            cmd: ["sh", "-c", `cd ${sq(workdir)} && ${startCommand}`],
+            cmd: workloadCmd,
             working_dir: workdir,
             env: [...toEnvArray(runtimeEnv), ...(port ? [`PORT=${port}`] : [])],
             restart_policy: restartPolicyForWorkload(config.restart),
@@ -278,7 +369,7 @@ export class CloudComposeSupport {
         }
       }
 
-      const ip = await this.resolveWorkspaceIp(ws);
+      const ip = await this.resolveWorkspaceIpWithRetry(ws);
       const ports = [
         ...new Set([
           ...config.ports
@@ -338,7 +429,7 @@ export class CloudComposeSupport {
     config: MultiServiceDeployConfig,
     log: LogCallback,
   ): Promise<void> {
-    const cpus = config.resources?.cpuCores ?? DEFAULT_RESOURCE_CONFIG.cpuCores;
+    const cpus = cloudCpus(config.resources?.cpuCores ?? DEFAULT_RESOURCE_CONFIG.cpuCores);
     const memory_mb = config.resources?.memoryMb ?? DEFAULT_RESOURCE_CONFIG.memoryMb;
     try {
       await withCloudOperationTimeout(
@@ -361,11 +452,49 @@ export class CloudComposeSupport {
     config: MultiServiceDeployConfig,
     onLog: LogCallback,
   ): Promise<string> {
+    // Reuse the workspace from the previous deploy when it still exists — the
+    // permanent-workspace disk is the ONLY persistence Oblien offers (no volume
+    // primitive), so recreating it every deploy silently wipes a stateful
+    // service's data. Keeping the same workspace keeps its disk.
+    if (config.previousWorkspaceId) {
+      try {
+        const existing = this.deps.workspace(config.previousWorkspaceId);
+        await existing.get(); // 404s if it was reaped
+        onLog({
+          timestamp: now(),
+          message: `Reusing existing workspace ${config.previousWorkspaceId} for service "${config.serviceName}" (preserves its disk/data).\n`,
+          level: "info",
+        });
+        return config.previousWorkspaceId;
+      } catch (error) {
+        throw new Error(`Could not verify the existing workspace for "${config.serviceName}". Retry before replacing its data: ${errorMessage(error)}`);
+      }
+    }
+
+    // A declared volume means the service stores data — size the disk above the
+    // runtime-tier default so it isn't cramped. (Oblien has one disk per
+    // workspace; there is no separate volume to size.)
+    const diskMb = config.volumes.length
+      ? Math.max(DEFAULT_RESOURCE_CONFIG.diskMb, 20480)
+      : DEFAULT_RESOURCE_CONFIG.diskMb;
     const resources: ResourceConfig = {
       cpuCores: config.resources?.cpuCores ?? DEFAULT_RESOURCE_CONFIG.cpuCores,
       memoryMb: config.resources?.memoryMb ?? DEFAULT_RESOURCE_CONFIG.memoryMb,
-      diskMb: DEFAULT_RESOURCE_CONFIG.diskMb,
+      diskMb,
     };
+
+    // Shared volumes (mounted by more than one service) and host bind-mounts
+    // have no Oblien equivalent — a single named volume persists via this
+    // workspace's disk, but anything cross-workspace can't. Warn instead of
+    // silently pretending it worked.
+    const sharedOrBind = config.volumes.filter((v) => v.includes(":/") && v.startsWith("/"));
+    if (sharedOrBind.length) {
+      onLog({
+        timestamp: now(),
+        message: `Warning: bind-mount volumes are not supported on cloud and were ignored for "${config.serviceName}": ${sharedOrBind.join(", ")}\n`,
+        level: "warn",
+      });
+    }
 
     onLog({
       timestamp: now(),
@@ -376,11 +505,12 @@ export class CloudComposeSupport {
     let wsData: { id: string };
     try {
       wsData = await this.deps.client.workspaces.create({
+        ...(this.deps.namespace ? { namespace: this.deps.namespace } : {}),
         name: `${config.slug}-${config.serviceName}`.slice(0, 60),
         image: config.image,
         mode: "permanent",
         config: {
-          cpus: resources.cpuCores,
+          cpus: cloudCpus(resources.cpuCores),
           memory_mb: resources.memoryMb,
           disk_size_mb: resources.diskMb,
           env: toEnvArray(config.environment),
@@ -400,15 +530,47 @@ export class CloudComposeSupport {
   }
 
   private async resolveWorkspaceIp(ws: WorkspaceHandle): Promise<string | null> {
+    // Oblien's DOCUMENTED private IP — the address a peer uses over a private
+    // link — comes from apiAccess.rawToken(), NOT network.get().ip (which is the
+    // public/gateway IP, often unset) or ws.get().ip. Prefer it, then fall back.
+    try {
+      const raw = await ws.apiAccess.rawToken();
+      if (raw?.ip) return raw.ip;
+    } catch {
+      // Fall through — rawToken can 404 briefly right after create.
+    }
     try {
       const network = await ws.network.get();
       if (network.ip) return network.ip;
     } catch {
       // Fall through to workspace metadata.
     }
+    try {
+      const data = await ws.get();
+      return ((data as Record<string, unknown>).ip as string | undefined) ?? null;
+    } catch {
+      return null;
+    }
+  }
 
-    const data = await ws.get();
-    return ((data as Record<string, unknown>).ip as string | undefined) ?? null;
+  /**
+   * Oblien may assign the private IP a beat after the workspace starts. Poll
+   * (bounded) so a transient null never permanently drops a service from the
+   * mesh — the original bug was resolving once with no retry.
+   */
+  private async resolveWorkspaceIpWithRetry(
+    ws: WorkspaceHandle,
+    attempts = 10,
+    delayMs = 1000,
+  ): Promise<string | null> {
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      const ip = await this.resolveWorkspaceIp(ws);
+      if (ip) return ip;
+      if (attempt < attempts - 1) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+    return null;
   }
 
   private async syncServiceDiscovery(
@@ -429,22 +591,24 @@ export class CloudComposeSupport {
       const privateLinks = workspaceIds.filter(
         (workspaceId) => workspaceId !== service.workspaceId,
       );
-      if (privateLinks.length > 0) {
-        const currentNetwork = await ws.network.get().catch(() => null);
-        const currentIngress = Array.isArray(
-          (currentNetwork as Record<string, unknown> | null)?.ingress_ports,
-        )
-          ? ((currentNetwork as Record<string, unknown>).ingress_ports as number[])
-          : [];
-        // Oblien's firewall drops traffic unless BOTH a source rule (the private
-        // link) AND a port rule (ingress_ports) match — a link alone does not open
-        // any port. So a peer's `http://<name>:<port>` resolves via /etc/hosts but
-        // is dropped unless this service's own listen port is opened here. Merge
-        // the service ports with whatever is already open (public expose, etc.).
-        const ingressPorts = [...new Set([...currentIngress, ...service.ports])];
+      // Open this service's own listen ports ALWAYS (even before it has peers) —
+      // Oblien's firewall drops traffic unless BOTH a source rule (the private
+      // link) AND a port rule (ingress_ports) match. A peer resolves
+      // `http://<name>:<port>` via /etc/hosts but the packet is dropped unless
+      // this port is open here. Doing it unconditionally means a service that
+      // deployed before its peers isn't left with a closed port. Merge with
+      // whatever is already open (public expose, etc.).
+      const currentNetwork = await ws.network.get().catch(() => null);
+      const currentIngress = Array.isArray(
+        (currentNetwork as Record<string, unknown> | null)?.ingress_ports,
+      )
+        ? ((currentNetwork as Record<string, unknown>).ingress_ports as number[])
+        : [];
+      const ingressPorts = [...new Set([...currentIngress, ...service.ports])];
+      if (ingressPorts.length > 0 || privateLinks.length > 0) {
         await ws.network
           .update({
-            private_link_ids: privateLinks,
+            ...(privateLinks.length ? { private_link_ids: privateLinks } : {}),
             ...(ingressPorts.length ? { ingress_ports: ingressPorts } : {}),
           })
           .catch((err) => {
@@ -475,5 +639,41 @@ rm -f "$tmp"`;
         });
       }
     }
+  }
+
+  /**
+   * Final convergence pass — run ONCE after every service in the group has
+   * deployed. The per-service `syncServiceDiscovery` is incremental and only
+   * ever sees the IPs known at that moment; a service whose private IP hadn't
+   * been assigned during its own deploy would otherwise stay permanently absent
+   * from the mesh. This re-resolves any still-missing IP (bounded retry) and
+   * rewrites the FULL /etc/hosts + private links + ingress across the whole
+   * group, so the finished stack has every peer reachable by name.
+   *
+   * Note: we deliberately do NOT blanket-restart workloads here — that would
+   * take stateful services (Postgres, …) down needlessly, and standard clients
+   * resolve DNS per connection, so they read the completed /etc/hosts without a
+   * restart. (A boot-time-cache app is the rare exception.)
+   */
+  async finalizeGroup(groupId: string, onLog?: LogCallback): Promise<void> {
+    const log = onLog ?? (() => {});
+    const group = this.groups.get(groupId);
+    if (!group) return;
+
+    for (const service of group.services.values()) {
+      if (service.ip) continue;
+      const ip = await this.resolveWorkspaceIpWithRetry(this.deps.workspace(service.workspaceId));
+      if (ip) {
+        service.ip = ip;
+      } else {
+        log({
+          timestamp: now(),
+          message: `Warning: service "${service.serviceName}" never received a private IP — peers cannot reach it by name.\n`,
+          level: "warn",
+        });
+      }
+    }
+
+    await this.syncServiceDiscovery(group, log);
   }
 }

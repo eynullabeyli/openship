@@ -2,8 +2,16 @@ import { api } from "./client";
 import { endpoints } from "./endpoints";
 
 export type BuildMode = "auto" | "server" | "local";
-export type DefaultDeployTarget = "local" | "server" | "cloud";
+/**
+ * Mirrors the API's `DefaultDeployTarget` (settings.service.ts). No "local": a
+ * default is a BINDING, and "local" is the absence of one — derived per deploy, and
+ * on a server-host this box is already in the server list. A legacy stored value
+ * reads back as null.
+ */
+export type DefaultDeployTarget = "server" | "cloud";
 export type CloneStrategyPreference = "prompt" | "local" | "remote-with-token";
+/** How the edge reaches an app's upstream. See settings.service RouteStrategyPref. */
+export type RouteStrategy = "auto" | "loopback-port" | "container-ip";
 
 export interface CloneCredentialsState {
   /** True when the user has a global clone token saved. Token never echoed back. */
@@ -20,6 +28,13 @@ export interface UserSettingsResponse {
   defaultServerId: string | null;
   cloneToken: CloneCredentialsState;
   cloneStrategyPreference: CloneStrategyPreference;
+  routeStrategy: RouteStrategy;
+  /**
+   * Generic (per-operator) "forward my local git identity to remote build
+   * servers" preference. Replaces the old per-deploy forwardGitCredentials
+   * toggle. When on, a server clone may forward the local `gh` over SSH.
+   */
+  forwardGitToServer: boolean;
 }
 
 export interface DeployDefaultsResponse {
@@ -39,6 +54,10 @@ export const settingsApi = {
   updateBuildMode: (buildMode: BuildMode) =>
     api.patch<UserSettingsResponse>(endpoints.settings.buildMode, { buildMode }),
 
+  /** Update only the default edge→app route strategy */
+  updateRouteStrategy: (routeStrategy: RouteStrategy) =>
+    api.patch<{ routeStrategy: RouteStrategy }>(endpoints.settings.routeStrategy, { routeStrategy }),
+
   /**
    * Update (or clear) the default deploy target.
    * Pass `defaultDeployTarget: null` to clear. When target='server',
@@ -56,10 +75,10 @@ export const settingsApi = {
    *   - asDefault         → whether `resolveCloneToken` should use it
    */
   updateCloneCredentials: (data: { token?: string | null; asDefault?: boolean }) =>
-    api.patch<CloneCredentialsState & { cloneStrategyPreference: CloneStrategyPreference }>(
-      endpoints.settings.cloneCredentials,
-      data,
-    ),
+    api.patch<{
+      cloneToken: CloneCredentialsState;
+      cloneStrategyPreference: CloneStrategyPreference;
+    }>(endpoints.settings.cloneCredentials, data),
 
   /** Save the first-time-deploy nudge choice. */
   updateCloneStrategyPreference: (preference: CloneStrategyPreference) =>
@@ -67,4 +86,8 @@ export const settingsApi = {
       endpoints.settings.cloneStrategyPreference,
       { preference },
     ),
+
+  /** Flip the generic "forward my git identity to remote build servers" preference. */
+  updateForwardGitToServer: (enabled: boolean) =>
+    api.patch<{ forwardGitToServer: boolean }>(endpoints.settings.forwardGit, { enabled }),
 };

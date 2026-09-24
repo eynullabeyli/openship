@@ -1,18 +1,19 @@
 import React, { useState } from "react";
 import { Inbox, Layers, ArrowRight, Pencil, KeyRound, Cpu } from "lucide-react";
 import { useRouter } from "next/navigation";
+import { isServicesFramework } from "@repo/core";
 import { useProjectSettings } from "@/context/ProjectSettingsContext";
+import { workloadOf } from "@/context/deployment/types";
 import { useI18n, interpolate } from "@/components/i18n-provider";
 import { encodeLocalSlug, encodeRepoSlug } from "@/utils/repoSlug";
 import { EnvVarsEditor } from "./EnvVarsEditor";
+import { StorageSettings } from "./StorageSettings";
+import { ResourceSettings } from "./ResourceSettings";
 
 /**
- * Project → Runtime tab. READ-ONLY by design.
- *
- * Config (build/runtime/env) has a single edit owner: the deploy wizard. This
- * tab only DISPLAYS the project's current configuration and links to the wizard
- * (opened with ?projectId) for any change — so editing never lives in two
- * places and every change goes through the create-a-new-version flow.
+ * Project → Configuration. Build settings link to the deploy wizard; project
+ * environment, resources and storage use their existing focused editors.
+ * Shared project environment remains available for every workload type.
  *
  * Visual shell (SectionCard + ICON_TONES) mirrors the sibling settings tabs
  * (GitSettings / BackupSettings / DomainSettings) so the tab fills the same
@@ -21,10 +22,11 @@ import { EnvVarsEditor } from "./EnvVarsEditor";
 
 const ICON_TONES = {
   primary: "bg-primary/10 text-primary",
-  emerald: "bg-emerald-500/10 text-emerald-500",
+  emerald: "bg-success-bg text-success",
   orange: "bg-orange-500/10 text-orange-500",
-  amber: "bg-amber-500/10 text-amber-500",
-  red: "bg-red-500/10 text-red-500",
+  amber: "bg-warning-bg text-warning",
+  violet: "bg-violet-500/10 text-violet-500",
+  red: "bg-danger-bg text-danger",
   muted: "bg-muted/60 text-muted-foreground",
 } as const;
 
@@ -86,14 +88,18 @@ export const BuildSettings = () => {
   const { buildData, projectData, servicesData, id } = useProjectSettings();
   const { t } = useI18n();
   const router = useRouter();
-  const [envOpen, setEnvOpen] = useState(false);
 
   const isWebmail = projectData?.framework === "webmail";
-  const isCloud = projectData?.deployTarget === "cloud";
   const services = servicesData.services;
-  const hasServices = services.length > 0;
   const monorepoCount = services.filter((s) => s.kind === "monorepo").length;
   const composeCount = services.length - monorepoCount;
+  // SERVICE-FIRST = the project itself is a set of services (a compose-stack
+  // project) or a monorepo of sub-apps — its config genuinely lives per-service.
+  // A single/static APP that merely had a sidecar service ADDED is NOT
+  // service-first: it keeps its own primary-app Configuration below. Keyed on
+  // the project's framework, never on "a service row exists" (which conflates
+  // the two — the whole point of this fix).
+  const isServiceFirst = monorepoCount > 0 || isServicesFramework(projectData?.framework);
 
   // Edit = the deploy wizard, rehydrated from this project. The single place
   // config is editable; this tab never mutates it.
@@ -134,8 +140,10 @@ export const BuildSettings = () => {
     );
   }
 
-  // ── Service-based project: config lives per-service in the Services tab. ──
-  if (hasServices) {
+  // ── Service-first project: config lives per-service in the Services tab.
+  //    (A single/static app with an added sidecar service falls through to the
+  //    single-app config below — it is NOT service-first.) ──
+  if (isServiceFirst) {
     const subAppsLabel = interpolate(
       monorepoCount === 1 ? t.projectSettings.build.services.subAppOne : t.projectSettings.build.services.subAppOther,
       { count: String(monorepoCount) },
@@ -168,20 +176,28 @@ export const BuildSettings = () => {
             </button>
           }
         />
+        <ProjectEnvironmentSettings />
       </div>
     );
   }
 
   // ── Single-app: read-only configuration summary. ──────────────────────
-  const runtimeModeLabel =
-    projectData?.runtimeMode === "docker"
+  // A static site has no runtime process to isolate — the edge serves its files
+  // from the shared static volume. Its `runtimeMode` is still "docker" because it
+  // BUILT in a Docker sandbox, so reporting "Sandboxed (container)" here mislabels a
+  // build detail as a runtime one and contradicts the Start command row's "Static
+  // (no server)". Say plainly there is no runtime instead.
+  // A worker shares hasServer=false with a static site but DOES run a process
+  // (sandboxed like a web app), so classify via the resolved workload — only a
+  // static site has "no runtime" (#538).
+  const workload = workloadOf(buildData);
+  const runtimeModeLabel = workload === "static"
+    ? t.projectSettings.build.runtime.modeStatic
+    : projectData?.runtimeMode === "docker"
       ? t.projectSettings.build.runtime.modeSandboxed
       : projectData?.runtimeMode === "bare"
         ? t.projectSettings.build.runtime.modeDirect
         : t.projectSettings.build.runtime.modeDefault;
-
-  const cpuCores = projectData?.resources?.production?.cpuCores;
-  const memoryMb = projectData?.resources?.production?.memoryMb;
 
   return (
     <div className="space-y-5">
@@ -196,12 +212,9 @@ export const BuildSettings = () => {
           <Row label={t.projectSettings.build.runtime.framework} value={projectData?.framework} />
           <Row label={t.projectSettings.build.runtime.packageManager} value={projectData?.packageManager} />
           <Row label={t.projectSettings.build.runtime.runtimeIsolation} value={runtimeModeLabel} />
-          {isCloud && (
-            <Row
-              label={t.projectSettings.build.runtime.resources}
-              value={cpuCores || memoryMb ? interpolate(t.projectSettings.build.runtime.resourcesValue, { cpu: String(cpuCores ?? "?"), memory: String(memoryMb ?? "?") }) : undefined}
-            />
-          )}
+          {/* Resources moved to the editable ResourceSettings card below — one
+              source, and it covers self-hosted (where limits are now a real
+              choice) instead of being cloud-only and read-only. */}
           <Row label={t.projectSettings.build.runtime.runtimePort} value={buildData.productionPort} mono />
           <Row label={t.projectSettings.build.runtime.installCommand} value={buildData.installCommand} mono />
           <Row
@@ -211,19 +224,47 @@ export const BuildSettings = () => {
           />
           <Row label={t.projectSettings.build.runtime.outputDirectory} value={buildData.outputDirectory} mono />
           <Row label={t.projectSettings.build.runtime.rootDirectory} value={buildData.rootDirectory || "."} mono />
+          {/* Only when pinned — a blank row would be noise for the vast majority
+              of projects, whose compose file (if any) sits at the root. */}
+          {buildData.composePath && (
+            <Row label={t.projectSettings.build.runtime.composePath} value={buildData.composePath} mono />
+          )}
           <Row
             label={t.projectSettings.build.runtime.startCommand}
-            value={buildData.hasServer ? buildData.startCommand : t.projectSettings.build.runtime.staticNoServer}
-            mono={buildData.hasServer}
+            value={workload !== "static" ? buildData.startCommand : t.projectSettings.build.runtime.staticNoServer}
+            mono={workload !== "static"}
           />
         </div>
       </SectionCard>
 
+      {/* Machine power — cpu/memory caps. Editable in place, like Storage: you
+          reach for it BECAUSE a container just got OOM-killed, and routing that
+          through the full re-deploy wizard is the wrong shape. Only meaningful
+          for a project that actually runs a container. */}
+      {workload !== "static" && <ResourceSettings />}
+
+      {/* Storage — persistent paths + object storage. Editable in place (see the
+          component's own note on why it doesn't route through the wizard). Only
+          meaningful for a project with a running container. */}
+      {workload !== "static" && <StorageSettings />}
+
+      <ProjectEnvironmentSettings />
+    </div>
+  );
+};
+
+/** Shared project inputs remain editable for single apps, Compose and monorepos. */
+export function ProjectEnvironmentSettings() {
+  const { id } = useProjectSettings();
+  const { t } = useI18n();
+  const [envOpen, setEnvOpen] = useState(false);
+  return (
+    <>
       {/* Environment variables — edited in place via a safe per-variable editor
           (diff-merge; untouched secrets are never re-sent), NOT the wizard. */}
       <SectionCard
         icon={KeyRound}
-        iconTone="muted"
+        iconTone="violet"
         title={t.projectSettings.build.env.title}
         description={t.projectSettings.build.env.description}
         actions={
@@ -238,7 +279,7 @@ export const BuildSettings = () => {
         }
       />
 
-      <EnvVarsEditor projectId={id} isOpen={envOpen} onClose={() => setEnvOpen(false)} />
-    </div>
+      <EnvVarsEditor key={id} projectId={id} isOpen={envOpen} onClose={() => setEnvOpen(false)} />
+    </>
   );
-};
+}

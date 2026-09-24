@@ -16,17 +16,21 @@ import {
 } from "lucide-react";
 import type { Terminal } from "@xterm/xterm";
 import BuildTerminal from "./BuildTerminal";
+import { DeploymentConfigurationAction, DeploymentSuccessActions } from "./DeploymentActions";
+import { PortAdvisoryModal } from "./PortAdvisoryModal";
+import { PromptDetails } from "./PromptDetails";
+import { describeBuildStrategy } from "./deploy-target-label";
+import { DeployTargetValue } from "./DeployTargetValue";
 import { generateIcon } from "@/utils/icons";
 import { useRouter } from "next/navigation";
 import { encodeRepoSlug } from "@/utils/repoSlug";
 import { useDeployment } from "@/context/DeploymentContext";
-import { getPublicEndpointHosts } from "@/context/deployment/types";
+import { getPublicEndpointHosts, workloadOf } from "@/context/deployment/types";
 import { resolveBuildElapsedMs } from "@/context/deployment/types";
 import { usePlatform } from "@/context/PlatformContext";
 import { useTheme } from "@/components/theme-provider";
 import { useModal } from "@/context/ModalContext";
-import { useI18n, interpolate } from "@/components/i18n-provider";
-import type { Dictionary } from "@/i18n";
+import { useI18n } from "@/components/i18n-provider";
 
 interface DeploymentProcessingProps {
   // Resolves to the new deployment id (navigates on success) or null on failure.
@@ -40,33 +44,6 @@ function formatDurationMs(ms: number): string {
   const m = Math.floor(totalSec / 60);
   const s = totalSec % 60;
   return `${m}m ${s.toString().padStart(2, "0")}s`;
-}
-
-/** Human label for the build/deploy target shown in Deployment Details. */
-function describeBuildTarget(config: {
-  deployTarget: string;
-  serverName?: string;
-}, t: Dictionary): string {
-  const dp = t.importProject.deploymentProcessing;
-  if (config.deployTarget === "cloud") return dp.targetOpenshipCloud;
-  if (config.deployTarget === "server") {
-    return config.serverName ? interpolate(dp.targetServerNamed, { name: config.serverName }) : dp.targetServer;
-  }
-  if (config.deployTarget === "local") return dp.targetLocal;
-  return "—";
-}
-
-/** Where the build runs (vs where it deploys, shown by Instance). Concise so it
- *  fits the narrow info column without truncating. */
-function describeBuildStrategy(config: {
-  deployTarget: string;
-  buildStrategy: string;
-}, t: Dictionary): string {
-  const dp = t.importProject.deploymentProcessing;
-  if (config.buildStrategy === "local") return dp.strategyLocal;
-  if (config.deployTarget === "cloud") return dp.strategyCloud;
-  if (config.deployTarget === "server") return dp.strategyServer;
-  return dp.strategyHost;
 }
 
 /** One themed row in the Deployment Details list: colored icon chip + label + value. */
@@ -98,7 +75,6 @@ function DetailRow({
 
 const DeploymentProcessing: React.FC<DeploymentProcessingProps> = ({ onRedeploy }) => {
   const { config, state, terminalRef, onTerminalReady, stopDeployment, respondToPrompt, steps, deploymentStatus } = useDeployment();
-  const { baseDomain } = usePlatform();
   const { resolvedTheme } = useTheme();
   const { showModal, hideModal } = useModal();
   const { t } = useI18n();
@@ -109,33 +85,7 @@ const DeploymentProcessing: React.FC<DeploymentProcessingProps> = ({ onRedeploy 
   // and navigates to the new deployment (or re-enables on failure).
   const [isRedeploying, setIsRedeploying] = useState(false);
 
-  const renderPromptDetails = useCallback((details?: Record<string, unknown>) => {
-    if (!details) return null;
-
-    const rows: Array<{ label: string; value: string | null }> = [
-      { label: dp.promptDetails.port, value: details.port != null ? String(details.port) : null },
-      { label: dp.promptDetails.process, value: typeof details.command === "string" ? details.command : null },
-      { label: "PID", value: details.pid != null ? String(details.pid) : null },
-      { label: "Systemd Unit", value: typeof details.systemdUnit === "string" ? details.systemdUnit : null },
-      { label: dp.promptDetails.unitDescription, value: typeof details.systemdDescription === "string" ? details.systemdDescription : null },
-      { label: dp.promptDetails.openshipDeployment, value: typeof details.deploymentId === "string" ? details.deploymentId : null },
-    ].filter((row): row is { label: string; value: string } => Boolean(row.value));
-
-    if (rows.length === 0) return null;
-
-    return (
-      <div className="rounded-xl border border-border bg-muted/40 p-4 space-y-3">
-        {rows.map((row) => (
-          <div key={row.label} className="flex flex-col gap-1">
-            <span className="text-xs uppercase tracking-wide text-muted-foreground">{row.label}</span>
-            <span className="text-sm text-foreground break-all">{row.value}</span>
-          </div>
-        ))}
-      </div>
-    );
-  }, [dp]);
-
-  // ── Pipeline prompt modal (e.g. port conflict) ─────────────────────────
+  // ── Pipeline prompt modal (port conflict / edge takeover) ──────────────
   useEffect(() => {
     if (!state.pendingPrompt) return;
     const { promptId, title, message, actions, details } = state.pendingPrompt;
@@ -152,13 +102,13 @@ const DeploymentProcessing: React.FC<DeploymentProcessingProps> = ({ onRedeploy 
             <p className="text-sm leading-relaxed text-muted-foreground">{message}</p>
           </div>
 
-          {renderPromptDetails(details)}
+          <PromptDetails details={details} />
 
           <div className="flex items-center justify-end gap-3 pt-2">
             {actions.map((action) => {
               const variant = (action.variant || "secondary") as "secondary" | "danger" | "primary";
               const styles = variant === "danger"
-                ? "bg-red-600 text-white hover:bg-red-700"
+                ? "bg-danger-solid text-white hover:bg-danger-solid/90"
                 : variant === "primary"
                   ? "bg-primary text-primary-foreground hover:bg-primary/90"
                   : "border border-border bg-muted text-foreground hover:bg-muted/80";
@@ -183,12 +133,7 @@ const DeploymentProcessing: React.FC<DeploymentProcessingProps> = ({ onRedeploy 
       width: "560px",
       maxWidth: "92vw",
     });
-  }, [state.pendingPrompt, showModal, hideModal, respondToPrompt, renderPromptDetails]);
-
-  // Build domain for display
-  const endpointHosts = getPublicEndpointHosts(config.publicEndpoints, baseDomain, config.projectName);
-  const domain = endpointHosts[0] ?? "";
-  const extraEndpointCount = endpointHosts.length > 1 ? endpointHosts.length - 1 : 0;
+  }, [state.pendingPrompt, showModal, hideModal, respondToPrompt]);
 
   const handleTerminalReady = useCallback((terminal: Terminal) => {
     if (terminalRef) {
@@ -197,12 +142,6 @@ const DeploymentProcessing: React.FC<DeploymentProcessingProps> = ({ onRedeploy 
     onTerminalReady();
   }, [terminalRef, onTerminalReady]);
 
-  const handleViewDashboard = () => {
-    if (state.projectId) {
-      router.push(`/projects/${state.projectId}`);
-    }
-  };
-
   const hasWarning = deploymentStatus === "ready" && !!state.warningMessage;
 
   return (
@@ -210,9 +149,9 @@ const DeploymentProcessing: React.FC<DeploymentProcessingProps> = ({ onRedeploy 
       {/* Header */}
       <div className="bg-background">
         <div className="py-5 relative">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-4">
-              <div>
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex min-w-0 items-center gap-4">
+              <div className="min-w-0">
                 <h1 className="text-xl font-semibold text-foreground">
                   {deploymentStatus === "cancelled"
                     ? dp.title.cancelled
@@ -225,7 +164,7 @@ const DeploymentProcessing: React.FC<DeploymentProcessingProps> = ({ onRedeploy 
                         : dp.title.deploying}
                 </h1>
                 <div className="flex items-center gap-2 mb-1">
-                  <p className="text-sm text-muted-foreground mt-0.5">
+                  <p className="text-sm text-muted-foreground mt-0.5 break-all">
                     {config.owner}/{config.repo}
                   </p>
                 </div>
@@ -233,21 +172,7 @@ const DeploymentProcessing: React.FC<DeploymentProcessingProps> = ({ onRedeploy 
             </div>
 
             {deploymentStatus === "ready" && (
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={handleViewDashboard}
-                  className="flex items-center gap-2 text-foreground font-medium transition-all duration-300 bg-card rounded-xl px-4 py-2 text-sm border border-border hover:shadow-md"
-                >
-                  {dp.viewDashboard}
-                </button>
-                <button
-                  onClick={() => window.open(`https://${domain}`, "_blank")}
-                  className="flex items-center gap-2 text-primary-foreground font-medium transition-all duration-300 bg-primary rounded-xl px-4 py-2 text-sm hover:bg-primary/90 shadow-md hover:shadow-lg"
-                >
-                  {dp.visitSite}
-                  {generateIcon('External_link_HtLszLDBXqHilHK674zh2aKoSL7xUhyboAzP.png', 16, '#fff')}
-                </button>
-              </div>
+              <DeploymentConfigurationAction className="self-start sm:shrink-0" />
             )}
 
           </div>
@@ -259,14 +184,25 @@ const DeploymentProcessing: React.FC<DeploymentProcessingProps> = ({ onRedeploy 
           {/* Main Content */}
           <div className="lg:col-span-2 space-y-6">
             {hasWarning && (
-              <div className="rounded-2xl border border-amber-500/30 bg-amber-500/8 px-4 py-3">
-                <p className="text-sm font-medium text-amber-700 dark:text-amber-300">
+              <div className="rounded-2xl border border-warning-border bg-warning-bg px-4 py-3">
+                <p className="text-sm font-medium text-warning">
                   {dp.warningTitle}
                 </p>
-                <p className="mt-1 text-sm text-amber-700/80 dark:text-amber-300/80">
+                <p className="mt-1 text-sm text-warning/80">
                   {state.warningMessage}
                 </p>
               </div>
+            )}
+
+            {deploymentStatus === "ready" && (
+              <PortAdvisoryModal
+                deploymentId={state.deploymentId}
+                projectId={state.projectId ?? config.projectId}
+                checks={state.portCheck}
+                skipped={state.portCheckSkipped}
+                isCompose={false}
+                publicEndpoints={config.publicEndpoints}
+              />
             )}
 
             {/* Steps — progress tracker above the terminal. */}
@@ -293,7 +229,7 @@ const DeploymentProcessing: React.FC<DeploymentProcessingProps> = ({ onRedeploy 
                     return (
                       <div key={index} className="flex flex-col items-center gap-2.5 z-10">
                         <div
-                          style={{ boxShadow: "0 0 0 6px var(--th-card-bg-solid)" }}
+                          style={{ boxShadow: "0 0 0 6px var(--th-card-on-page)" }}
                           className={`rounded-full flex items-center justify-center w-10 h-10 transition-all duration-300 ${
                             hasFailed
                               ? "bg-destructive"
@@ -303,9 +239,12 @@ const DeploymentProcessing: React.FC<DeploymentProcessingProps> = ({ onRedeploy 
                                   ? "bg-foreground"
                                   : // Pending: SOLID fill (the `bg-muted` token is a
                                     // translucent surface tint, so the connector line
-                                    // showed through). Use the solid card color so the
-                                    // line is fully occluded under the circle.
-                                    "bg-[var(--th-card-bg-solid)] border border-border"
+                                    // showed through). --th-card-on-page is the OPAQUE
+                                    // composite of this card over the page, so the dot
+                                    // and its ring match the card exactly. NOT the modal
+                                    // token --th-card-bg-solid: that is darker than a
+                                    // real card in dark (#060606 vs #0d0d0d).
+                                    "bg-[var(--th-card-on-page)] border border-border"
                           }`}
                         >
                           {hasFailed ? (
@@ -340,7 +279,7 @@ const DeploymentProcessing: React.FC<DeploymentProcessingProps> = ({ onRedeploy 
                 <div className="flex items-center gap-2">
                   {generateIcon('terminal-58-1658431404.png', 24, 'currentColor')}
                   <h2 className="text-base font-normal text-foreground">
-                    {state.deploymentSuccess && config.options.hasServer ? dp.productionLogs : dp.buildTerminal}
+                    {state.deploymentSuccess && workloadOf(config.options) !== "static" ? dp.productionLogs : dp.buildTerminal}
                   </h2>
                 </div>
                 {deploymentStatus === "failed" && (
@@ -348,10 +287,10 @@ const DeploymentProcessing: React.FC<DeploymentProcessingProps> = ({ onRedeploy 
                 )}
               </div>
 
-              <div className="bg-white dark:bg-black border border-border/50 rounded-xl overflow-hidden h-[400px]">
+              <div className="bg-white dark:bg-black dim:bg-black border border-border/50 rounded-xl overflow-hidden h-[400px]">
                 <BuildTerminal
                   onReady={handleTerminalReady}
-                  theme={resolvedTheme}
+                  theme={resolvedTheme === "light" ? "light" : "dark"}
                 />
               </div>
             </div>
@@ -392,6 +331,14 @@ const DeploymentProcessing: React.FC<DeploymentProcessingProps> = ({ onRedeploy 
                     dp.stopDeployment
                   )}
                 </button>
+              ) : state.cancellationPending ? (
+                <button
+                  disabled
+                  className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl transition-all font-medium text-sm bg-muted text-muted-foreground cursor-not-allowed"
+                >
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  {dp.stopping}
+                </button>
               ) : (deploymentStatus === "failed" || deploymentStatus === "cancelled") ? (
                 <div className="space-y-2">
                   <button
@@ -420,12 +367,7 @@ const DeploymentProcessing: React.FC<DeploymentProcessingProps> = ({ onRedeploy 
                   )}
                 </div>
               ) : (deploymentStatus === "ready") ? (
-                <button
-                  onClick={handleViewDashboard}
-                  className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-primary text-primary-foreground rounded-xl transition-all font-medium text-sm hover:bg-primary/90"
-                >
-                  {dp.openDashboard}
-                </button>
+                <DeploymentSuccessActions />
               ) : null}
             </div>
 
@@ -460,7 +402,7 @@ const DeploymentDetails = memo(() => {
   const dp = t.importProject.deploymentProcessing;
   const router = useRouter();
   const hasWarning = deploymentStatus === "ready" && !!state.warningMessage;
-  const endpointHosts = getPublicEndpointHosts(config.publicEndpoints, baseDomain, config.projectName);
+  const endpointHosts = getPublicEndpointHosts(config.publicEndpoints, baseDomain);
   const domain = endpointHosts[0] ?? "";
   const extraEndpointCount = endpointHosts.length > 1 ? endpointHosts.length - 1 : 0;
 
@@ -491,7 +433,7 @@ const DeploymentDetails = memo(() => {
     deploymentStatus === "failed" || deploymentStatus === "cancelled"
       ? "text-destructive"
       : hasWarning
-        ? "text-amber-600 dark:text-amber-300"
+        ? "text-warning"
         : deploymentStatus === "ready"
           ? "text-primary"
           : "text-foreground";
@@ -499,7 +441,7 @@ const DeploymentDetails = memo(() => {
     deploymentStatus === "failed" || deploymentStatus === "cancelled"
       ? "bg-destructive/10"
       : hasWarning
-        ? "bg-amber-500/10"
+        ? "bg-warning-bg"
         : deploymentStatus === "ready"
           ? "bg-primary/10"
           : "bg-muted/60";
@@ -507,7 +449,7 @@ const DeploymentDetails = memo(() => {
     deploymentStatus === "failed" || deploymentStatus === "cancelled" ? (
       <XCircle className="size-4 text-destructive" />
     ) : hasWarning ? (
-      <CheckCircle2 className="size-4 text-amber-600 dark:text-amber-300" />
+      <CheckCircle2 className="size-4 text-warning" />
     ) : deploymentStatus === "ready" ? (
       <CheckCircle2 className="size-4 text-primary" />
     ) : (
@@ -540,7 +482,7 @@ const DeploymentDetails = memo(() => {
             <p className={`text-sm font-medium truncate ${statusColor}`}>{statusLabel}</p>
           </div>
         </div>
-        <DetailRow icon={InstanceIcon} label={dp.detailInstance} value={describeBuildTarget(config, t)} />
+        <DetailRow icon={InstanceIcon} label={dp.detailInstance} value={<DeployTargetValue config={config} />} />
         <DetailRow icon={Hammer} label={dp.detailBuild} value={describeBuildStrategy(config, t)} />
         <DetailRow icon={Clock} label={dp.detailBuildTime} value={<BuildTimeLabel />} />
         <DetailRow icon={Layers} label={dp.detailFramework} value={config.framework} />

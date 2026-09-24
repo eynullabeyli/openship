@@ -1,53 +1,72 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useState, useEffect, useCallback, useRef } from "react";
+import { BlurIp } from "@/components/BlurIp";
+import { useRouter, useSearchParams, usePathname } from "next/navigation";
 import {
   ArrowLeft,
-  CheckCircle2,
-  XCircle,
   Loader2,
   Settings2,
   Trash2,
   LayoutGrid,
   Blocks,
+  Boxes,
   Terminal,
   MoreHorizontal,
   Server,
+  ServerCrash,
   Globe,
   User,
   KeyRound,
   Shield,
   Network,
+  GitBranch,
 } from "lucide-react";
 import { ApiError, getApiErrorMessage, isAbortError, systemApi } from "@/lib/api";
 import { useToast } from "@/context/ToastContext";
 import { useModal } from "@/context/ModalContext";
 import { useI18n, interpolate } from "@/components/i18n-provider";
 import { PageContainer } from "@/components/ui/PageContainer";
+import { Tabs } from "@/components/ui/Tabs";
+import { ResourceNotFound } from "@/components/resource-not-found";
 import { useSetupStream } from "@/hooks/useSetupStream";
 import { useMonitorStream } from "@/hooks/useMonitorStream";
+import { useServerTunnels } from "@/hooks/useServerTunnels";
 import type { ServerInfo, ComponentStatus, SetupComponentProgress, SetupLogEvent } from "@/lib/api/system";
-import { ServerForm } from "../_components/server-form";
+import { PromptDetails } from "@/components/import-project/PromptDetails";
+import { ServerForm } from "@/components/servers/server-form";
 import { OverviewTab } from "./_components/overview-tab";
 import { ComponentsTab } from "./_components/components-tab";
+import { ServerModuleUpdates } from "./_components/module-updates";
+import { ServerContainerUpdates } from "./_components/container-updates";
 import { TerminalTab } from "./_components/terminal-tab";
 import {
   ConnectionBanner,
   classifyConnectionError,
+  readConnectionDiagnosis,
+  type ConnectionDiagnosis,
   type ConnectionErrorKind,
 } from "./_components/connection-banner";
 
 import { RateLimitSettings } from "./_components/rate-limit-settings";
+import { ExposedPortsCard } from "./_components/exposed-ports-card";
 import { PortForwardingCard } from "./_components/port-forwarding-card";
+import { ServerGitHubConnect } from "@/components/github/ServerGitHubConnect";
+import { MigrationsTab } from "@/components/migration/MigrationsTab";
+import { ServerConnectionCard } from "./_components/connection-card";
+import { ServerDeletionModal } from "./_components/ServerDeletionModal";
+import { serverRemovalSummary, type ServerRemovalResult, type ServerRemovalWorkloadResult } from "@/lib/server-removal";
 import { usePlatform } from "@/context/PlatformContext";
+import { ServerInfrastructure } from "@/components/servers/ServerInfrastructure";
 
-type Tab = "overview" | "components" | "security" | "ports" | "terminal";
+
+type Tab = "overview" | "migrations" | "components" | "github" | "security" | "ports" | "terminal";
 type ManualActionMode = "remove" | null;
 
 interface TabDef {
   key: Tab;
-  icon: React.ElementType;
+  /** Narrower than ElementType so these feed the shared <Tabs> directly. */
+  icon: React.ComponentType<{ className?: string }>;
   /** Desktop-only tabs are filtered out in non-desktop deployments. */
   desktopOnly?: boolean;
 }
@@ -56,7 +75,9 @@ interface TabDef {
 // its mail-install state at runtime. We don't repeat that UI here.
 const TABS: TabDef[] = [
   { key: "overview",   icon: LayoutGrid },
+  { key: "migrations", icon: Boxes },
   { key: "components", icon: Blocks },
+  { key: "github",     icon: GitBranch },
   { key: "security",   icon: Shield },
   // Port forwarding is meaningful only in desktop mode (the orchestrator IS
   // the user's machine); hidden elsewhere.
@@ -70,6 +91,7 @@ export default function ServerDetailPage({
   params: Promise<{ serverId: string }>;
 }) {
   const router = useRouter();
+  const pathname = usePathname();
   const searchParams = useSearchParams();
   const editing = searchParams.get("edit") === "true";
   const { showToast } = useToast();
@@ -80,14 +102,55 @@ export default function ServerDetailPage({
   const { deployMode } = usePlatform();
   const isDesktop = deployMode === "desktop";
   const [serverId, setServerId] = useState<string>("");
+  // Single source of truth for saved port-forwards: drives the "Ports" tab
+  // count badge (live even when the card is unmounted) AND the card's list.
+  // No-ops off desktop, where the feature is gated away.
+  const {
+    tunnels,
+    loading: tunnelsLoading,
+    refresh: refreshTunnels,
+  } = useServerTunnels(isDesktop ? serverId : null);
   const [server, setServer] = useState<ServerInfo | null>(null);
   const [components, setComponents] = useState<ComponentStatus[]>([]);
   const [loading, setLoading] = useState(true);
   const [checking, setChecking] = useState(false);
   const [checkError, setCheckError] = useState<string | null>(null);
   const [checkErrorKind, setCheckErrorKind] = useState<ConnectionErrorKind | null>(null);
+  /** Endpoint + remedy the API attached to the failure (host-channel case). */
+  const [checkDiagnosis, setCheckDiagnosis] = useState<ConnectionDiagnosis | undefined>(undefined);
   const [installLogs, setInstallLogs] = useState<SetupLogEvent[]>([]);
   const [activeTab, setActiveTab] = useState<Tab>("overview");
+  // Deep-link support: honour ?tab= once on mount (e.g. ?tab=github to land
+  // straight on the GitHub connect tab).
+  const tabParamApplied = useRef(false);
+  useEffect(() => {
+    if (tabParamApplied.current) return;
+    tabParamApplied.current = true;
+    const tab = searchParams.get("tab");
+    if (tab && TABS.some((td) => td.key === tab)) setActiveTab(tab as Tab);
+  }, [searchParams]);
+  // Switch tab AND persist it in the URL (?tab=), so a reload / "service restart"
+  // reopens the same tab. Shallow replace (no scroll) preserves other params.
+  const changeTab = useCallback(
+    (key: Tab) => {
+      setActiveTab(key);
+      const params = new URLSearchParams(Array.from(searchParams.entries()));
+      params.set("tab", key);
+      router.replace(`${pathname}?${params.toString()}`, { scroll: false });
+    },
+    [searchParams, router, pathname],
+  );
+  // Real URL for each tab (`?tab=`, other params preserved) so the tabs are
+  // proper links — cmd/ctrl/middle-click opens the tab in a new browser tab,
+  // and the link is copyable. Plain clicks still switch client-side via changeTab.
+  const tabHref = useCallback(
+    (key: Tab) => {
+      const params = new URLSearchParams(Array.from(searchParams.entries()));
+      params.set("tab", key);
+      return `${pathname}?${params.toString()}`;
+    },
+    [searchParams, pathname],
+  );
   const [showMenu, setShowMenu] = useState(false);
   const [isRemoving, setIsRemoving] = useState(false);
   const [activeActionComponent, setActiveActionComponent] = useState<string | null>(null);
@@ -124,6 +187,61 @@ export default function ServerDetailPage({
 
   const monitor = useMonitorStream(serverId || null, activeTab === "overview");
 
+  // Mid-install prompt (e.g. OpenResty edge takeover) — the SAME generic prompt
+  // modal the deploy pipeline uses. Surfaced only when an install hits a
+  // port-80/443 conflict; answering it resumes the install.
+  const promptModalRef = useRef<string | null>(null);
+  const pendingPrompt = setupStream.pendingPrompt;
+  const respondToPrompt = setupStream.respondToPrompt;
+  useEffect(() => {
+    if (!pendingPrompt) {
+      promptModalRef.current = null;
+      return;
+    }
+    if (promptModalRef.current === pendingPrompt.promptId) return;
+    promptModalRef.current = pendingPrompt.promptId;
+
+    const modalId = showModal({
+      title: pendingPrompt.title,
+      icon: "warning",
+      width: "100%",
+      maxWidth: "34rem",
+      customContent: (
+        <div className="p-6 space-y-5">
+          <div className="space-y-2">
+            <h3 className="text-lg font-semibold text-foreground">{pendingPrompt.title}</h3>
+            <p className="text-sm leading-relaxed text-muted-foreground">{pendingPrompt.message}</p>
+          </div>
+          <PromptDetails details={pendingPrompt.details} />
+          <div className="flex items-center justify-end gap-3 pt-2">
+            {pendingPrompt.actions.map((action) => {
+              const variant = (action.variant || "secondary") as "secondary" | "danger" | "primary";
+              const styles =
+                variant === "danger"
+                  ? "bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                  : variant === "primary"
+                    ? "bg-primary text-primary-foreground hover:bg-primary/90"
+                    : "border border-border bg-muted text-foreground hover:bg-muted/80";
+              return (
+                <button
+                  key={action.id}
+                  type="button"
+                  className={`rounded-lg px-4 py-2 text-sm font-medium transition-colors ${styles}`}
+                  onClick={() => {
+                    hideModal(modalId);
+                    void respondToPrompt(action.id);
+                  }}
+                >
+                  {action.label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      ),
+    });
+  }, [pendingPrompt, respondToPrompt, showModal, hideModal]);
+
   useEffect(() => {
     params.then((p) => setServerId(p.serverId));
   }, [params]);
@@ -146,6 +264,7 @@ export default function ServerDetailPage({
     setChecking(true);
     setCheckError(null);
     setCheckErrorKind(null);
+    setCheckDiagnosis(undefined);
     try {
       const result = await systemApi.checkServer(serverId);
       setComponents(result.components);
@@ -156,6 +275,7 @@ export default function ServerDetailPage({
       setComponents([]);
       setCheckError(message);
       setCheckErrorKind(kind);
+      setCheckDiagnosis(readConnectionDiagnosis(body));
       // The inline banner is the primary surface - only toast for unexpected
       // shapes so the user isn't getting both a toast and a banner for the
       // same problem.
@@ -200,7 +320,7 @@ export default function ServerDetailPage({
     }
   }, [components, serverId, showToast, setupStream, t]);
 
-  const runComponentAction = useCallback(async (component: ComponentStatus) => {
+  const startComponentAction = useCallback(async (component: ComponentStatus) => {
     if (!serverId) {
       showToast(t.servers.detail.toastServerMissing, "error", t.servers.toastTitles.serverSetup);
       return;
@@ -216,7 +336,15 @@ export default function ServerDetailPage({
     setActiveTab("components");
 
     try {
-      await setupStream.startInstall(serverId, [component.name]);
+      // This button reads "Reinstall"/"Update" on an installed component, so it
+      // means it: installers that skip an already-working component (Docker, #491)
+      // need the explicit opt-in to run at all. Install-missing and the setup flow
+      // never send it, which is the point — they get the skip.
+      await setupStream.startInstall(
+        serverId,
+        [component.name],
+        component.installed ? { reinstall: true } : undefined,
+      );
     } catch (err) {
       const message = getApiErrorMessage(err, interpolate(t.servers.detail.toastFailedRun, { label: component.label }));
       setCheckError(message);
@@ -224,11 +352,44 @@ export default function ServerDetailPage({
     }
   }, [serverId, setupStream, showToast, t]);
 
+  const runComponentAction = useCallback(async (component: ComponentStatus) => {
+    // Reinstalling Docker restarts the daemon, which restarts every container on
+    // the box — Openship's own stack included. That used to happen as an invisible
+    // side effect of steps that merely needed Docker present (#491); now it happens
+    // only here, and only after the operator is told what it costs.
+    if (component.name === "docker" && component.installed) {
+      const modalId = showModal({
+        title: t.servers.detail.reinstallDockerTitle,
+        message: t.servers.detail.reinstallDockerMessage,
+        icon: "warning",
+        width: "100%",
+        maxWidth: "32rem",
+        buttons: [
+          {
+            label: t.servers.detail.cancel,
+            variant: "secondary",
+            onClick: () => hideModal(modalId),
+          },
+          {
+            label: t.servers.components.reinstall,
+            variant: "danger",
+            onClick: () => {
+              hideModal(modalId);
+              void startComponentAction(component);
+            },
+          },
+        ],
+      });
+      return;
+    }
+    await startComponentAction(component);
+  }, [hideModal, showModal, startComponentAction, t]);
+
   const removeComponentAction = useCallback((component: ComponentStatus) => {
     const modalId = showModal({
       title: interpolate(t.servers.detail.removeComponentTitle, { label: component.label }),
       message:
-        component.name === "openresty"
+        component.name === "edge"
           ? t.servers.detail.removeOpenrestyMessage
           : interpolate(t.servers.detail.removeComponentMessage, { label: component.label }),
       icon: "warning",
@@ -360,38 +521,71 @@ export default function ServerDetailPage({
     })();
   }, [serverId, fetchData, runHealthCheck]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Removal is its own modal, not a one-line confirm: the row being deleted is the
+  // deploy target of every project on the box, so the operator has to see the list and
+  // choose what happens to those workloads. `showModal` can't render either.
+  const [removeOpen, setRemoveOpen] = useState(false);
+  const [removeBusy, setRemoveBusy] = useState(false);
+  const [removeFailures, setRemoveFailures] = useState<ServerRemovalWorkloadResult[] | null>(null);
+
   const handleDelete = useCallback(() => {
-    const modalId = showModal({
-      title: t.servers.detail.removeServer,
-      message: t.servers.detail.removeServerMessage,
-      icon: "warning",
-      buttons: [
-        {
-          label: t.servers.detail.cancel,
-          variant: "secondary",
-          onClick: () => hideModal(modalId),
-        },
-        {
-          label: t.servers.detail.remove,
-          variant: "danger",
-          onClick: async () => {
-            try {
-              await systemApi.deleteServerEntry(serverId);
-              hideModal(modalId);
-              showToast(t.servers.detail.toastServerRemoved, "success", t.servers.toastTitles.server);
-              router.push("/servers");
-            } catch (err) {
-              showToast(
-                getApiErrorMessage(err, t.servers.detail.toastFailedRemoveServer),
-                "error",
-                t.servers.toastTitles.server,
-              );
-            }
-          },
-        },
-      ],
-    });
-  }, [serverId, router, showToast, showModal, hideModal, t]);
+    setRemoveFailures(null);
+    setRemoveOpen(true);
+  }, []);
+
+  const handleRemoveConfirm = useCallback(
+    async (destroyOnSource: boolean, workloadCount: number) => {
+      setRemoveBusy(true);
+      try {
+        const res = await systemApi.deleteServerEntry(serverId, { destroyOnSource, workloadCount });
+        // Every message below is derived from the RESPONSE. Reporting the flag we sent
+        // is how a delete once claimed a cascade the server never performed.
+        const summary = serverRemovalSummary(res);
+        if (summary.kind === "partial") {
+          setRemoveFailures(summary.failed);
+          showToast(
+            res.error ?? t.servers.detail.toastFailedRemoveServer,
+            "error",
+            t.servers.toastTitles.server,
+          );
+          return;
+        }
+        setRemoveOpen(false);
+        showToast(
+          summary.count === 0
+            ? t.servers.detail.toastServerRemoved
+            : interpolate(
+                summary.destroyed
+                  ? summary.count === 1
+                    ? t.servers.detail.removal.toastRemovedDestroyedOne
+                    : t.servers.detail.removal.toastRemovedDestroyedOther
+                  : summary.count === 1
+                    ? t.servers.detail.removal.toastRemovedKeptOne
+                    : t.servers.detail.removal.toastRemovedKeptOther,
+                { count: String(summary.count) },
+              ),
+          "success",
+          t.servers.toastTitles.server,
+        );
+        router.push("/servers");
+      } catch (err) {
+        // A 409 carries the per-workload reasons; render them in the modal so the
+        // retry is aimed rather than blind.
+        const body = err instanceof ApiError ? (err.body as ServerRemovalResult | undefined) : undefined;
+        if (body?.workloads?.length) {
+          setRemoveFailures(body.workloads.filter((w) => !w.ok || (w.orphaned ?? 0) > 0));
+        }
+        showToast(
+          getApiErrorMessage(err, t.servers.detail.toastFailedRemoveServer),
+          "error",
+          t.servers.toastTitles.server,
+        );
+      } finally {
+        setRemoveBusy(false);
+      }
+    },
+    [serverId, router, showToast, t],
+  );
 
   if (loading) {
     return (
@@ -404,20 +598,22 @@ export default function ServerDetailPage({
   if (!server) {
     return (
       <PageContainer>
-          <div className="flex items-center gap-3 mb-6">
-            <button
-              onClick={() => router.push("/servers")}
-              className="w-8 h-8 rounded-lg hover:bg-muted flex items-center justify-center transition-colors"
-            >
-              <ArrowLeft className="size-4 text-muted-foreground rtl:rotate-180" />
-            </button>
-            <h1 className="text-2xl font-medium text-foreground/80">
-              {t.servers.detail.serverNotFound}
-            </h1>
-          </div>
-          <p className="text-sm text-muted-foreground">
-            {interpolate(t.servers.detail.noServerConfigured, { id: serverId })}
-          </p>
+        <div className="flex min-h-[60vh] items-center justify-center p-6">
+          <ResourceNotFound
+            icon={<ServerCrash className="size-7" />}
+            title={t.servers.detail.serverNotFound}
+            description={t.servers.detail.serverNotFoundDesc}
+            detail={serverId}
+            detailCopyLabel={t.chrome.notFound.copyId}
+            actions={[
+              {
+                label: t.servers.setup.goToServers,
+                icon: <ArrowLeft className="size-4 rtl:rotate-180" />,
+                onClick: () => router.push("/servers"),
+              },
+            ]}
+          />
+        </div>
       </PageContainer>
     );
   }
@@ -482,35 +678,40 @@ export default function ServerDetailPage({
     <PageContainer>
         {/* Header */}
         <div className="flex items-center gap-3 mb-6">
+          {/* `app-nav-fallback` hides this in the desktop app, where the titlebar
+              already carries back/forward. It stays on web/SaaS, which has no
+              titlebar and would otherwise leave no way out of this page. */}
           <button
             onClick={() => router.push("/servers")}
-            className="w-8 h-8 rounded-lg hover:bg-muted flex items-center justify-center transition-colors"
+            className="app-nav-fallback w-8 h-8 rounded-lg hover:bg-muted flex items-center justify-center transition-colors"
+            aria-label={t.servers.setup.goToServers}
           >
             <ArrowLeft className="size-4 text-muted-foreground rtl:rotate-180" />
           </button>
           <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-2">
-              <h1
-                className="text-2xl font-medium text-foreground/80 truncate"
-                style={{ letterSpacing: "-0.2px" }}
-              >
-                {server.name || server.sshHost}
-              </h1>
+            <h1
+              className="text-2xl font-medium text-foreground/80 truncate"
+              style={{ letterSpacing: "-0.2px" }}
+            >
+              {server.name || <BlurIp>{server.sshHost}</BlurIp>}
+            </h1>
+            {/* Connection line: user@host + a clean status pill (no loud dot).
+                The country flag lives on the connection card's Host row — beside
+                the value it describes — and the SSH port lives there too. */}
+            <div className="mt-1 flex items-center gap-2">
+              <p className="text-sm text-muted-foreground/70 font-mono">
+                {server.sshUser ?? "root"}@<BlurIp>{server.sshHost}</BlurIp>
+              </p>
               {allHealthy ? (
-                <div className="shrink-0 inline-flex items-center gap-1 px-2 py-0.5 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 text-xs font-medium rounded-full">
-                  <CheckCircle2 className="size-3" />
+                <span className="shrink-0 inline-flex items-center rounded-full bg-success/10 px-2 py-0.5 text-[11px] font-medium text-success">
                   {t.servers.detail.healthy}
-                </div>
+                </span>
               ) : components.length > 0 ? (
-                <div className="shrink-0 inline-flex items-center gap-1 px-2 py-0.5 bg-orange-500/10 text-orange-600 dark:text-orange-400 text-xs font-medium rounded-full">
-                  <XCircle className="size-3" />
+                <span className="shrink-0 inline-flex items-center rounded-full bg-warning/10 px-2 py-0.5 text-[11px] font-medium text-warning">
                   {t.servers.detail.issues}
-                </div>
+                </span>
               ) : null}
             </div>
-            <p className="text-sm text-muted-foreground/70 mt-1 font-mono">
-              {server.sshUser ?? "root"}@{server.sshHost}:{server.sshPort ?? 22}
-            </p>
           </div>
           <div className="flex items-center gap-1.5">
             <button
@@ -539,7 +740,7 @@ export default function ServerDetailPage({
                         setShowMenu(false);
                         handleDelete();
                       }}
-                      className="w-full flex items-center gap-2 px-3 py-2 text-sm text-red-600 dark:text-red-400 hover:bg-red-500/5 transition-colors"
+                      className="w-full flex items-center gap-2 px-3 py-2 text-sm text-danger hover:bg-danger-bg transition-colors"
                     >
                       <Trash2 className="size-3.5" />
                       {t.servers.detail.removeServer}
@@ -563,33 +764,34 @@ export default function ServerDetailPage({
             message={checkError}
             retrying={checking}
             onRetry={runHealthCheck}
+            diagnosis={checkDiagnosis}
           />
         )}
 
-        {/* Main Grid */}
-        <div className="grid grid-cols-1 lg:grid-cols-[1fr_340px] gap-6">
+        {/* Tabs — the SHARED <Tabs> component, the same one the servers LIST uses,
+            so the two pages can't drift apart in size/spacing (this bar used to be
+            a hand-rolled copy of it). `href` keeps the tabs deep-linkable and
+            cmd-clickable; a plain click still switches client-side. */}
+        <Tabs
+          className="mb-6"
+          value={activeTab}
+          onChange={(key) => changeTab(key)}
+          tabs={TABS.map(({ key, icon, desktopOnly }) => ({
+            key,
+            label: t.servers.detail.tabs[key],
+            icon,
+            href: tabHref(key),
+            hidden: desktopOnly && !isDesktop,
+            // Show how many forwards (running + stopped) are saved on this server.
+            count: key === "ports" && isDesktop ? tunnels.length : undefined,
+          }))}
+        />
+
+        {/* Main Grid — the Migrations tab spans full width (its flow renders its
+            own right column: connection card → migrate config / live progress). */}
+        <div className={`grid grid-cols-1 gap-6 items-start ${activeTab === "migrations" ? "" : "lg:grid-cols-[1fr_340px]"}`}>
           {/* Left column */}
           <div className="min-w-0">
-            {/* Tabs */}
-            <div className="flex items-center gap-1 mb-6 border-b border-border/50">
-              {TABS.filter((tab) => !tab.desktopOnly || isDesktop).map(({ key, icon: Icon }) => (
-                <button
-                  key={key}
-                  onClick={() => setActiveTab(key)}
-                  className={`inline-flex items-center gap-2 px-4 py-2.5 text-sm font-medium transition-colors relative ${
-                    activeTab === key
-                      ? "text-foreground"
-                      : "text-muted-foreground hover:text-foreground/70"
-                  }`}
-                >
-                  <Icon className="size-4" />
-                  {t.servers.detail.tabs[key]}
-                  {activeTab === key && (
-                    <span className="absolute bottom-0 start-0 end-0 h-0.5 bg-primary rounded-full" />
-                  )}
-                </button>
-              ))}
-            </div>
 
             {/* Tab content */}
             {activeTab === "overview" && (
@@ -604,6 +806,9 @@ export default function ServerDetailPage({
             )}
 
             {activeTab === "components" && (
+              <>
+              {serverId && <ServerContainerUpdates serverId={serverId} />}
+              {serverId && <ServerModuleUpdates serverId={serverId} />}
               <ComponentsTab
                 components={components}
                 checking={checking}
@@ -627,16 +832,27 @@ export default function ServerDetailPage({
                   setManualActionFinalStatus(null);
                 }}
               />
+              </>
+            )}
+
+            {activeTab === "github" && serverId && (
+              <ServerGitHubConnect serverId={serverId} variant="card" />
             )}
 
             {activeTab === "security" && (
-              <RateLimitSettings serverId={serverId} />
+              <div className="space-y-6">
+                <ExposedPortsCard serverId={serverId} />
+                <RateLimitSettings serverId={serverId} />
+              </div>
             )}
 
             {activeTab === "ports" && isDesktop && serverId && (
-              <div className="max-w-2xl">
-                <PortForwardingCard serverId={serverId} />
-              </div>
+              <PortForwardingCard
+                serverId={serverId}
+                tunnels={tunnels}
+                loading={tunnelsLoading}
+                refresh={refreshTunnels}
+              />
             )}
 
             {activeTab === "terminal" && (
@@ -646,60 +862,39 @@ export default function ServerDetailPage({
                 enabled={activeTab === "terminal"}
               />
             )}
+
+            {/* Migrations — durable run list (rows like a project's deployments)
+                that opens each run's steps + logs IN-PAGE, plus the scan-first
+                migrate flow (both are the reused ServerMigrationWizard). Kept
+                MOUNTED (visibility-toggled) so a scan/flow survives tab switches. */}
+            {serverId && (
+              <div className={activeTab === "migrations" ? "" : "hidden"}>
+                <MigrationsTab serverId={serverId} server={server} />
+              </div>
+            )}
           </div>
 
-          {/* Right sidebar - offset to align with tab content below tab bar */}
-          <div className="lg:pt-[65px] space-y-4 lg:sticky lg:top-6 lg:self-start">
-            {/* Server details */}
-            <div className="bg-card rounded-2xl border border-border/50 p-5">
-              <div className="flex items-center gap-2 mb-4">
-                <Server className="size-4 text-muted-foreground" />
-                <h3 className="font-semibold text-foreground text-sm">
-                  {t.servers.detail.connection}
-                </h3>
-              </div>
-              <div className="space-y-3">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <div className="w-8 h-8 rounded-lg bg-muted/60 flex items-center justify-center">
-                      <Globe className="size-4 text-muted-foreground" />
-                    </div>
-                    <span className="text-sm text-muted-foreground">{t.servers.detail.host}</span>
-                  </div>
-                  <span className="text-sm font-medium text-foreground font-mono truncate ms-3 max-w-[140px]">
-                    {server.sshHost}
-                  </span>
-                </div>
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <div className="w-8 h-8 rounded-lg bg-muted/60 flex items-center justify-center">
-                      <User className="size-4 text-muted-foreground" />
-                    </div>
-                    <span className="text-sm text-muted-foreground">{t.servers.detail.user}</span>
-                  </div>
-                  <span className="text-sm font-medium text-foreground font-mono">
-                    {server.sshUser ?? "root"}
-                  </span>
-                </div>
-
-                <div className="h-px bg-border/60 my-2" />
-
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <div className="w-8 h-8 rounded-lg bg-muted/60 flex items-center justify-center">
-                      <KeyRound className="size-4 text-muted-foreground" />
-                    </div>
-                    <span className="text-sm text-muted-foreground">{t.servers.detail.auth}</span>
-                  </div>
-                  <span className="text-sm font-medium text-foreground">
-                    {server.sshAuthMethod === "key" ? t.servers.detail.authSshKey : t.servers.detail.authPassword}
-                  </span>
-                </div>
-              </div>
+          {/* Right sidebar — connection summary. Hidden on the Migrations tab,
+              whose flow renders its own right column. */}
+          {activeTab !== "migrations" && (
+            <div className="space-y-4 lg:sticky lg:top-6 lg:self-start">
+              <ServerConnectionCard server={server} />
+              <ServerInfrastructure serverId={serverId} />
             </div>
-
-          </div>
+          )}
         </div>
+
+        {/* Removal confirm. The only removal entry point in the app — the fleet list
+            has no delete action. */}
+        <ServerDeletionModal
+          isOpen={removeOpen}
+          onClose={() => setRemoveOpen(false)}
+          onConfirm={handleRemoveConfirm}
+          serverId={serverId}
+          serverName={server?.name ?? ""}
+          failures={removeFailures}
+          busy={removeBusy}
+        />
     </PageContainer>
   );
 }

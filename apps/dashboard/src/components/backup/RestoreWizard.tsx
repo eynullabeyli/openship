@@ -23,6 +23,7 @@ export function RestoreWizard({ sourceRun, serviceName, onClose }: Props): React
   const [typed, setTyped] = useState("");
   const [backupFirst, setBackupFirst] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [cancelRequested, setCancelRequested] = useState(false);
 
   const { restore } = useRestoreRunStream(restoreId);
 
@@ -89,14 +90,22 @@ export function RestoreWizard({ sourceRun, serviceName, onClose }: Props): React
       return;
     }
     setBusy(true);
+    // A cancel during apply is a REQUEST the running phase honors at its next
+    // checkpoint, so the wizard stays open to report which of the two outcomes
+    // landed — clean, or "the target holds partial data". Closing here would
+    // hide exactly the fact the operator needs.
+    let keepOpen = false;
     try {
-      await backupsApi.cancelRestore(restoreId);
-    } catch {
-      // tolerated
+      const res = await backupsApi.cancelRestore(restoreId);
+      keepOpen = res.data.status === "applying";
+      if (keepOpen) setCancelRequested(true);
+    } catch (err) {
+      window.alert(getApiErrorMessage(err, m.cancelFailed));
+      keepOpen = true;
     } finally {
       setBusy(false);
-      onClose();
     }
+    if (!keepOpen) onClose();
   };
 
   return (
@@ -143,7 +152,14 @@ export function RestoreWizard({ sourceRun, serviceName, onClose }: Props): React
           />
         )}
 
-        {step === "applying" && <ApplyingStep restore={restore} />}
+        {step === "applying" && (
+          <ApplyingStep
+            restore={restore}
+            busy={busy}
+            cancelRequested={cancelRequested || restore?.cancelRequested === true}
+            onCancel={() => void cancelRestore()}
+          />
+        )}
 
         {step === "done" && <DoneStep restore={restore} onClose={onClose} />}
       </div>
@@ -175,7 +191,7 @@ function StepIndicator({ step }: { step: WizardStep }): React.JSX.Element {
             <span
               className={`flex size-5 items-center justify-center rounded-full text-[10px] ${
                 idx < currentIdx
-                  ? "bg-emerald-500/20 text-emerald-600 dark:text-emerald-400"
+                  ? "bg-success-bg text-success"
                   : idx === currentIdx
                     ? "bg-primary text-primary-foreground"
                     : "bg-muted text-muted-foreground"
@@ -227,9 +243,9 @@ function ReviewStep({
         </p>
       </div>
 
-      <div className="rounded-xl border border-amber-500/40 bg-amber-500/5 p-4">
+      <div className="rounded-xl border border-warning-border bg-warning-bg p-4">
         <div className="flex items-start gap-2">
-          <AlertTriangle className="mt-0.5 size-4 text-amber-500 shrink-0" />
+          <AlertTriangle className="mt-0.5 size-4 text-warning shrink-0" />
           <div className="text-sm text-foreground/80">
             <p className="font-medium">{m.overwriteWarning}</p>
             <p className="mt-1 text-xs text-muted-foreground">
@@ -337,9 +353,9 @@ function ConfirmStep({
   const ok = typed === serviceName;
   return (
     <div className="mt-6 space-y-4">
-      <div className="rounded-xl border border-emerald-500/40 bg-emerald-500/5 p-4">
+      <div className="rounded-xl border border-success-border bg-success-bg p-4">
         <div className="flex items-start gap-2">
-          <CheckCircle2 className="mt-0.5 size-4 text-emerald-500 shrink-0" />
+          <CheckCircle2 className="mt-0.5 size-4 text-success shrink-0" />
           <div className="text-sm text-foreground/80">
             <p className="font-medium">{m.verified}</p>
             <p className="mt-1 text-xs text-muted-foreground">
@@ -351,9 +367,9 @@ function ConfirmStep({
         </div>
       </div>
 
-      <div className="rounded-xl border border-red-500/40 bg-red-500/5 p-4">
+      <div className="rounded-xl border border-danger-border bg-danger-bg p-4">
         <div className="flex items-start gap-2">
-          <AlertTriangle className="mt-0.5 size-4 text-red-500 shrink-0" />
+          <AlertTriangle className="mt-0.5 size-4 text-danger shrink-0" />
           <p className="text-sm text-foreground/80">
             {m.confirmPre}<strong>{m.confirmStrong}</strong>{m.confirmMid}
             <code className="rounded bg-muted px-1.5 py-0.5 text-xs font-mono">
@@ -383,7 +399,7 @@ function ConfirmStep({
         <button
           onClick={onApply}
           disabled={busy || !ok}
-          className="rounded-lg bg-red-500 px-3 py-2 text-sm font-medium text-white hover:bg-red-600 disabled:opacity-50"
+          className="rounded-lg bg-danger-solid px-3 py-2 text-sm font-medium text-white hover:bg-danger-solid/90 disabled:opacity-50"
         >
           {busy ? m.applying : m.applyRestore}
         </button>
@@ -392,13 +408,35 @@ function ConfirmStep({
   );
 }
 
-function ApplyingStep({ restore }: { restore: BackupRestore | null }): React.JSX.Element {
+/**
+ * Apply used to render with no cancel affordance at all — the phase that can run
+ * for hours was the one phase the operator could not interrupt (#434). The
+ * button has two states because the promise changes mid-phase: before the first
+ * write a cancel costs nothing, after it the target is left holding partial data
+ * and the service stays stopped. `destructive` arrives on the SSE channel the
+ * instant that crossing happens, and the abort path confirms in place rather
+ * than through window.confirm so the consequence can actually be spelled out.
+ */
+function ApplyingStep({
+  restore,
+  busy,
+  cancelRequested,
+  onCancel,
+}: {
+  restore: BackupRestore | null;
+  busy: boolean;
+  cancelRequested: boolean;
+  onCancel: () => void;
+}): React.JSX.Element {
   const { t } = useI18n();
   const m = t.misc.restoreWizard;
+  const [confirming, setConfirming] = useState(false);
+  const destructive = restore?.meta?.destructive === true;
+
   return (
     <div className="mt-6 space-y-3">
       <div className="rounded-xl bg-muted/40 p-4 text-sm flex items-center gap-3">
-        <Loader2 className="size-4 animate-spin text-red-500" />
+        <Loader2 className="size-4 animate-spin text-danger" />
         <div className="flex-1">
           <p className="font-medium text-foreground">{m.restoringData}</p>
           <p className="text-xs text-muted-foreground">
@@ -412,6 +450,53 @@ function ApplyingStep({ restore }: { restore: BackupRestore | null }): React.JSX
           </span>
         )}
       </div>
+
+      {cancelRequested ? (
+        <div className="rounded-xl border border-warning-border bg-warning-bg p-3 text-xs text-warning">
+          {m.cancelPending}
+        </div>
+      ) : confirming ? (
+        <div className="rounded-xl border border-danger-border bg-danger-bg p-3 space-y-3">
+          <div className="flex items-start gap-2 text-sm">
+            <AlertTriangle className="mt-0.5 size-4 shrink-0 text-danger" />
+            <div>
+              <p className="font-medium text-foreground">{m.abortTitle}</p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {destructive ? m.abortBodyDestructive : m.abortBodyClean}
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center justify-end gap-2">
+            <button
+              onClick={() => setConfirming(false)}
+              disabled={busy}
+              className="rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-foreground hover:bg-muted disabled:opacity-50"
+            >
+              {m.abortKeepGoing}
+            </button>
+            <button
+              onClick={onCancel}
+              disabled={busy}
+              className="rounded-lg bg-danger-solid px-3 py-1.5 text-xs font-medium text-white hover:bg-danger-solid/90 disabled:opacity-50"
+            >
+              {m.abortConfirm}
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div className="flex items-center justify-between gap-3">
+          <p className="text-xs text-muted-foreground">
+            {destructive ? m.destructiveNow : m.destructiveNotYet}
+          </p>
+          <button
+            onClick={() => setConfirming(true)}
+            disabled={busy}
+            className="shrink-0 rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-foreground hover:bg-muted disabled:opacity-50"
+          >
+            {destructive ? m.abortRestore : m.cancelRestore}
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -431,15 +516,15 @@ function DoneStep({
       <div
         className={`rounded-xl border p-4 ${
           success
-            ? "border-emerald-500/40 bg-emerald-500/5"
-            : "border-red-500/40 bg-red-500/5"
+            ? "border-success-border bg-success-bg"
+            : "border-danger-border bg-danger-bg"
         }`}
       >
         <div className="flex items-start gap-2">
           {success ? (
-            <CheckCircle2 className="mt-0.5 size-4 text-emerald-500 shrink-0" />
+            <CheckCircle2 className="mt-0.5 size-4 text-success shrink-0" />
           ) : (
-            <XCircle className="mt-0.5 size-4 text-red-500 shrink-0" />
+            <XCircle className="mt-0.5 size-4 text-danger shrink-0" />
           )}
           <div className="text-sm">
             <p className="font-medium">
@@ -455,6 +540,32 @@ function DoneStep({
           </div>
         </div>
       </div>
+
+      {/* The row already carries the sentence in errorMessage; this repeats the
+          consequence as a standing banner because what the operator must DO next is the
+          part they otherwise misread as a second failure.
+
+          Two independent flags, so three distinct outcomes — the server stamps them
+          separately (see restore.orchestrator's runApply) and collapsing them here would
+          undo that. The dangerous one is partial data on a service still RUNNING: that
+          only happens for kinds restored through their own container, so nothing was
+          stopped and an app is serving half-written data right now. It gets the danger
+          styling; the other two are warnings about a service that is merely down. */}
+      {restore?.meta?.partialWrite ? (
+        <div
+          className={`rounded-xl border p-3 text-xs ${
+            restore.meta.serviceLeftStopped
+              ? "border-warning-border bg-warning-bg text-warning"
+              : "border-danger-border bg-danger-bg text-danger"
+          }`}
+        >
+          {restore.meta.serviceLeftStopped ? m.partialDataNotice : m.partialDataRunningNotice}
+        </div>
+      ) : restore?.meta?.serviceLeftStopped ? (
+        <div className="rounded-xl border border-warning-border bg-warning-bg p-3 text-xs text-warning">
+          {m.serviceDownNotice}
+        </div>
+      ) : null}
 
       <div className="flex items-center justify-end">
         <button

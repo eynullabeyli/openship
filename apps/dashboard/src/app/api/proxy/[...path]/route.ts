@@ -57,7 +57,12 @@ const RESPONSE_HOP_BY_HOP = new Set([
 ]);
 
 function internalApiBase(): string {
-  const url = process.env.INTERNAL_API_URL ?? "http://127.0.0.1:4000";
+  // INTERNAL_API_URL is the canonical knob (docker-compose, `openship up`).
+  // Fall back to OPENSHIP_LOCAL_API_URL so the desktop app — which serves this
+  // same proxy-baked bundle but runs the API on a DYNAMIC port and only sets
+  // OPENSHIP_LOCAL_API_URL — targets its real API instead of the :4000 default.
+  const url =
+    process.env.INTERNAL_API_URL ?? process.env.OPENSHIP_LOCAL_API_URL ?? "http://127.0.0.1:4000";
   return url.replace(/\/+$/, "");
 }
 
@@ -83,10 +88,7 @@ function buildForwardedHeaders(req: NextRequest, upstream: URL): Headers {
   // already accepts loopback peers, but a real X-Forwarded-For makes
   // the rate-limit key match the actual client).
   const xff = req.headers.get("x-forwarded-for");
-  const clientIp =
-    req.headers.get("x-real-ip") ??
-    (req as unknown as { ip?: string }).ip ??
-    "";
+  const clientIp = req.headers.get("x-real-ip") ?? (req as unknown as { ip?: string }).ip ?? "";
   if (clientIp && !xff) {
     out.set("x-forwarded-for", clientIp);
   }
@@ -116,8 +118,7 @@ async function proxy(req: NextRequest, pathSegments: string[]): Promise<Response
     // is off, but a stray dev fetch shouldn't 200-with-loopback-data.
     return new Response(
       JSON.stringify({
-        error:
-          "API proxy is disabled. Set NEXT_PUBLIC_API_PROXY=true to enable single-host mode.",
+        error: "API proxy is disabled. Set NEXT_PUBLIC_API_PROXY=true to enable single-host mode.",
       }),
       { status: 503, headers: { "content-type": "application/json" } },
     );
@@ -160,7 +161,18 @@ async function proxy(req: NextRequest, pathSegments: string[]): Promise<Response
   const responseHeaders = new Headers();
   for (const [name, value] of upstreamRes.headers) {
     if (RESPONSE_HOP_BY_HOP.has(name.toLowerCase())) continue;
+    // set-cookie is handled separately below: `.set()` overwrites, so a
+    // multi-cookie auth response (Better Auth sends session_token +
+    // session_data) would lose all but the last one and the browser would
+    // never receive a session.
+    if (name.toLowerCase() === "set-cookie") continue;
     responseHeaders.set(name, value);
+  }
+
+  // Preserve EVERY Set-Cookie header individually. getSetCookie() is the
+  // only spec-correct way to read multiples off a fetch Response.
+  for (const cookie of upstreamRes.headers.getSetCookie()) {
+    responseHeaders.append("set-cookie", cookie);
   }
 
   // Stream the body straight through — for SSE (text/event-stream)

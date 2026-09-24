@@ -1,0 +1,402 @@
+---
+title: Deployments
+description: Submit builds, follow progress, and manage releases.
+---
+
+import { TypeTable } from 'fumadocs-ui/components/type-table';
+
+A deployment builds and releases a project's configured source. Use this page to submit builds, inspect
+progress, handle decisions, and redeploy or roll back. For generated files and folder uploads, start with
+[Source files](/docs/api/sources).
+
+The operations apply to self-hosted and Cloud deployments when the selected provider supports them.
+[Cloud scope requirements](/docs/api/sdk/compatibility#cloud) still apply.
+
+## Deploy a Git project
+
+Redeploys an already-linked project from its git source. To deploy a **local folder** instead, use the
+upload flow that ends at [`/build/access`](#deploy-wizard-buildaccess).
+
+<Tabs items={['SDK', 'REST API']} groupId="api-transport" persist>
+<Tab value="SDK">
+
+```ts
+const result = await ship.deployments.create({
+  projectId: "proj_123",
+  branch: "main",
+});
+console.log(result);
+```
+
+</Tab>
+<Tab value="REST API">
+
+```bash
+curl -X POST "$OPENSHIP_URL/api/deployments" \
+  -H "Authorization: Bearer $OPENSHIP_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"projectId":"proj_123","branch":"main"}'
+```
+
+</Tab>
+</Tabs>
+
+<TypeTable
+  type={{
+    projectId: { type: 'string', description: 'The project to deploy.', required: true },
+    branch: { type: 'string', description: 'Git branch to deploy.', default: 'main' },
+    commitSha: { type: 'string', description: 'Specific commit to build; defaults to the latest on the branch.' },
+    environment: { type: '"production" | "preview"', description: 'Target environment.' },
+  }}
+/>
+
+## Detect build configuration
+
+Side-effect-free: point it at a git repo or a local path and it returns the detected framework, package
+manager, and build/start commands so the wizard can pre-fill. Creates nothing.
+
+```
+POST /api/deployments/prepare
+```
+
+<TypeTable
+  type={{
+    source: { type: '"github" | "local"', description: "Source kind. Inferred as 'github' when owner + repo are given." },
+    owner: { type: 'string', description: 'GitHub owner/org (source = github).' },
+    repo: { type: 'string', description: 'GitHub repository name (source = github).' },
+    branch: { type: 'string', description: 'Branch to inspect (source = github).' },
+    path: { type: 'string', description: 'Absolute path on the host (source = local; self-hosted only).' },
+    includeEnv: { type: 'boolean', description: 'Include editable source environment values in this response. Defaults to false; Git requires whole-repository content read access.' },
+  }}
+/>
+
+<Callout title="Local source is self-hosted only" type="warn">
+`source: "local"` is rejected with **403** in cloud mode — cloud has no host filesystem to read.
+</Callout>
+
+Preparation masks environment values by default. Import editors can request them in the same response with
+`includeEnv: true`; see
+[Reveal environment values](/docs/api/services#reveal-environment-values).
+
+## Submit an uploaded build [#deploy-wizard-buildaccess]
+
+Create a deployment and start its build. For a folder-upload
+deploy, pass `projectId` (from `projects/ensure`) and `uploadSessionId` (from `projects/folder/session`);
+for a git project, pass `projectId` and optionally `branch`. Returns `{ success, deployment_id, project_id }`.
+
+<Tabs items={['SDK', 'REST API']} groupId="api-transport" persist>
+<Tab value="SDK">
+
+```ts
+const result = await ship.deployments.buildAccess({
+  projectId: "proj_123",
+  branch: "main",
+  buildStrategy: "server",
+});
+console.log(result);
+```
+
+</Tab>
+<Tab value="REST API">
+
+```bash
+curl -X POST "$OPENSHIP_URL/api/deployments/build/access" \
+  -H "Authorization: Bearer $OPENSHIP_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"projectId":"proj_123","branch":"main","buildStrategy":"server"}'
+```
+
+</Tab>
+</Tabs>
+
+<TypeTable
+  type={{
+    projectId: { type: 'string', description: 'Target project id.', required: true },
+    uploadSessionId: { type: 'string', description: 'Folder-upload session id — deploys the uploaded source instead of git.' },
+    branch: { type: 'string', description: 'Git branch (git-source projects).' },
+    environment: { type: 'string', description: 'production | preview (default production).' },
+    envVars: { type: 'Record<string, string>', description: 'Runtime env vars { KEY: value }.' },
+    publicEndpoints: { type: 'PublicEndpoint[]', description: 'Domains/routes; omit to auto-derive a free subdomain from the project slug.' },
+    buildStrategy: { type: '"server" | "local"', description: 'Where the build runs.' },
+    deployTarget: { type: '"local" | "server" | "cloud"', description: 'Usually omit for folder uploads — the upload session mode decides.' },
+    serverId: { type: 'string', description: "Target server id when deployTarget = 'server'." },
+    runtimeMode: { type: '"bare" | "docker"', description: 'How the app runs on the target.' },
+    serviceDeploymentMode: { type: '"services" | "single"', description: 'Multi-service (compose/monorepo) or single app.' },
+    services: { type: 'BuildService[]', description: 'Compose / multi-service definitions (services mode). Omit on a folder upload and the services the scan parsed for that upload session are used.' },
+    cloudResourceTier: { type: '"micro" | "low" | "medium" | "high" | "custom"', description: 'Cloud resource tier.' },
+    cloudResourceCustom: { type: '{ cpuCores; memoryMb; diskMb }', description: "CPU/RAM/disk when cloudResourceTier = 'custom'." },
+    cloneStrategy: { type: '"api-host" | "server"', description: 'Where the repo clone happens.' },
+  }}
+/>
+
+Each `publicEndpoints` entry is `{ port?, targetPath?, domain?, customDomain?, domainType? }` where
+`domainType` is `"free"` or `"custom"`. A `services` entry mirrors a compose/monorepo service
+(`name`, `image?`, `build?`, `dockerfile?`, `ports`, `dependsOn`, `environment`, `volumes`, and the
+optional per-app build fields).
+
+<Callout title="Don't force deployTarget on self-hosted" type="warn">
+Setting `deployTarget: "cloud"` on a self-hosted instance triggers a promote-to-cloud flow. For a normal
+folder upload, leave `deployTarget` unset and let the upload session's mode decide.
+</Callout>
+
+## Wait, decisions, and cancellation
+
+A deployment submission returns IDs before the workload is ready. Read persisted build status to decide
+whether it succeeded. The SDK's `deployment(id)` handle adds polling and a normalized outcome.
+
+<Tabs items={['SDK', 'REST API']} groupId="api-transport" persist>
+<Tab value="SDK">
+
+```ts
+const outcome = await ship.deployment("dep_123").wait({ timeoutMs: 120_000 });
+if (!outcome.success) throw new Error(outcome.message ?? outcome.status);
+```
+
+</Tab>
+<Tab value="REST API">
+
+```bash
+curl "$OPENSHIP_URL/api/deployments/dep_123/build" \
+  -H "Authorization: Bearer $OPENSHIP_TOKEN"
+```
+
+</Tab>
+</Tabs>
+
+The REST request returns one status snapshot; poll it while the deployment runs. The SDK waits until a
+terminal state or a decision is required. `ready` and `no_changes` are successful. Handle failures,
+cancellation, partial failure, and rejection explicitly.
+
+`wait()` returns `status`, `success`, `decisionPending`, and `cancellationPending`, with an optional
+`prompt`, `message`, or `warning`. Without an `onPrompt` callback it returns `action_required` when a
+decision is pending. To connect your own decision UI:
+
+```ts
+import type { PromptPayload } from "openship";
+
+export async function waitWithDecisions(
+  deploymentId: string,
+  chooseAction: (prompt: PromptPayload) => Promise<string>,
+) {
+  return ship.deployment(deploymentId).wait({
+    timeoutMs: 120_000,
+    onPrompt: chooseAction,
+  });
+}
+```
+
+Return an action ID offered by the prompt. REST callers submit the same selected action as
+`{ "action": "<offered-id>" }` to `POST /api/deployments/:id/build/respond`.
+
+Aborting or timing out a wait stops observation. To cancel execution, call `deployments.cancel(id)` and
+inspect the subsequent state. Cancellation can remain pending while work settles; it does not roll back
+an already created release.
+
+## Read progress events
+
+<Tabs items={['SDK', 'REST API']} groupId="api-transport" persist>
+<Tab value="SDK">
+
+```ts
+for await (const event of ship.deployments.events("dep_123", {
+  signal: AbortSignal.timeout(30_000),
+})) {
+  console.log(event);
+}
+```
+
+</Tab>
+<Tab value="REST API">
+
+```bash
+curl -N "$OPENSHIP_URL/api/deployments/dep_123/stream" \
+  -H "Authorization: Bearer $OPENSHIP_TOKEN"
+```
+
+</Tab>
+</Tabs>
+
+REST returns Server-Sent Events. SDK events contain an event name and serialized data;
+[`consumeDeploymentEvents()`](/docs/api/sdk/utilities#deployment-helpers) decodes log chunks.
+Use `since` to resume from a known event cursor while it is available. Durable replay across worker
+restarts is not implemented. A stream ending does not establish deployment success; read status.
+
+## Redeploy
+
+<Tabs items={['SDK', 'REST API']} groupId="api-transport" persist>
+<Tab value="SDK">
+
+```ts
+const submitted = await ship.deployments.redeploy("dep_123", { useExistingCommit: true });
+console.log(submitted.deployment_id);
+```
+
+</Tab>
+<Tab value="REST API">
+
+```bash
+curl -X POST "$OPENSHIP_URL/api/deployments/dep_123/redeploy" \
+  -H "Authorization: Bearer $OPENSHIP_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"useExistingCommit":true}'
+```
+
+</Tab>
+</Tabs>
+
+Re-runs the build. By default it resolves the latest commit on the branch (the auto-redeploy semantic);
+send `{ "useExistingCommit": true }` to rebuild against the exact commit the original deployment used.
+
+## Rollback and pin
+
+Rollback restores a previous deployment's artifact/commit as the active release. Pinning marks a
+deployment as protected so it isn't reclaimed by the rollback-window cleanup — `POST /:id/pin` defaults to
+`{ "pinned": true }`; send `{ "pinned": false }` to unpin.
+
+```
+POST /api/deployments/:id/rollback
+POST /api/deployments/:id/pin
+```
+
+## Cancel a running deploy
+
+<Tabs items={['SDK', 'REST API']} groupId="api-transport" persist>
+<Tab value="SDK">
+
+```ts
+const cancellation = await ship.deployments.cancel("dep_123");
+console.log(cancellation);
+```
+
+</Tab>
+<Tab value="REST API">
+
+```bash
+curl -X POST "$OPENSHIP_URL/api/deployments/dep_123/cancel" \
+  -H "Authorization: Bearer $OPENSHIP_TOKEN"
+```
+
+</Tab>
+</Tabs>
+
+## Partial-failure compose deploys: keep or reject
+
+When a multi-service (compose) deploy has some services succeed and others fail, it is held in
+`partial_failure` with `decision: pending` ("Action Required"). Resolve it explicitly:
+
+- **Keep** accepts the services that succeeded and leaves the rest on their prior version.
+- **Reject** rolls back the changed services to their previous state.
+
+```
+POST /api/deployments/:id/keep
+POST /api/deployments/:id/reject
+```
+
+## SSL status and renew
+
+Both take the domain in the JSON body. `/ssl/status` is a side-effect-free probe (`POST` only so the
+hostname travels in the body); `/ssl/renew` re-issues the certificate.
+
+```
+POST /api/deployments/ssl/status
+POST /api/deployments/ssl/renew
+```
+
+<Tabs items={['SDK', 'REST API']} groupId="api-transport" persist>
+<Tab value="SDK">
+
+```ts
+const result = await ship.deployments.sslStatus({
+  domain: "app.example.com",
+});
+console.log(result);
+```
+
+</Tab>
+<Tab value="REST API">
+
+```bash
+curl -X POST "$OPENSHIP_URL/api/deployments/ssl/status" \
+  -H "Authorization: Bearer $OPENSHIP_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"domain":"app.example.com"}'
+```
+
+</Tab>
+</Tabs>
+
+<TypeTable
+  type={{
+    domain: { type: 'string', description: 'The hostname to check or renew.', required: true },
+    includeWww: { type: 'boolean', description: 'Renew only — also cover the www subdomain.' },
+  }}
+/>
+
+## Errors
+
+<Callout title="400 — bad request / failed operation" type="warn">
+Missing a required field (`domain is required`, `source must be 'github' or 'local'`) or the operation
+couldn't run (e.g. cancelling a deployment that already finished, or keep/reject on a deployment that
+isn't awaiting a decision). The response body carries `{ success: false, error }`.
+</Callout>
+
+<Callout title="403 — local source in cloud mode" type="error">
+`prepare` with `source: "local"` (or a folder deploy) isn't available on Openship Cloud — there's no host
+filesystem. Use a git source instead.
+</Callout>
+
+<Callout title="404 on a per-deployment route" type="error">
+The `:id` doesn't belong to your organization (or was deleted). List with `GET /api/deployments` to get
+valid IDs.
+</Callout>
+
+## Operations
+
+{/* api-operations:start */}
+
+### Submit
+
+| Operation | SDK | REST API |
+| --- | --- | --- |
+| Submit a deployment for a configured project. | `deployments.create(input)` | `POST /api/deployments`<br />`deployment:write` |
+| Submit a new deployment based on an existing release. | `deployments.redeploy(id, input?)` | `POST /api/deployments/:id/redeploy`<br />`deployment:write` |
+| Detect and prepare source configuration before submission. | `deployments.prepare(input)` | `POST /api/deployments/prepare`<br />`deployment:write` |
+| Submit a prepared upload/build workflow. | `deployments.buildAccess(input)` | `POST /api/deployments/build/access`<br />`deployment:write` |
+| Start an already prepared deployment. | `deployments.start(id)` | `POST /api/deployments/:id/build`<br />`deployment:write` |
+
+### Observe
+
+| Operation | SDK | REST API |
+| --- | --- | --- |
+| Read the persisted deployment record. | `deployments.get(id)` | `GET /api/deployments/:id`<br />`deployment:read` |
+| Read a page of deployments using project and environment filters. | `deployments.list(input?)` | `GET /api/deployments`<br />`deployment:list` |
+| Read captured deployment logs. | `deployments.logs(id, input?)` | `GET /api/deployments/:id/logs`<br />`deployment:read` |
+| Read persisted status, pending prompts, and cancellation state. | `deployments.buildStatus(id)` | `GET /api/deployments/:id/build`<br />`deployment:read` |
+| Inspect whether rollback needs retained artifacts or a rebuild. | `deployments.restorePlan(id)` | `GET /api/deployments/:id/restore-plan`<br />`deployment:read` |
+| Stream deployment progress events. | `deployments.events(id, options?)` | `GET /api/deployments/:id/stream`<br />`deployment:read` |
+| Read runtime/container information. | `deployments.containerInfo(id)` | `GET /api/deployments/:id/info`<br />`deployment:read` |
+| Read current CPU, memory, disk, and network usage. | `deployments.containerUsage(id)` | `GET /api/deployments/:id/usage`<br />`deployment:read` |
+| Read unresolved actions for the deployment. | `deployments.pendingActions(id)` | `GET /api/deployments/:id/pending`<br />`deployment:read` |
+
+### Control
+
+| Operation | SDK | REST API |
+| --- | --- | --- |
+| Request cancellation and return whether settlement is pending. | `deployments.cancel(id)` | `POST /api/deployments/:id/cancel`<br />`deployment:write` |
+| Answer a pending deployment prompt with an offered action ID. | `deployments.respond(id, input)` | `POST /api/deployments/:id/build/respond`<br />`deployment:write` |
+| Restore the selected deployment through the rollback workflow. | `deployments.rollback(id)` | `POST /api/deployments/:id/rollback`<br />`deployment:write` |
+| Pin or unpin retained rollback artifacts. | `deployments.pin(id, input?)` | `POST /api/deployments/:id/pin`<br />`deployment:write` |
+| Accept a release waiting for a keep/reject decision. | `deployments.keep(id)` | `POST /api/deployments/:id/keep`<br />`deployment:write` |
+| Reject a held release and restore the prior deployment when possible. | `deployments.reject(id)` | `POST /api/deployments/:id/reject`<br />`deployment:write` |
+| Remove an eligible deployment and its retained resources. | `deployments.remove(id)` | `DELETE /api/deployments/:id`<br />`deployment:admin` |
+| Restart the deployment’s runtime. | `deployments.restart(id)` | `POST /api/deployments/:id/restart`<br />`deployment:write` |
+| Skip the specified advisory port check. | `deployments.skipPortCheck(id, input)` | `POST /api/deployments/:id/skip-port-check`<br />`deployment:write` |
+
+### Certificates
+
+| Operation | SDK | REST API |
+| --- | --- | --- |
+| Read certificate status for a domain. | `deployments.sslStatus(input)` | `POST /api/deployments/ssl/status`<br />`deployment:read` |
+| Request certificate renewal for a domain. | `deployments.renewSsl(input)` | `POST /api/deployments/ssl/renew`<br />`deployment:write` |
+
+{/* api-operations:end */}

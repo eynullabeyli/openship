@@ -25,6 +25,7 @@
     "projectCountOne": "{count} project",
     "projectCountOther": "{count} projects",
     "viewAllProjects": "View all {count} projects →",
+    "viewAllApps": "View all {count} apps →",
     "greetingName": "{greeting}, {name}",
     "importGit": "Import Git",
     "importGitDesc": "From repository",
@@ -35,9 +36,14 @@
     "docs": "Docs",
     "docsDesc": "Learn more",
     "activityTitle": "Activity",
-    "successRate": "Success rate",
+    "systemStatus": "System status",
+    "operational": "Operational",
+    "oneIssue": "1 issue",
+    "manyIssues": "{n} issues",
     "recentTitle": "Recent",
     "activityEmpty": "Your activity will appear here",
+    "appsEmptyTitle": "No apps yet",
+    "appsEmptyDesc": "One click, fully self-hosted — databases, automation, analytics, password vaults and more, running on your own servers.",
     "allSystemsOperational": "All systems operational",
     "runningSmoothly": "Your projects are running smoothly",
     "time": {
@@ -49,21 +55,33 @@
     }
   },
   "nav": {
+    "scale": "Scale",
     "home": "Home",
     "new-project": "New Project",
     "projects": "Projects",
+    "apps": "Apps",
     "deployments": "Deployments",
+    "issues": "Monitoring",
     "backups": "Backups",
     "domains": "Domains",
     "monitoring": "Monitoring",
     "servers": "Servers",
     "emails": "Emails",
+    "jobs": "Jobs",
     "settings": "Settings",
-    "billing": "Billing",
+    "billing": "Billing & Usage",
+    "audit": "Audit log",
+    "mailSetup": "Set up mail",
+    "mailSetupProgress": "Setup progress",
+    "addMailbox": "Add mailbox",
+    "webmail": "Webmail",
     "sections": {
       "main": "Main",
       "settings": "Settings",
       "infrastructure": "Infrastructure",
+      "mail": "Mail",
+      "delivery": "Delivery",
+      "system": "System",
       "account": "Account"
     }
   },
@@ -78,6 +96,40 @@
     "preferences": "Preferences"
   },
   "pages": {
+    "apps": {
+      "title": "Apps",
+      "description": "One-click managed services — install and run Convex, WordPress, mail, and more.",
+      "createButton": "Install App",
+      "loading": "Loading apps…",
+      "countOne": "{count} app installed",
+      "countOther": "{count} apps installed",
+      "emptyTitle": "Install your first app",
+      "emptyDescription": "Spin up Convex, n8n, Ghost, and more — one click, fully self-hosted. Pick one to get started.",
+      "popular": "Popular apps",
+      "alsoDeploy": "You can also deploy",
+      "browseAll": "Browse all apps",
+      "moreApps": "+{count} more",
+      "catalogTitle": "Install an app",
+      "catalogDescription": "One-click managed services. Pick one to install it as an app.",
+      "catalogSearchPlaceholder": "Search apps…",
+      "catalogNoResults": "No apps match your search.",
+      "categories": {
+        "all": "All",
+        "backend": "Backend",
+        "database": "Database",
+        "cms": "CMS",
+        "analytics": "Analytics",
+        "automation": "Automation",
+        "mail": "Mail",
+        "other": "Tools"
+      },
+      "installing": "Installing…",
+      "install": "Install",
+      "cancel": "Cancel",
+      "nameLabel": "Name",
+      "configTitle": "Configure {app}",
+      "comingSoon": "Coming soon"
+    },
     "projects": {
       "title": "Projects",
       "description": "Deploy and manage your applications with ease",
@@ -107,6 +159,11 @@
         "rollbacks": "Rollbacks",
         "rollbacksDesc": "One-click revert",
         "commandPalette": "Or press {key} to open command palette"
+      },
+      "view": {
+        "label": "View",
+        "list": "List",
+        "grid": "Grid"
       }
     },
     "deployments": {
@@ -130,7 +187,7 @@
       "description": "Account, team, and platform settings."
     },
     "billing": {
-      "title": "Billing",
+      "title": "Billing & Usage",
       "description": "Manage your subscription, usage, and payment methods."
     }
   },
@@ -158,7 +215,7 @@
       "description": "Custom domains"
     },
     "billing": {
-      "title": "Billing",
+      "title": "Billing & Usage",
       "description": "Usage & plans"
     }
   }

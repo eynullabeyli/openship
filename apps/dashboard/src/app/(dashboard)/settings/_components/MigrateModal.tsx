@@ -16,6 +16,7 @@
  */
 
 import { useEffect, useState } from "react";
+import { BlurIp } from "@/components/BlurIp";
 import {
   Cloud,
   Loader2,
@@ -27,6 +28,7 @@ import {
   ChevronRight,
   ChevronLeft,
   ExternalLink,
+  Plus,
 } from "lucide-react";
 import { migrationApi, systemApi, getApiErrorMessage } from "@/lib/api";
 import type {
@@ -40,6 +42,8 @@ import type { ServerInfo } from "@/lib/api/system";
 import { useToast } from "@/context/ToastContext";
 import { useCloud } from "@/context/CloudContext";
 import { useI18n, interpolate } from "@/components/i18n-provider";
+import { useAddServerModal } from "@/components/servers/add-server-modal";
+import { Modal } from "@/components/ui/Modal";
 
 type PathKind = "server" | "cloud" | "tunnel";
 type Step = "choose" | "form" | "result";
@@ -85,14 +89,20 @@ export function MigrateModal({ open, onClose, onMigrated }: MigrateModalProps) {
   };
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-6"
-      onClick={handleClose}
+    // Portal-backed shared Modal, not a hand-rolled `fixed inset-0` overlay.
+    // Rendered inline, this sat INSIDE the settings page's stacking/filter
+    // context, so the whole dialog came out washed and the page bled through it.
+    // Modal portals to document.body and owns the scrim + solid surface.
+    <Modal
+      isOpen
+      onClose={handleClose}
+      closable={!submitting}
+      showCloseButton={false}
+      maxWidth="42rem"
+      maxHeight="90vh"
+      overflow="hidden"
     >
-      <div
-        className="w-full max-w-2xl max-h-[90vh] overflow-hidden rounded-2xl border border-border/50 bg-card"
-        onClick={(e) => e.stopPropagation()}
-      >
+      <div className="flex max-h-[90vh] min-h-0 flex-col">
         <ModalHeader
           step={step}
           path={path}
@@ -106,7 +116,7 @@ export function MigrateModal({ open, onClose, onMigrated }: MigrateModalProps) {
           submitting={submitting}
         />
 
-        <div className="max-h-[calc(90vh-72px)] overflow-y-auto p-6">
+        <div className="min-h-0 flex-1 overflow-y-auto p-6">
           {step === "choose" && (
             <ChooseStep
               cloudConnected={cloudConnected}
@@ -177,7 +187,7 @@ export function MigrateModal({ open, onClose, onMigrated }: MigrateModalProps) {
           )}
         </div>
       </div>
-    </div>
+    </Modal>
   );
 }
 
@@ -309,7 +319,7 @@ function PathCard({
           {meta}
         </p>
         {warn && (
-          <p className="text-[11px] text-amber-500 mt-1 flex items-center gap-1">
+          <p className="text-[11px] text-warning mt-1 flex items-center gap-1">
             <AlertCircle className="size-3" /> {warn}
           </p>
         )}
@@ -335,6 +345,7 @@ function ServerForm({
   showToast: (msg: string, kind: "success" | "error", topic?: string) => void;
 }) {
   const { t } = useI18n();
+  const openAddServer = useAddServerModal();
   const [servers, setServers] = useState<ServerInfo[]>([]);
   const [loadingServers, setLoadingServers] = useState(true);
   const [serverId, setServerId] = useState("");
@@ -343,6 +354,7 @@ function ServerForm({
   const [freeSlug, setFreeSlug] = useState("");
   const [preflight, setPreflight] = useState<PreflightResult | null>(null);
   const [running, setRunning] = useState(false);
+  const [startError, setStartError] = useState<string | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -392,12 +404,15 @@ function ServerForm({
 
   const handleStart = async () => {
     if (!preflight?.ready) return;
+    setStartError(null);
     onSubmitStart();
     try {
       const res = await migrationApi.startServer({ serverId, domain });
       onSuccess(res);
     } catch (err) {
-      showToast(getApiErrorMessage(err, t.settings.migrate.server.toastMigrationFailed), "error", t.settings.common.toast.migration);
+      const message = getApiErrorMessage(err, t.settings.migrate.server.toastMigrationFailed);
+      setStartError(message);
+      showToast(message, "error", t.settings.common.toast.migration);
     } finally {
       onSubmitEnd();
     }
@@ -413,8 +428,29 @@ function ServerForm({
             {t.settings.migrate.server.loadingServers}
           </div>
         ) : servers.length === 0 ? (
-          <div className="rounded-xl border border-border/50 px-3 py-3 text-xs text-muted-foreground">
-            {t.settings.migrate.server.noServersPrefix} <span className="font-mono">/system/servers</span>.
+          // Migrating needs a target, so a bare "go add one somewhere else"
+          // ended the wizard. Add it here and it becomes the picked target.
+          <div className="rounded-xl border border-border/50 px-3 py-3 space-y-2.5">
+            <p className="text-xs text-muted-foreground">
+              {t.settings.migrate.server.noServersPrefix} <span className="font-mono">/system/servers</span>.
+            </p>
+            <button
+              type="button"
+              disabled={submitting}
+              onClick={() =>
+                openAddServer((created) => {
+                  setServers((prev) =>
+                    prev.some((s) => s.id === created.id) ? prev : [...prev, created],
+                  );
+                  setServerId(created.id);
+                  setPreflight(null);
+                })
+              }
+              className="inline-flex items-center gap-1.5 rounded-lg border border-border/60 px-2.5 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground disabled:opacity-50"
+            >
+              <Plus className="size-3.5" />
+              {t.widgets.shared.serverSelector.addServer}
+            </button>
           </div>
         ) : (
           <select
@@ -429,7 +465,7 @@ function ServerForm({
             <option value="">{t.settings.migrate.server.pickServer}</option>
             {servers.map((s) => (
               <option key={s.id} value={s.id}>
-                {s.name || s.sshHost} ({s.sshUser}@{s.sshHost})
+                {s.name || <BlurIp>{s.sshHost}</BlurIp>} ({s.sshUser}@<BlurIp>{s.sshHost}</BlurIp>)
               </option>
             ))}
           </select>
@@ -508,9 +544,15 @@ function ServerForm({
           <CheckRow ok={preflight.checks.domain.ok} label={t.settings.migrate.server.domainReady}>
             {preflight.checks.domain.detail}
           </CheckRow>
+          {preflight.checks.deployment && (
+            <CheckRow ok={preflight.checks.deployment.ok} label={t.settings.migrate.server.startMigration}>
+              {preflight.checks.deployment.detail}
+            </CheckRow>
+          )}
         </div>
       )}
 
+      {startError && <p role="alert" className="text-sm text-destructive">{startError}</p>}
       {/* Actions */}
       <div className="flex items-center justify-end gap-2 pt-2">
         {!preflight && (
@@ -593,8 +635,8 @@ function CloudForm({
 
   if (!cloudConnected) {
     return (
-      <div className="rounded-xl border border-amber-500/30 bg-amber-500/[0.04] p-4 space-y-2">
-        <div className="flex items-center gap-2 text-amber-500">
+      <div className="rounded-xl border border-warning-border bg-warning-bg p-4 space-y-2">
+        <div className="flex items-center gap-2 text-warning">
           <AlertCircle className="size-4" />
           <p className="text-sm font-medium">{t.settings.migrate.cloud.connectFirstTitle}</p>
         </div>
@@ -690,8 +732,8 @@ function TunnelForm({
 
   if (!cloudConnected) {
     return (
-      <div className="rounded-xl border border-amber-500/30 bg-amber-500/[0.04] p-4 space-y-2">
-        <div className="flex items-center gap-2 text-amber-500">
+      <div className="rounded-xl border border-warning-border bg-warning-bg p-4 space-y-2">
+        <div className="flex items-center gap-2 text-warning">
           <AlertCircle className="size-4" />
           <p className="text-sm font-medium">{t.settings.migrate.tunnel.connectFirstTitle}</p>
         </div>
@@ -763,8 +805,8 @@ function ResultStep({
   const { t } = useI18n();
   return (
     <div className="space-y-5">
-      <div className="flex items-start gap-3 rounded-xl border border-emerald-500/30 bg-emerald-500/[0.05] p-4">
-        <CheckCircle2 className="size-5 text-emerald-500 shrink-0 mt-0.5" />
+      <div className="flex items-start gap-3 rounded-xl border border-success-border bg-success-bg p-4">
+        <CheckCircle2 className="size-5 text-success shrink-0 mt-0.5" />
         <div>
           <p className="text-sm font-medium text-foreground">{t.settings.migrate.result.complete}</p>
           <p className="text-xs text-muted-foreground mt-1">{detail}</p>
@@ -812,9 +854,9 @@ function CheckRow({
   return (
     <div className="flex items-start gap-2">
       {ok ? (
-        <CheckCircle2 className="size-4 text-emerald-500 shrink-0 mt-0.5" />
+        <CheckCircle2 className="size-4 text-success shrink-0 mt-0.5" />
       ) : (
-        <AlertCircle className="size-4 text-amber-500 shrink-0 mt-0.5" />
+        <AlertCircle className="size-4 text-warning shrink-0 mt-0.5" />
       )}
       <div className="flex-1 min-w-0">
         <p className="text-sm text-foreground">{label}</p>

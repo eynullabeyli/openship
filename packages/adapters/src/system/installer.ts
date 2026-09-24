@@ -8,26 +8,27 @@
 
 import type { CommandExecutor, LogEntry } from "../types";
 import type { InstallerConfig, InstallResult, SystemLogCallback, SystemLog } from "./types";
-import { systemCatalog } from "./catalog";
+import { MIN_DOCKER_VERSION, systemCatalog } from "./catalog";
+import { checkDocker } from "./checks";
 import { resolveEnvironment, type EnvironmentProfile } from "./environment";
-import { safeErrorMessage } from "@repo/core";
+import { envOps, opScript } from "./environment-ops";
+import { privilegedExecutor } from "./privilege";
+import { answered, type Answer, compareSemver, safeErrorMessage } from "@repo/core";
 import {
-  deployLuaScripts,
-  detectOpenRestyPaths,
-  buildReloadCommand,
-  ensureOpenRestyConfig,
-  OPENRESTY_DEFAULT_PATHS,
-  type OpenRestyPaths,
-} from "../infra/openresty-lua";
+  EdgeMigrateRequested,
+  invalidateEdgeContainer,
+  resolveOurEdgeContainer,
+} from "./proxy/detect";
+import { probeListeningPort } from "../runtime/port-conflict";
+import { dockerAvailable } from "./managed-image";
+import { ensureContainerEdge } from "./proxy/ensure-container-edge";
+import { containerCommand } from "./edge-container-executor";
+import { sq } from "./local-shell";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function log(message: string, level: SystemLog["level"] = "info"): SystemLog {
   return { timestamp: new Date().toISOString(), message, level };
-}
-
-function describeEnvironment(profile: EnvironmentProfile): string {
-  return `Detected environment: os=${profile.os}, arch=${profile.arch}, distro=${profile.distro ?? "n/a"}, packageManager=${profile.packageManager}, serviceManager=${profile.serviceManager}`;
 }
 
 /** Run a command, swallow errors (best-effort). */
@@ -37,60 +38,225 @@ async function execSafe(executor: CommandExecutor, cmd: string): Promise<void> {
   } catch {}
 }
 
-/**
- * Kill stale apt/dpkg locks and fix interrupted state.
- * Only needed on apt systems when dpkg got interrupted.
- */
-async function ensureAptReady(
-  executor: CommandExecutor,
-  onLog: SystemLogCallback,
-): Promise<void> {
-  const broken = await executor.exec("dpkg --audit 2>&1 | head -1").catch(() => "");
-  if (!broken) return;
+type ExecutorPrep =
+  | { ok: true; executor: CommandExecutor; profile: EnvironmentProfile }
+  | { ok: false; result: InstallResult };
 
-  onLog(log("Fixing interrupted package state..."));
-  await execSafe(executor, "fuser -k /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock 2>/dev/null || true");
-  await execSafe(executor, "rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock 2>/dev/null || true");
-  // DPKG_FORCE=confnew is set in the SSH env prefix, so this won't hang on conffile prompts
-  await executor.streamExec("dpkg --configure -a 2>&1", onLog as (log: LogEntry) => void);
+/**
+ * {@link privilegedExecutor} in this layer's own vocabulary — a refusal becomes the
+ * `InstallResult` every caller here already returns. Call it BEFORE touching the box
+ * (e.g. before stopping OpenResty), since running installs unelevated is the #84
+ * apt-lock failure.
+ */
+async function prepareExecutor(
+  executor: CommandExecutor,
+  component: string,
+): Promise<ExecutorPrep> {
+  const grant = await privilegedExecutor(executor, `Installing ${component}`);
+  if (!grant.supported) {
+    return { ok: false, result: { component, success: false, error: grant.reason } };
+  }
+  return { ok: true, executor: grant.value.executor, profile: grant.value.profile };
 }
 
-/** Build the package-manager remove command. */
-function buildRemoveCommand(pm: EnvironmentProfile["packageManager"], packages: string[]): string | null {
-  const names = packages.join(" ");
-  switch (pm) {
-    case "apt":  return `apt-get purge -y -qq ${names} && apt-get autoremove -y -qq`;
-    case "dnf":  return `dnf remove -y ${names}`;
-    case "yum":  return `yum remove -y ${names}`;
-    case "brew": return `brew uninstall --force ${names}`;
-    case "apk":  return `apk del ${names}`;
-    default:     return null;
-  }
+/**
+ * Turn a failed package install into something the operator can act on.
+ *
+ * "Docker install failed" named nothing — not the command, not the exit code, and
+ * not the one line that carries the cause: apt's own `E: Held packages were changed
+ * and -y was used without --allow-change-held-packages` (#491). It was visible only
+ * by running the install by hand on the host. `streamExec` returns stdout AND
+ * stderr, so the cause is already in hand; this picks the lines worth repeating and
+ * caps them (installer output runs to hundreds of lines, and this string renders
+ * inline in the UI).
+ */
+function describeInstallFailure(label: string, code: number, output: string): string {
+  const lines = output
+    .split("\n")
+    .map((line) => line.replace(/\r/g, "").trim())
+    .filter(Boolean);
+  // apt/dpkg/dnf put the diagnosis on E:/Err:/Error:/dpkg: lines. Nothing matched →
+  // the tail is the closest thing to a reason.
+  const flagged = lines.filter((line) => /^(e:|err:|error:|dpkg:|fatal:)/i.test(line));
+  const picked = (flagged.length ? flagged : lines).slice(-3).join(" · ");
+  const detail = picked.length > 400 ? `${picked.slice(0, 399)}…` : picked;
+  // The #491 host: the operator had held Docker's packages precisely so nothing
+  // would upgrade them. A hold is a decision, not an obstacle — name it.
+  const held = /held packages?|--allow-change-held-packages/i.test(output)
+    ? " Packages are held on this host (`apt-mark hold`) and Openship does not override a hold — unhold them first if you do want this install."
+    : "";
+  return `${label} install failed (exit ${code})${detail ? `: ${detail}` : ""}.${held}`;
+}
+
+/** The package-manager remove command for this host, or the reason there isn't one. */
+function removeCommand(profile: EnvironmentProfile, packages: string[]): Answer<string> {
+  const remove = envOps(profile).pkgRemove(packages);
+  return remove.supported ? answered(opScript(remove.value)) : remove;
 }
 
 // ─── Docker ──────────────────────────────────────────────────────────────────
 
+/**
+ * What Docker the box already has. Four answers, because three of them mean "do
+ * NOT run the installer" — for three different reasons.
+ */
+interface DockerPresence {
+  verdict: "missing" | "stopped" | "outdated" | "ok";
+  version?: string;
+  /** `checkDocker`'s message — carries the daemon's own refusal when there is one. */
+  message: string;
+}
+
+/** Answered by the SHARED check, so "Docker is fine" means here exactly what it
+ *  means on the Components tab. */
+async function probeDocker(executor: CommandExecutor): Promise<DockerPresence> {
+  const status = await checkDocker(executor);
+  const version = status.version;
+  if (!status.installed) return { verdict: "missing", message: status.message };
+  if (!status.healthy) return { verdict: "stopped", version, message: status.message };
+  if (version && compareSemver(version, MIN_DOCKER_VERSION) < 0) {
+    return { verdict: "outdated", version, message: status.message };
+  }
+  return { verdict: "ok", version, message: status.message };
+}
+
+function dockerAlreadyThere(
+  present: DockerPresence,
+  onLog: SystemLogCallback,
+): InstallResult {
+  const named = present.version ? `Docker ${present.version}` : "Docker";
+  onLog(log(`${named} is installed and its daemon is answering — nothing to install`));
+  return { component: "docker", success: true, version: present.version };
+}
+
+/**
+ * Install Docker Engine — but only on a box that actually needs it.
+ *
+ * #491: this used to run `get.docker.com` unconditionally, for every caller (the
+ * mail wizard's "Ensure System Components" among them). On a host that already runs
+ * Docker — including the host running Openship itself — that is not a no-op: the
+ * installer pulls the CURRENT engine, which is a major upgrade (28.x → 29.x) plus
+ * containerd, and restarting the daemon restarts every container on the box. An
+ * operator who asked for a mail server got their whole stack bounced. An operator
+ * who had pinned the packages against exactly that (`apt-mark hold`) got apt's
+ * refusal reported as the self-contradictory "Docker install failed: Docker install
+ * failed", on a box whose dashboard was demonstrably running under Docker.
+ *
+ * So the state of the host decides:
+ *   ok       → return, having touched nothing (and without needing root)
+ *   stopped  → start the daemon. Reinstalling cannot fix a daemon that isn't
+ *              answering, and would upgrade the engine on the way past
+ *   outdated → say what's needed and stop. An engine upgrade takes every container
+ *              on the host down with it, so it is the operator's call, never a side
+ *              effect of another flow happening to need Docker
+ *   missing  → install
+ *
+ * `config.reinstall` is that operator's call (the Components tab's Reinstall
+ * action) and the ONLY way to reach the installer over a working Docker.
+ */
 export async function installDocker(
   executor: CommandExecutor,
   onLog: SystemLogCallback,
+  config?: InstallerConfig,
 ): Promise<InstallResult> {
-  const profile = await resolveEnvironment(executor);
-  const plan = systemCatalog.installs.docker(profile);
-  if (!plan.supported || !plan.installCommand || !plan.verifyCommand) {
-    return { component: "docker", success: false, error: plan.unsupportedReason ?? "Docker install not supported" };
+  const forced = config?.reinstall === true;
+
+  // Probe BEFORE elevating: skipping needs no root at all, and `prepareExecutor`
+  // fails outright on a non-root box without sudo — which answered "installing
+  // docker needs root" on hosts that needed no install in the first place.
+  let present = forced ? null : await probeDocker(executor);
+  if (present?.verdict === "ok") return dockerAlreadyThere(present, onLog);
+
+  const prep = await prepareExecutor(executor, "docker");
+  if (!prep.ok) return prep.result;
+  executor = prep.executor;
+  const profile = prep.profile;
+
+  // A non-root user outside the `docker` group can't open the socket even when the
+  // daemon is perfectly healthy, and from the probe that is indistinguishable from a
+  // stopped daemon. Ask again as root before concluding anything.
+  if (present && present.verdict !== "missing" && !profile.isRoot) {
+    present = await probeDocker(executor);
+    if (present.verdict === "ok") return dockerAlreadyThere(present, onLog);
   }
 
-  onLog(log("Installing Docker Engine..."));
-  try {
-    const { code } = await executor.streamExec(plan.installCommand, onLog as (log: LogEntry) => void);
-    if (code !== 0) return { component: "docker", success: false, error: "Docker install failed" };
+  const plan = systemCatalog.installs.docker(profile);
+  // A host we can't install on still has to answer "how would I start it" — the
+  // stopped-daemon branch below needs the reason, not an `undefined`.
+  const service = plan.supported ? plan.value.service : plan;
 
-    if (plan.startCommand) {
-      onLog(log("Starting Docker service..."));
-      await executor.streamExec(plan.startCommand, onLog as (log: LogEntry) => void);
+  // Installed, current, daemon down → starting it IS the fix.
+  if (present?.verdict === "stopped" && service?.supported) {
+    onLog(log(`${present.message} — starting the Docker service`, "warn"));
+    await executor
+      .streamExec(service.value, onLog as (log: LogEntry) => void)
+      .catch(() => undefined);
+    present = await probeDocker(executor);
+    if (present.verdict === "ok") {
+      onLog(log(`Docker ${present.version} is running`));
+      return { component: "docker", success: true, version: present.version };
+    }
+  }
+
+  // Docker is here but not usable. Either way, running the installer now would be
+  // an ENGINE UPGRADE with a daemon restart attached — the thing the operator has
+  // to authorize. Say what's wrong instead of doing it.
+  if (present && present.verdict !== "missing") {
+    // Stopped AND unstartable is two facts, and the second one is the actionable
+    // half — "start Docker and retry" is not advice on a host where we know why we
+    // couldn't.
+    const cannotStart =
+      present.verdict === "stopped" && service && !service.supported
+        ? ` Openship could not start it for you: ${service.reason}`
+        : "";
+    const error =
+      (present.verdict === "outdated"
+        ? `Docker ${present.version} is installed but Openship needs ${MIN_DOCKER_VERSION} or newer. ` +
+          "Upgrading Docker restarts the daemon and every container on this server, so it is never done " +
+          "as part of another step — upgrade it on the host, or use Reinstall on the Docker component to " +
+          "run the official installer."
+        : `${present.message}. Start Docker on this server and retry. Openship will not reinstall Docker ` +
+          "over a daemon that is merely unreachable: the installer would also upgrade the engine and restart " +
+          "every container on this host. Use Reinstall on the Docker component if that is what you want.") +
+      cannotStart;
+    onLog(log(error, "error"));
+    return { component: "docker", success: false, version: present.version, error };
+  }
+
+  if (!plan.supported) {
+    onLog(log(plan.reason, "error"));
+    return { component: "docker", success: false, error: plan.reason };
+  }
+
+  onLog(
+    forced
+      ? log(
+          "Running the Docker installer — it may upgrade the engine, which restarts the daemon and every container on this host...",
+          "warn",
+        )
+      : log("Installing Docker Engine..."),
+  );
+  try {
+    const { code, output } = await executor.streamExec(
+      plan.value.installCommand,
+      onLog as (log: LogEntry) => void,
+    );
+    if (code !== 0) {
+      const error = describeInstallFailure("Docker", code, output);
+      onLog(log(error, "error"));
+      return { component: "docker", success: false, error };
     }
 
-    const version = await executor.exec(plan.verifyCommand);
+    if (service?.supported) {
+      onLog(log("Starting Docker service..."));
+      await executor.streamExec(service.value, onLog as (log: LogEntry) => void);
+    } else if (service) {
+      // How Alpine used to install Docker and never start it: the start table knew
+      // only systemd, so "no command" and "no way to say so" were the same value.
+      onLog(log(`Docker is installed but Openship cannot start it here: ${service.reason}`, "warn"));
+    }
+
+    const version = await executor.exec(plan.value.verifyCommand);
     const parsed = systemCatalog.checks.docker.parseVersion(version);
     onLog(log(`Docker ${parsed} installed`));
     return { component: "docker", success: true, version: parsed };
@@ -101,169 +267,134 @@ export async function installDocker(
   }
 }
 
-// ─── Git ─────────────────────────────────────────────────────────────────────
+// ─── Git and rsync ───────────────────────────────────────────────────────────
 
-export async function installGit(
+/** A component that is one package and one binary — no repo, no daemon. */
+type PackagedComponent = "git" | "rsync";
+
+/**
+ * Install one packaged component: plan, stream, verify, report.
+ *
+ * Git and rsync differed only in their operator-facing strings, and each carried
+ * its own copy of this sequence — including its own way of turning a refused plan
+ * into a message.
+ */
+async function installPackaged(
+  executor: CommandExecutor,
+  onLog: SystemLogCallback,
+  component: PackagedComponent,
+  label: string,
+  /** Where it is going, when that isn't the host itself — a build container. */
+  where?: string,
+): Promise<InstallResult> {
+  const prep = await prepareExecutor(executor, component);
+  if (!prep.ok) return prep.result;
+  executor = prep.executor;
+
+  const plan = systemCatalog.installs[component](prep.profile);
+  if (!plan.supported) {
+    onLog(log(plan.reason, "error"));
+    return { component, success: false, error: plan.reason };
+  }
+  const inside = where ? ` in ${where}` : "";
+
+  onLog(log(`Installing ${label}${inside}...`));
+  try {
+    const { code, output } = await executor.streamExec(
+      plan.value.installCommand,
+      onLog as (log: LogEntry) => void,
+    );
+    if (code !== 0) {
+      const error = describeInstallFailure(label, code, output);
+      onLog(log(error, "error"));
+      return { component, success: false, error };
+    }
+
+    const version = await executor.exec(plan.value.verifyCommand);
+    const parsed = systemCatalog.checks[component].parseVersion(version);
+    onLog(log(`${label} ${parsed} installed${inside}`));
+    return { component, success: true, version: parsed };
+  } catch (err) {
+    const msg = safeErrorMessage(err);
+    onLog(log(`${label} installation failed: ${msg}`, "error"));
+    return { component, success: false, error: msg };
+  }
+}
+
+export function installGit(
   executor: CommandExecutor,
   onLog: SystemLogCallback,
   opts?: { label?: string },
 ): Promise<InstallResult> {
-  const profile = await resolveEnvironment(executor);
-  const plan = systemCatalog.installs.git(profile);
-  if (!plan.supported || !plan.installCommand || !plan.verifyCommand) {
-    return { component: "git", success: false, error: plan.unsupportedReason ?? "Git install not supported" };
-  }
-
-  onLog(log(opts?.label ? `Installing Git in ${opts.label}...` : "Installing Git..."));
-  try {
-    const { code } = await executor.streamExec(plan.installCommand, onLog as (log: LogEntry) => void);
-    if (code !== 0) return { component: "git", success: false, error: "Git installation failed" };
-
-    const version = await executor.exec(plan.verifyCommand);
-    const parsed = systemCatalog.checks.git.parseVersion(version);
-    onLog(log(opts?.label ? `Git ${parsed} installed in ${opts.label}` : `Git ${parsed} installed`));
-    return { component: "git", success: true, version: parsed };
-  } catch (err) {
-    const msg = safeErrorMessage(err);
-    onLog(log(`Git installation failed: ${msg}`, "error"));
-    return { component: "git", success: false, error: msg };
-  }
+  return installPackaged(executor, onLog, "git", "Git", opts?.label);
 }
 
-// ─── Rsync ───────────────────────────────────────────────────────────────────
-
-export async function installRsync(
+export function installRsync(
   executor: CommandExecutor,
   onLog: SystemLogCallback,
 ): Promise<InstallResult> {
-  const profile = await resolveEnvironment(executor);
-  const plan = systemCatalog.installs.rsync(profile);
-  if (!plan.supported || !plan.installCommand || !plan.verifyCommand) {
-    return { component: "rsync", success: false, error: plan.unsupportedReason ?? "rsync install not supported" };
-  }
-
-  onLog(log("Installing rsync..."));
-  try {
-    const { code } = await executor.streamExec(plan.installCommand, onLog as (log: LogEntry) => void);
-    if (code !== 0) return { component: "rsync", success: false, error: "rsync installation failed" };
-
-    const version = await executor.exec(plan.verifyCommand);
-    const parsed = systemCatalog.checks.rsync.parseVersion(version);
-    onLog(log(`rsync ${parsed} installed`));
-    return { component: "rsync", success: true, version: parsed };
-  } catch (err) {
-    const msg = safeErrorMessage(err);
-    onLog(log(`rsync installation failed: ${msg}`, "error"));
-    return { component: "rsync", success: false, error: msg };
-  }
+  return installPackaged(executor, onLog, "rsync", "rsync");
 }
 
-// ─── Certbot ─────────────────────────────────────────────────────────────────
-
-export async function installCertbot(
+/**
+ * Install the edge — the `edge` component. It is a CONTAINER, always.
+ *
+ * The edge is the openship-edge image and its serving path is host-side (host
+ * networking, host bind mounts for vhosts/certs/ACME). There is deliberately NO
+ * host-package fallback: a Docker-less box gets an explicit, actionable failure
+ * instead of a second, divergent edge implementation that then has to be migrated.
+ *
+ * THE only way to install an edge. There is no `installOpenResty`/`installCertbot`
+ * any more — both apt-installed a host-side edge, and the mail wizard was the last
+ * caller keeping them alive. That left one box able to end up with two edge
+ * implementations, a certbot on the host that only mail's cert step used, and a
+ * second copy of the conflict handling. `ensureContainerEdge` below still converts
+ * a PRE-EXISTING host OpenResty (bare→container), which is how boxes installed
+ * before this move come across.
+ */
+export async function installContainerEdge(
   executor: CommandExecutor,
   onLog: SystemLogCallback,
+  config?: InstallerConfig,
 ): Promise<InstallResult> {
-  const profile = await resolveEnvironment(executor);
-  const plan = systemCatalog.installs.certbot(profile);
-  if (!plan.supported || !plan.installCommand || !plan.verifyCommand) {
-    return { component: "certbot", success: false, error: plan.unsupportedReason ?? "Certbot install not supported" };
+  // Elevate: `docker` may need sudo, and the host state dirs live under /var/lib
+  // and /etc.
+  const prep = await prepareExecutor(executor, "edge");
+  if (!prep.ok) return prep.result;
+  executor = prep.executor;
+
+  if (!(await dockerAvailable(executor))) {
+    const error =
+      "The edge is a container image and needs Docker on this server. " +
+      "Install the Docker component first, then install the edge.";
+    onLog(log(error, "error"));
+    return { component: "edge", success: false, error };
   }
 
-  onLog(log("Installing certbot..."));
   try {
-    const { code } = await executor.streamExec(plan.installCommand, onLog as (log: LogEntry) => void);
-    if (code !== 0) return { component: "certbot", success: false, error: "Certbot installation failed" };
-
-    const version = await executor.exec(plan.verifyCommand);
-    const parsed = systemCatalog.checks.certbot.parseVersion(version);
-    onLog(log(`Certbot ${parsed} installed`));
-    return { component: "certbot", success: true, version: parsed };
+    const result = await ensureContainerEdge(executor, {
+      onLog,
+      config,
+      image: config?.edgeImage,
+    });
+    if (result.converted) {
+      onLog(log("Edge moved from host OpenResty to the container edge", "warn"));
+    }
+    const version = await executor
+      .exec(containerCommand(result.container, "openresty -v 2>&1"))
+      .catch(() => "");
+    return {
+      component: "edge",
+      success: true,
+      version: version ? systemCatalog.checks.openresty.parseVersion(version) : undefined,
+    };
   } catch (err) {
+    // The migrate signal must reach the caller (which runs the takeover
+    // orchestration) — don't swallow it into a failed InstallResult.
+    if (err instanceof EdgeMigrateRequested) throw err;
     const msg = safeErrorMessage(err);
-    onLog(log(`Certbot installation failed: ${msg}`, "error"));
-    return { component: "certbot", success: false, error: msg };
-  }
-}
-
-// ─── OpenResty ───────────────────────────────────────────────────────────────
-
-export async function installOpenResty(
-  executor: CommandExecutor,
-  onLog: SystemLogCallback,
-): Promise<InstallResult> {
-  const profile = await resolveEnvironment(executor);
-  onLog(log(describeEnvironment(profile)));
-  const plan = systemCatalog.installs.openresty(profile);
-  if (!plan.supported || !plan.installCommand || !plan.verifyCommand) {
-    return { component: "openresty", success: false, error: plan.unsupportedReason ?? "OpenResty install not supported" };
-  }
-
-  onLog(log("Installing OpenResty..."));
-  try {
-    // Stop existing if present
-    const hasIt = await executor.exec("command -v openresty >/dev/null 2>&1 && echo y || echo n").then((r) => r.trim() === "y");
-    if (hasIt) {
-      onLog(log("Stopping existing OpenResty..."));
-      await execSafe(executor, "systemctl stop openresty 2>/dev/null || true");
-      await execSafe(executor, "pkill -f '[o]penresty' 2>/dev/null || true");
-    }
-
-    if (profile.packageManager === "apt") {
-      await ensureAptReady(executor, onLog);
-    }
-
-    // Install package
-    const { code } = await executor.streamExec(plan.installCommand, onLog as (log: LogEntry) => void);
-    if (code !== 0) return { component: "openresty", success: false, error: "OpenResty installation failed" };
-
-    // Stop auto-started instance, write our config, then start
-    await execSafe(executor, "systemctl stop openresty 2>/dev/null || true");
-    await execSafe(executor, "pkill -f '[o]penresty' 2>/dev/null || true");
-    await execSafe(executor, "systemctl reset-failed openresty 2>/dev/null || true");
-
-    const paths = await detectOpenRestyPaths(executor);
-    await ensureOpenRestyConfig(executor, paths);
-
-    // Validate config
-    onLog(log("Validating config..."));
-    const { code: testCode } = await executor.streamExec(`${paths.bin} -t 2>&1`, onLog as (log: LogEntry) => void);
-    if (testCode !== 0) {
-      return { component: "openresty", success: false, error: "OpenResty config invalid - see logs above" };
-    }
-
-    // Start service
-    if (plan.startCommand) {
-      onLog(log("Starting OpenResty..."));
-      const start = await executor.streamExec(plan.startCommand, onLog as (log: LogEntry) => void);
-      if (start.code !== 0) {
-        onLog(log("Start failed - clearing port 80...", "warn"));
-        await execSafe(executor, "fuser -k 80/tcp 2>/dev/null || true");
-        await execSafe(executor, "systemctl reset-failed openresty 2>/dev/null || true");
-        const retry = await executor.streamExec(plan.startCommand, onLog as (log: LogEntry) => void);
-        if (retry.code !== 0) {
-          const journal = await executor.exec(
-            "journalctl -xeu openresty.service --no-pager -n 30 2>/dev/null || echo '(unavailable)'",
-          ).catch(() => "(could not read journal)");
-          onLog(log(`Service journal:\n${journal}`, "error"));
-          return { component: "openresty", success: false, error: "OpenResty installed but failed to start" };
-        }
-      }
-    }
-
-    // Reload, deploy scripts, verify
-    await executor.exec(buildReloadCommand(paths));
-    onLog(log("Deploying analytics scripts..."));
-    await deployLuaScripts(executor, paths);
-
-    const version = await executor.exec(plan.verifyCommand);
-    const parsed = systemCatalog.checks.openresty.parseVersion(version);
-    onLog(log(`OpenResty ${parsed} installed`));
-    return { component: "openresty", success: true, version: parsed };
-  } catch (err) {
-    const msg = safeErrorMessage(err);
-    onLog(log(`OpenResty installation failed: ${msg}`, "error"));
-    return { component: "openresty", success: false, error: msg };
+    onLog(log(`Edge setup failed: ${msg}`, "error"));
+    return { component: "edge", success: false, error: msg };
   }
 }
 
@@ -273,13 +404,18 @@ export async function uninstallRsync(
   executor: CommandExecutor,
   onLog: SystemLogCallback,
 ): Promise<InstallResult> {
-  const profile = await resolveEnvironment(executor);
-  const cmd = buildRemoveCommand(profile.packageManager, ["rsync"]);
-  if (!cmd) return { component: "rsync", success: false, error: "rsync removal not supported" };
+  const prep = await prepareExecutor(executor, "rsync");
+  if (!prep.ok) return prep.result;
+  executor = prep.executor;
+  const cmd = removeCommand(prep.profile, ["rsync"]);
+  if (!cmd.supported) {
+    onLog(log(cmd.reason, "error"));
+    return { component: "rsync", success: false, error: cmd.reason };
+  }
 
   onLog(log("Removing rsync..."));
   try {
-    const { code } = await executor.streamExec(cmd, onLog as (log: LogEntry) => void);
+    const { code } = await executor.streamExec(cmd.value, onLog as (log: LogEntry) => void);
     if (code !== 0) return { component: "rsync", success: false, error: "rsync removal failed" };
     onLog(log("rsync removed"));
     return { component: "rsync", success: true };
@@ -289,77 +425,32 @@ export async function uninstallRsync(
   }
 }
 
-export async function uninstallCertbot(
+export async function uninstallEdge(
   executor: CommandExecutor,
   onLog: SystemLogCallback,
 ): Promise<InstallResult> {
-  const profile = await resolveEnvironment(executor);
-  const cmd = buildRemoveCommand(profile.packageManager, ["certbot"]);
-  if (!cmd) return { component: "certbot", success: false, error: "Certbot removal not supported" };
+  const prep = await prepareExecutor(executor, "edge");
+  if (!prep.ok) return prep.result;
+  executor = prep.executor;
 
-  onLog(log("Removing certbot..."));
-  try {
-    const { code } = await executor.streamExec(cmd, onLog as (log: LogEntry) => void);
-    if (code !== 0) return { component: "certbot", success: false, error: "Certbot removal failed" };
-    onLog(log("Certbot removed"));
-    return { component: "certbot", success: true };
-  } catch (err) {
-    const msg = safeErrorMessage(err);
-    return { component: "certbot", success: false, error: msg };
+  // `fresh`: we are about to REMOVE it, so a stale positive would `docker rm` a
+  // name that no longer exists and report success over an untouched box.
+  const container = await resolveOurEdgeContainer(executor, { fresh: true }).catch(() => null);
+  if (!container) {
+    onLog(log("No edge container on this server — nothing to remove."));
+    return { component: "edge", success: true };
   }
-}
 
-export async function uninstallOpenResty(
-  executor: CommandExecutor,
-  onLog: SystemLogCallback,
-): Promise<InstallResult> {
-  const profile = await resolveEnvironment(executor);
-
-  try {
-    // 1. Stop
-    onLog(log("Stopping OpenResty..."));
-    await execSafe(executor, "systemctl stop openresty 2>/dev/null || true");
-    await execSafe(executor, "pkill -f '[o]penresty' 2>/dev/null || true");
-    await execSafe(executor, "fuser -k 80/tcp 2>/dev/null || true");
-
-    // 2. Remove package
-    const removeCmd = buildRemoveCommand(profile.packageManager, ["openresty"]);
-    if (removeCmd) {
-      if (profile.packageManager === "apt") {
-        await ensureAptReady(executor, onLog);
-      }
-      onLog(log("Removing OpenResty package..."));
-      const { code } = await executor.streamExec(removeCmd, onLog as (log: LogEntry) => void);
-      if (code !== 0) return { component: "openresty", success: false, error: "Package removal failed" };
-    }
-
-    // 3. Clean up leftover files
-    onLog(log("Cleaning up files..."));
-    let paths: OpenRestyPaths;
-    try {
-      paths = await detectOpenRestyPaths(executor);
-    } catch {
-      paths = OPENRESTY_DEFAULT_PATHS;
-    }
-    const root = paths.bin.includes("/openresty/") ? paths.bin.replace(/\/bin\/[^/]+$/, "") : "/usr/local/openresty";
-
-    await execSafe(executor, [
-      `rm -rf ${root}`,
-      `rm -rf ${paths.confDir}`,
-      "rm -rf /etc/openresty",
-      "rm -rf /usr/local/openresty",
-      "rm -f /etc/apt/sources.list.d/openresty.list",
-      "rm -f /usr/share/keyrings/openresty.gpg",
-      "rm -f /etc/yum.repos.d/openresty.repo",
-    ].join(" && "));
-
-    onLog(log("OpenResty removed"));
-    return { component: "openresty", success: true };
-  } catch (err) {
-    const msg = safeErrorMessage(err);
-    onLog(log(`OpenResty removal failed: ${msg}`, "error"));
-    return { component: "openresty", success: false, error: msg };
-  }
+  onLog(log(`Removing the edge container ${container}...`));
+  // Clear the restart policy first, or the daemon brings it straight back.
+  await execSafe(executor, `docker update --restart=no ${sq(container)} 2>/dev/null || true`);
+  await execSafe(executor, `docker rm -f ${sq(container)} 2>/dev/null || true`);
+  invalidateEdgeContainer(executor);
+  // Certs and vhosts stay on the host on purpose — same rule as the compose
+  // uninstall: issued certificates outlive a reinstall, and /etc/letsencrypt may be
+  // shared with the mail server. Removing them is the operator's call.
+  onLog(log("Edge removed. Certificates and vhosts were left on the host."));
+  return { component: "edge", success: true };
 }
 
 // ─── Removal support check ──────────────────────────────────────────────────
@@ -368,14 +459,11 @@ export async function getRemovalSupport(
   executor: CommandExecutor,
   componentName: string,
 ): Promise<{ supported: boolean; reason?: string }> {
+  // The edge is a container: removal needs the daemon, not a package manager.
+  if (componentName === "edge") return { supported: true };
   const profile = await resolveEnvironment(executor);
-  if (profile.os !== "linux" && componentName === "openresty") {
-    return { supported: false, reason: "OpenResty removal only supported on Linux" };
-  }
-  const cmd = buildRemoveCommand(profile.packageManager, [componentName]);
-  return cmd
-    ? { supported: true }
-    : { supported: false, reason: `No package manager to remove ${componentName}` };
+  const cmd = removeCommand(profile, [componentName]);
+  return cmd.supported ? { supported: true } : { supported: false, reason: cmd.reason };
 }
 
 // ─── Registry ────────────────────────────────────────────────────────────────
@@ -387,15 +475,15 @@ type InstallerFn = (
 ) => Promise<InstallResult>;
 
 export const COMPONENT_INSTALLERS: Record<string, InstallerFn> = {
-  docker: (exec, log) => installDocker(exec, log),
-  openresty: (exec, log) => installOpenResty(exec, log),
-  certbot: (exec, log) => installCertbot(exec, log),
+  docker: (exec, log, config) => installDocker(exec, log, config),
+  // The edge is ONE component and it is a container image — there is no
+  // host-OpenResty or host-certbot installer to reach for any more.
+  edge: (exec, log, config) => installContainerEdge(exec, log, config),
   git: (exec, log) => installGit(exec, log),
   rsync: (exec, log) => installRsync(exec, log),
 };
 
 export const COMPONENT_UNINSTALLERS: Record<string, InstallerFn> = {
-  openresty: (exec, log) => uninstallOpenResty(exec, log),
-  certbot: (exec, log) => uninstallCertbot(exec, log),
+  edge: (exec, log) => uninstallEdge(exec, log),
   rsync: (exec, log) => uninstallRsync(exec, log),
 };

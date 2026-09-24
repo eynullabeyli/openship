@@ -9,7 +9,12 @@
  */
 
 import { and, eq, inArray, lt, or, sql } from "drizzle-orm";
-import { generateId } from "@repo/core";
+import {
+  generateId,
+  parseSourceAccessScope,
+  serializeSourceAccessScope,
+  type SourceAccessScope,
+} from "@repo/core";
 import type { Database } from "../client";
 import { invitationPendingGrant } from "../schema/invitation-pending-grant";
 import { invitation } from "../schema/organization";
@@ -23,6 +28,9 @@ export interface InvitationPendingGrant {
   resourceType: ResourceType;
   resourceId: string;
   permissions: Permission[];
+  /** Carried through acceptance so materialization preserves the inviter's
+   *  chosen source access. `undefined` = metadata only. */
+  scope?: SourceAccessScope;
 }
 
 function rowToGrant(row: InvitationPendingGrantRow): InvitationPendingGrant {
@@ -31,7 +39,7 @@ function rowToGrant(row: InvitationPendingGrantRow): InvitationPendingGrant {
     const parsed = JSON.parse(row.permissionsJson);
     if (Array.isArray(parsed)) {
       permissions = parsed.filter(
-        (p): p is Permission => p === "read" || p === "write" || p === "admin",
+        (p): p is Permission => p === "read" || p === "write" || p === "admin" || p === "create",
       );
     }
   } catch {
@@ -43,10 +51,11 @@ function rowToGrant(row: InvitationPendingGrantRow): InvitationPendingGrant {
     resourceType: row.resourceType as ResourceType,
     resourceId: row.resourceId,
     permissions,
+    scope: parseSourceAccessScope(row.scopeJson),
   };
 }
 
-export function createInvitationPendingGrantRepo(db: Database) {
+export function createInvitationPendingGrantRepo(db: Pick<Database, "select" | "insert" | "delete">) {
   return {
     /** List all pending grants for one invitation. */
     async listByInvitation(invitationId: string): Promise<InvitationPendingGrant[]> {
@@ -63,14 +72,17 @@ export function createInvitationPendingGrantRepo(db: Database) {
       resourceType: ResourceType;
       resourceId: string;
       permissions: Permission[];
+      scope?: SourceAccessScope | null;
     }): Promise<InvitationPendingGrant> {
       const id = generateId("pgnt");
+      const scopeJson = serializeSourceAccessScope(input.scope);
       await db.insert(invitationPendingGrant).values({
         id,
         invitationId: input.invitationId,
         resourceType: input.resourceType,
         resourceId: input.resourceId,
         permissionsJson: JSON.stringify(input.permissions),
+        scopeJson,
       });
       return {
         id,
@@ -78,6 +90,9 @@ export function createInvitationPendingGrantRepo(db: Database) {
         resourceType: input.resourceType,
         resourceId: input.resourceId,
         permissions: input.permissions,
+        // Round-trip through the serialiser so the returned value is exactly what
+        // was stored (normalised, malformed rules dropped), not the raw input.
+        scope: parseSourceAccessScope(scopeJson),
       };
     },
 

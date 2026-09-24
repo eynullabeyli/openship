@@ -4,6 +4,7 @@ import { rateLimiter } from "../../middleware/rate-limiter";
 import { secureRouter } from "../../lib/secure-router";
 import { cloudSessionAuth } from "./cloud-session-auth";
 import * as saas from "./cloud-saas.controller";
+import { cloudResourceProxy, cloudRouteRegistry } from "./cloud-resource.controller";
 
 /** SaaS-only cloud routes. */
 const r = secureRouter(new Hono(), {
@@ -24,6 +25,11 @@ r.public("post", "/connect-authorize", { reason: "Connect authorize - cookie ses
 r.use("/exchange-code", rateLimiter);
 r.public("post", "/exchange-code", { reason: "OAuth code exchange - validated by single-use code, not session" }, saas.exchangeCode);
 
+// Device/poll flow: a headless CLI (over SSH) polls here with its unguessable
+// `state` to pick up its one-time PKCE code — no browser redirect to the box.
+r.use("/connect-poll", rateLimiter);
+r.public("get", "/connect-poll", { reason: "Device-flow poll - CLI retrieves its one-time PKCE code by unguessable state; no session" }, saas.connectPoll);
+
 r.use("/token", cloudSessionAuth);
 r.post("/token", { tag: "cloud:write" }, saas.getToken);
 
@@ -37,7 +43,14 @@ r.use("/preflight", cloudSessionAuth);
 r.post("/preflight", { tag: "cloud:write" }, saas.preflight);
 
 r.use("/edge-proxy", cloudSessionAuth);
+r.use("/edge-proxy/*", cloudSessionAuth);
 r.post("/edge-proxy", { tag: "cloud:write" }, saas.syncEdgeProxy);
+r.post("/edge-proxy/delete", { tag: "cloud:write" }, saas.deleteEdgeProxy);
+// Target verification. `cloud:write` deliberately: these MUTATE upstream state
+// (issue a challenge, run a probe), and the route scanner makes a POST with a
+// read tag boot-fatal. Covered by the /edge-proxy/* auth above.
+r.post("/edge-proxy/verify", { tag: "cloud:write" }, saas.requestEdgeVerification);
+r.post("/edge-proxy/verify-check", { tag: "cloud:write" }, saas.checkEdgeVerification);
 
 r.use("/analytics", cloudSessionAuth);
 r.post("/analytics", { tag: "cloud:write" }, saas.analyticsProxy);
@@ -48,6 +61,11 @@ r.post("/pages", { tag: "cloud:write" }, saas.pagesProxy);
 r.post("/pages/disable", { tag: "cloud:write" }, saas.pagesDisable);
 r.post("/pages/enable", { tag: "cloud:write" }, saas.pagesEnable);
 r.post("/pages/delete", { tag: "cloud:write" }, saas.pagesDelete);
+
+r.use("/resource-proxy", cloudSessionAuth, rateLimiter, bodyLimit({ maxSize: 256_000 }));
+r.post("/resource-proxy", { tag: "cloud:write" }, cloudResourceProxy);
+r.use("/route-registry", cloudSessionAuth);
+r.get("/route-registry", { tag: "cloud:read" }, cloudRouteRegistry);
 
 r.use("/send-invitation", cloudSessionAuth);
 r.post("/send-invitation", { tag: "cloud:write" }, saas.sendInvitation);
@@ -90,7 +108,7 @@ r.post("/teardown-project", { tag: "cloud:admin" }, saas.teardownProjectHandler)
 // directly from github.com / from a popup with no SaaS session cookie.
 // Auth is a single-use random token in the URL. Register these BEFORE
 // the cloudSessionAuth middleware so it isn't gated.
-r.public("get", "/github/install-callback", { reason: "GitHub App install callback - validated by state token in URL" }, saas.githubInstallCallback);
+r.public("get", "/github/install-callback", { reason: "GitHub App install callback - durable state plus GitHub user/App verification" }, saas.githubInstallCallback);
 r.public("get", "/github/oauth-bridge", { reason: "GitHub OAuth bridge redirect - validated by state token, no session" }, saas.githubOauthBridge);
 r.public("get", "/github/oauth-success", { reason: "GitHub OAuth success page - validated by single-use token in URL" }, saas.githubOauthSuccess);
 
@@ -102,4 +120,3 @@ r.post("/github/installation-token", { tag: "cloud:write" }, saas.githubInstalla
 r.get("/github/user-status", { tag: "cloud:read" }, saas.githubUserStatus);
 
 export const cloudSaasRoutes = r.hono;
-

@@ -6,6 +6,8 @@
  */
 
 import { contextBridge, ipcRenderer } from "electron";
+// Type-only: erased at compile time, so this never becomes a runtime require.
+import type { RendererConfigKey } from "../main/security";
 let onboardingUtils: {
   isPrivateIp?: typeof import("@repo/onboarding").isPrivateIp;
   validateServerAddress?: typeof import("@repo/onboarding").validateServerAddress;
@@ -22,12 +24,15 @@ contextBridge.exposeInMainWorld("desktop", {
   /** Whether the app is running inside Electron */
   isDesktop: true,
 
-  /** Persistent config store */
+  /**
+   * Persistent config store — update preferences only (see RENDERER_CONFIG_KEYS
+   * in main/security.ts, which enforces the key allowlist). No `getAll`: the same
+   * store holds SSH credentials and tunnel tokens.
+   */
   config: {
-    get: (key: string) => ipcRenderer.invoke("config:get", key),
-    set: (key: string, value: unknown) =>
+    get: (key: RendererConfigKey) => ipcRenderer.invoke("config:get", key),
+    set: (key: RendererConfigKey, value: unknown) =>
       ipcRenderer.invoke("config:set", key, value),
-    getAll: () => ipcRenderer.invoke("config:getAll"),
   },
 
   /** App metadata */
@@ -37,9 +42,6 @@ contextBridge.exposeInMainWorld("desktop", {
     cloudUrls: () => ipcRenderer.invoke("app:cloud-urls"),
     localUrls: () => ipcRenderer.invoke("app:local-urls"),
   },
-
-  /** Navigation */
-  navigate: (url: string) => ipcRenderer.invoke("navigate", url),
 
   /** Onboarding helpers */
   onboarding: {
@@ -73,17 +75,16 @@ contextBridge.exposeInMainWorld("desktop", {
     browseFile: () => ipcRenderer.invoke("onboarding:browse-file"),
   },
 
-  /** System utilities */
+  /**
+   * System utilities. SSH credentials are deliberately absent — there is no read
+   * or write channel for them (see the note in main/index.ts); the dashboard goes
+   * through the API under a real session.
+   */
   system: {
     /** Native folder picker - returns absolute path or null */
     browseFolder: () => ipcRenderer.invoke("system:browse-folder"),
-
-    /** Get local system settings (SSH creds, etc.) */
-    getSettings: () => ipcRenderer.invoke("system:get-settings"),
-
-    /** Update local system settings (partial merge) */
-    updateSettings: (settings: Record<string, unknown>) =>
-      ipcRenderer.invoke("system:update-settings", settings),
+    /** Native file picker for an SSH key - returns absolute path or null */
+    browseFile: () => ipcRenderer.invoke("system:browse-file"),
   },
 
   /** Cloud connection from settings (reconnect without onboarding side-effects) */
@@ -99,9 +100,11 @@ contextBridge.exposeInMainWorld("desktop", {
 
   /** In-app updater (drives the update window). */
   updates: {
-    /** Begin download + install of the pending update. */
+    /** Read the shared release snapshot, or refresh it on an explicit check. */
+    check: (force = false) => ipcRenderer.invoke("update:check", force === true),
+    /** Begin download + install of the pending update (re-checks if none staged). */
     start: () => ipcRenderer.invoke("update:start"),
-    /** Open (or focus) the native update window for the pending update. */
+    /** Open the native update window (re-checks + stages if none pending). */
     open: () => ipcRenderer.invoke("update:open"),
     /** Dismiss / close the update window ("Later"). */
     dismiss: () => ipcRenderer.invoke("update:dismiss"),
@@ -122,6 +125,44 @@ contextBridge.exposeInMainWorld("desktop", {
       const h = (_e: unknown, msg: string) => cb(msg);
       ipcRenderer.on("update:error", h);
       return () => ipcRenderer.removeListener("update:error", h);
+    },
+  },
+
+  /**
+   * Window controls for the app's own header bar (see DesktopChrome in the
+   * dashboard). macOS keeps its native traffic lights, so only Windows/Linux
+   * actually render buttons — but the whole surface is exposed on every platform
+   * so the renderer never has to branch on process.platform.
+   */
+  window: {
+    minimize: () => ipcRenderer.invoke("window:minimize"),
+    /** Maximize, or restore if already maximized. */
+    toggleMaximize: () => ipcRenderer.invoke("window:toggle-maximize"),
+    close: () => ipcRenderer.invoke("window:close"),
+    isMaximized: (): Promise<boolean> => ipcRenderer.invoke("window:is-maximized"),
+
+    /** Titlebar navigation. canGoBack/canGoForward can only be answered by the
+     *  main process — see the note on the IPC handlers. */
+    back: () => ipcRenderer.invoke("window:nav-back"),
+    forward: () => ipcRenderer.invoke("window:nav-forward"),
+    reload: () => ipcRenderer.invoke("window:reload"),
+    navState: (): Promise<{ canGoBack: boolean; canGoForward: boolean }> =>
+      ipcRenderer.invoke("window:nav-state"),
+    /** Only route to DevTools on Windows/Linux — those are frameless and have no
+     *  menu bar. macOS also has Electron's default View menu. */
+    toggleDevTools: () => ipcRenderer.invoke("window:toggle-devtools"),
+    onNavStateChange: (cb: (s: { canGoBack: boolean; canGoForward: boolean }) => void) => {
+      const h = (_e: unknown, s: { canGoBack: boolean; canGoForward: boolean }) => cb(s);
+      ipcRenderer.on("window:nav-state-change", h);
+      return () => ipcRenderer.removeListener("window:nav-state-change", h);
+    },
+    /** Track real maximize state so the restore icon can't drift out of sync
+     *  (the window can also be maximized by the OS, a double-click, or a
+     *  keyboard shortcut — none of which go through toggleMaximize). */
+    onMaximizedChange: (cb: (maximized: boolean) => void) => {
+      const h = (_e: unknown, maximized: boolean) => cb(maximized);
+      ipcRenderer.on("window:maximized-change", h);
+      return () => ipcRenderer.removeListener("window:maximized-change", h);
     },
   },
 

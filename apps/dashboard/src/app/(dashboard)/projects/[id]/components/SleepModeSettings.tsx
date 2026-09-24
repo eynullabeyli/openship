@@ -37,7 +37,7 @@ export const SleepModeSettings: React.FC<SleepModeSettingsProps> = ({
     <div className="bg-card rounded-2xl border border-border/50 p-6">
       <div className="flex items-center gap-3 mb-5">
         <div className="w-10 h-10 bg-primary/10 rounded-xl flex items-center justify-center border border-primary/20">
-          {generateIcon('preferences-95-1658432731.png', 24, 'hsl(var(--primary))')}
+          {generateIcon('preferences-95-1658432731.png', 24, 'var(--primary)')}
         </div>
         <div>
           <h3 className="text-lg font-semibold text-foreground">{t.projectSettings.sleep.title}</h3>
@@ -71,7 +71,7 @@ export const SleepModeSettings: React.FC<SleepModeSettingsProps> = ({
               <p className={`text-sm font-semibold ${selectedMode === 'auto_sleep' ? 'text-foreground' : 'text-foreground'}`}>
                 {t.projectSettings.sleep.autoSleep}
               </p>
-              <span className="px-1.5 py-0.5 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 text-[9px] font-semibold rounded-full">
+              <span className="px-1.5 py-0.5 bg-success-bg text-success text-[9px] font-semibold rounded-full">
                 {t.projectSettings.sleep.recommended}
               </span>
             </div>
@@ -119,12 +119,12 @@ export const SleepModeSettings: React.FC<SleepModeSettingsProps> = ({
       </div>
 
       {/* Info Box */}
-      <div className="mt-4 p-3 bg-amber-500/10 border border-amber-500/20 rounded-xl">
+      <div className="mt-4 p-3 bg-warning-bg border border-warning-border rounded-xl">
         <div className="flex items-start gap-2">
-          {generateIcon('info%20circle-16-1662452248.png', 16, 'hsl(var(--primary))')}
+          {generateIcon('info%20circle-16-1662452248.png', 16, 'var(--primary)')}
           <div>
-            <p className="text-xs font-semibold text-amber-700 dark:text-amber-300 mb-0.5">{t.projectSettings.sleep.infoTitle}</p>
-            <p className="text-sm text-amber-700/80 dark:text-amber-300/80 leading-relaxed">
+            <p className="text-xs font-semibold text-warning mb-0.5">{t.projectSettings.sleep.infoTitle}</p>
+            <p className="text-sm text-warning/80 leading-relaxed">
               {t.projectSettings.sleep.infoBefore}
               <span className="font-semibold">{t.projectSettings.sleep.infoEmphasis}</span>
               {t.projectSettings.sleep.infoAfter}

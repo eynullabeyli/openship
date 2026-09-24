@@ -24,6 +24,7 @@ import { SidebarToggle } from '../ui/sidebar-toggle';
 import { PricingDialog } from '../ui/pricing-dialog';
 import { clearBulkSelectionAtom } from './use-mail';
 import { useThreads } from '@/hooks/use-threads';
+import { useMailRefresh } from '@/hooks/use-mail-refresh';
 import { useIsMobile } from '@/hooks/use-mobile';
 import { Button } from '@/components/ui/button';
 import { useSession } from '@/lib/auth-client';
@@ -318,6 +319,7 @@ export function MailLayout() {
   const isMobile = useIsMobile();
   const navigate = useNavigate();
   const { data: session, isPending } = useSession();
+  useMailRefresh(!!session?.user);
   const prevFolderRef = useRef(folder);
   const { enableScope, disableScope } = useHotkeysContext();
   const { data: activeConnection } = useActiveConnection();

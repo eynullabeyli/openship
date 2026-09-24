@@ -12,9 +12,9 @@
 
 import { randomUUID, randomBytes, createHash, timingSafeEqual } from "node:crypto";
 import { db, schema, repos, eq } from "@repo/db";
-import { encrypt } from "./encryption";
-import { provisionUser } from "./provision-user";
-import { cloudRuntimeTarget, env } from "../config/env";
+import { encrypt } from "@repo/platform/engine/lib/encryption";
+import { provisionUser } from "@repo/platform/engine/lib/provision-user";
+import { cloudRuntimeTarget, env } from "@repo/platform/engine/config/env";
 import { safeErrorMessage } from "@repo/core";
 
 export interface CloudUser {
@@ -85,7 +85,7 @@ async function storeCloudSession(userId: string, cloudSessionToken: string): Pro
       cloudSessionToken: encrypted,
     });
   }
-  const { invalidateCloudCaches } = await import("./cloud/session");
+  const { invalidateCloudCaches } = await import("@repo/platform/engine/lib/cloud/session");
   await invalidateCloudCaches(userId);
 }
 
@@ -181,6 +181,7 @@ async function generateHandoffCode(
   user: CloudUser,
   sessionToken: string,
   codeChallenge?: string,
+  state?: string,
 ): Promise<string> {
   // Lazy purge — cheap, runs at most once per minute via inserts.
   await repos.cloudHandoffCode.purgeExpired().catch(() => undefined);
@@ -197,9 +198,22 @@ async function generateHandoffCode(
     },
     sessionToken,
     codeChallenge: codeChallenge ?? null,
+    // Recorded so the device/poll flow can retrieve this code by `state`.
+    state: state ?? null,
     expiresAt: new Date(Date.now() + HANDOFF_TTL_MS),
   });
   return code;
+}
+
+/**
+ * Device/poll flow: look up the one-time code minted for a CLI-generated
+ * `state`. Returns the opaque code (still PKCE-locked + one-time at exchange)
+ * or null while the user hasn't approved yet / after TTL. NON-destructive so
+ * the CLI can poll idempotently.
+ */
+async function findHandoffCodeByState(state: string): Promise<string | null> {
+  const row = await repos.cloudHandoffCode.findByState(state).catch(() => null);
+  return row?.code ?? null;
 }
 
 /**
@@ -585,6 +599,7 @@ export async function buildAuthHandoff(opts: {
     },
     opts.session.session.token,
     opts.codeChallenge || undefined,
+    opts.state || undefined,
   );
 
   const url = new URL(opts.redirect.toString());
@@ -597,6 +612,7 @@ export {
   mirrorCloudUser,
   storeCloudSession,
   generateHandoffCode,
+  findHandoffCodeByState,
   exchangeHandoffCode,
   exchangeCodeWithCloud,
   registerDesktopNonce,

@@ -9,10 +9,24 @@ import React, {
   useRef,
   useMemo,
 } from "react";
+import type { ReleaseSource, WorkloadType } from "@repo/core";
 import { useRouter } from "next/navigation";
 import { useI18n } from "@/components/i18n-provider";
+import { usePlatform } from "@/context/PlatformContext";
 import { projectsApi, servicesApi, type Service } from "@/lib/api";
-import { PROJECT_INFO_NOT_FOUND, useProjectInfo } from "@/hooks/useProjectEndpoints";
+import {
+  invalidateProjectCachesFor,
+  PROJECT_INFO_NOT_FOUND,
+  useProjectInfo,
+} from "@/hooks/useProjectEndpoints";
+import type { ActiveMigration } from "@/utils/project-status";
+import { dedupeServerLogs } from "./server-log-dedup";
+import {
+  projectEnvironmentIds,
+  reconcileCreatedProjectEnvironment,
+  removeProjectEnvironment,
+} from "./project-environments";
+import { beginServicesFetch, failServicesFetch } from "./services-fetch-state";
 
 interface ProjectDomain {
   domain: string;
@@ -20,10 +34,26 @@ interface ProjectDomain {
   [key: string]: any;
 }
 
+/** The server-computed canonical access URL (see api resolveProjectAccess).
+ *  `url` is a full href, `host` the bare display hostname, `urls` every public
+ *  href (primary first). The single source of truth for "where does this
+ *  project live" across the sidebar and the Domains card. */
+export interface ProjectAccess {
+  url: string | null;
+  host: string | null;
+  kind: "custom" | "free" | "local" | "none";
+  isLocal: boolean;
+  urls: string[];
+}
+
 interface ProjectOptions {
   buildCommand?: string;
   outputDirectory?: string;
   productionPaths?: string;
+  /** Declared persistent mounts; null = inheriting the framework's defaults. */
+  volumes?: string[] | null;
+  /** What a deploy would actually mount (declaration OR framework default). */
+  resolvedVolumes?: string[];
   installCommand?: string;
   startCommand?: string;
   productionPort?: string;
@@ -41,19 +71,52 @@ interface BasicProjectData {
   framework: string;
   options?: ProjectOptions;
   domains?: ProjectDomain[];
+  access?: ProjectAccess;
   buildImage?: string;
   hasMultipleServices?: boolean;
   serviceCount?: number;
   activeDeploymentId?: string | null;
-  deployTarget?: "cloud" | "server" | "local";
+  /** Operator switch, derived server-side from `disabled_at` (enrichProject). */
+  enabled?: boolean;
+  /**
+   * WHY the routes didn't sync, in the server's own words (`routeIssuesWarning`), or null.
+   *
+   * The routing banner carried ONE hardcoded sentence — about a free `.opsh.io` URL failing to
+   * route through Openship Cloud's edge — and showed it for every cause, including custom
+   * domains merely waiting on a certificate. The accurate sentence was already computed
+   * server-side and written to the deployment meta; it just had no way through to the UI.
+   */
+  routingWarning?: string | null;
+  /**
+   * The in-flight migration run for this project, or null (server-side
+   * `readActiveMigration`). Typed here rather than left to the interface's index signature
+   * because it drives BOTH the status pill and whether the Advanced tab shows the migration
+   * session — a run is part of the project's state, not something a panel fetches.
+   */
+  activeMigration?: ActiveMigration | null;
+  deployTarget?: "cloud" | "server" | "local" | "cluster";
+  clusterId?: string | null;
+  clusterConfig?: import("@repo/core").ClusterWorkloadConfig | null;
   cloudWorkspaceId?: string | null;
   deletedAt?: string | null;
   packageManager?: string;
+  /** Source metadata for prebuilt release/image projects. */
+  releaseSource?: ReleaseSource | null;
+  /**
+   * Push auto-deploy, straight from the `auto_deploy` column — the same field
+   * the push webhook handler gates on. Typed here (not left to the index
+   * signature) because the Overview reads it: the Source tab's `gitData` mirror
+   * is only fetched when that tab mounts, which is why Overview used to show
+   * "off" for projects whose pushes were deploying. `webhookActive` is the
+   * server-derived companion: whether GitHub has a delivery path at all.
+   */
+  autoDeploy?: boolean;
+  webhookActive?: boolean;
+  webhookStrategy?: "app" | "domain" | "repo" | "none" | null;
   /** How many recent versions retain their build artifact for rollback (snapshot strategy). null = instance default. */
   rollbackWindow?: number | null;
   [key: string]: any;
 }
-
 
 interface DomainsData {
   domains: any[];
@@ -94,19 +157,31 @@ interface ProjectEnvironment {
   activeDeploymentId: string | null;
   latestDeploymentStatus: string | null;
   primaryDomain: string | null;
+  // App axis: version instead of git branch (null for git projects).
+  version?: string | null;
+  isApp?: boolean;
+  gitProvider?: string | null;
 }
 
 interface BuildData {
   buildCommand: string;
   outputDirectory: string;
   productionPaths: string;
+  volumes: string[] | null;
+  resolvedVolumes: string[];
   installCommand: string;
   startCommand: string;
   productionPort: string;
   buildImage: string;
   rootDirectory: string;
+  /** Explicit compose file location; "" when the root is detected normally. */
+  composePath: string;
   hasBuild: boolean;
   hasServer: boolean;
+  /** Resolved runtime workload (#538). Flows in from `projectData.options`
+   *  (getInfo sets it). A worker shares `hasServer=false` with a static site;
+   *  only this distinguishes "runs a process" from "edge-served files". */
+  workloadType?: WorkloadType;
   isLoading: boolean;
   error: string | null;
 }
@@ -118,6 +193,8 @@ const BUILD_OPTION_DEFAULTS = {
   buildCommand: "",
   outputDirectory: ".",
   productionPaths: "",
+  volumes: null as string[] | null,
+  resolvedVolumes: [] as string[],
   installCommand: "bun install",
   startCommand: "npm start",
   productionPort: "",
@@ -142,6 +219,18 @@ interface ServicesData {
   services: Service[];
   isLoading: boolean;
   error: string | null;
+}
+
+interface ProjectTab {
+  id: string;
+  label: string;
+  icon: string;
+  /** Sections keep their existing routes inside a shared navigation group. */
+  sections?: { id: string; label: string }[];
+}
+
+function findTabGroup(tabs: ProjectTab[], tabId: string) {
+  return tabs.find((tab) => tab.id === tabId || tab.sections?.some((section) => section.id === tabId));
 }
 
 interface ProjectSettingsContextType {
@@ -201,18 +290,28 @@ interface ProjectSettingsContextType {
     gitBranch?: string;
     sourceMode?: "branch" | "manual";
   }) => Promise<ProjectEnvironment | null>;
+  /** Apply a confirmed server-side deletion to the shared list and caches. */
+  removeEnvironment: (environmentId: string) => void;
   domain: string;
+  /** The canonical access URL — server-computed, correct for service-scoped-only
+   *  projects and target-aware for the localhost fallback. What display surfaces
+   *  (sidebar, Domains card) should read instead of deriving their own. */
+  access: ProjectAccess;
   /** Shared domain selection driving the overview URL + analytics (multi-domain projects). */
   selectedDomain: string;
   setSelectedDomain: (domain: string) => void;
   slug?: string[]; // Optional array for catch-all routes
   activeTab: string;
+  activeTabGroup: string;
   setActiveTab: (tab: string) => void;
-  tabs: { id: string; label: string; icon: string }[];
+  /** One-shot intent from the sidebar's "Add domain" affordance: the Domains
+   *  tab opens its add-domain form on arrival, then clears it back to null. */
+  pendingDomainAction: "add" | null;
+  setPendingDomainAction: (action: "add" | null) => void;
+  tabs: ProjectTab[];
 }
 
 const ProjectSettingsContext = createContext<ProjectSettingsContextType | undefined>(undefined);
-
 
 interface ProviderProps {
   children: ReactNode;
@@ -228,6 +327,9 @@ export const ProjectSettingsProvider: React.FC<ProviderProps> = ({
   initialProjectData,
 }) => {
   const { t } = useI18n();
+  // Mirrors the API's `isServerHost` (= platform target "selfhosted"), which is
+  // exactly the gate on the health-watch job that feeds the Health tab.
+  const { isServerHost } = usePlatform();
   const [projectData, setProjectData] = useState<BasicProjectData>(
     initialProjectData || {
       id: "",
@@ -323,6 +425,16 @@ export const ProjectSettingsProvider: React.FC<ProviderProps> = ({
       initialProjectData || { id: "", slug: "", name: "", description: "", framework: "" },
     );
     setEnvironments([]);
+    // gitData too: it is fetched ONCE per GitSettings mount, so without this the
+    // previous project's repo, branch, commits and auto-deploy state stayed on
+    // screen under project B's name until B's Source tab fetch landed.
+    setGitData({
+      repository: null,
+      branch: "",
+      recentCommits: [],
+      isLoading: false,
+      error: null,
+    });
   }, [id, initialProjectData]);
 
   // 404 cold-load: the project was deleted (other tab, force flow, direct
@@ -352,6 +464,9 @@ export const ProjectSettingsProvider: React.FC<ProviderProps> = ({
       ...projectData.options,
       // buildImage lives at top-level on the project, not in options.
       buildImage: projectData.buildImage || "node:22",
+      // Same — a top-level column. Shown read-only; edited through the deploy
+      // wizard, since changing it has to re-scan the repo for services.
+      composePath: projectData.composePath || "",
       isLoading: isLoadingProjectInfo,
       error: projectInfoError,
     }),
@@ -375,19 +490,61 @@ export const ProjectSettingsProvider: React.FC<ProviderProps> = ({
     [projectData.domains],
   );
 
-  // Shared domain selection driving the overview URL + analytics: the sidebar
-  // switcher writes it, OverviewTab/MonitoringTab read it to refetch per-domain.
-  // Defaults to the primary and snaps back to it when the current pick drops out
-  // of the project's domains. (The /logs view keeps its own separate selection.)
-  const [selectedDomain, setSelectedDomain] = useState("");
-  useEffect(() => {
-    const available = (projectData.domains || [])
-      .map((d: any) => d?.domain)
-      .filter((d: unknown): d is string => typeof d === "string" && d.length > 0);
-    setSelectedDomain((current) =>
-      current && available.includes(current) ? current : domain,
-    );
-  }, [domain, projectData.domains]);
+  // The canonical access URL. Server-computed (resolveProjectAccess) is the
+  // truth; the fallback below is the ONE remaining client derivation, kept only
+  // for cloud version-skew — an older SaaS getInfo won't send `access`. It
+  // mirrors the server precedence: a verified domain wins; else localhost only
+  // when the project is purely local; else "none" (never a misleading localhost).
+  const access = useMemo<ProjectAccess>(() => {
+    if (projectData.access) return projectData.access;
+
+    const rows = (projectData.domains || []) as any[];
+    const verified = rows.filter((d) => d?.verified);
+    const primary = verified.find((d) => d.primary || d.isPrimary) ?? verified[0] ?? null;
+    if (primary) {
+      const host = String(primary.domain || primary.hostname || "").trim();
+      if (host) {
+        const urls = Array.from(
+          new Set(
+            [primary, ...verified.filter((d) => d !== primary)]
+              .map((d) => String(d.domain || d.hostname || "").trim())
+              .filter(Boolean),
+          ),
+        ).map((h) => `https://${h}`);
+        return {
+          url: `https://${host}`,
+          host,
+          kind: primary.domainType === "custom" ? "custom" : "free",
+          isLocal: false,
+          urls,
+        };
+      }
+    }
+
+    const target = projectData.cloudWorkspaceId
+      ? "cloud"
+      : (projectData as any).serverId
+        ? "server"
+        : (projectData.deployTarget ?? "local");
+    if (target === "local") {
+      const port = Number((projectData as any).port ?? projectData.options?.productionPort) || 3000;
+      const host = `localhost:${port}`;
+      return { url: `http://${host}`, host, kind: "local", isLocal: true, urls: [] };
+    }
+    return { url: null, host: null, kind: "none", isLocal: false, urls: [] };
+  }, [projectData]);
+
+  // Derive the default during render: a parent effect runs after its children
+  // and would let Overview start an expensive unscoped analytics request first.
+  // Keep explicit choices tied to the project, and use the primary if removed.
+  const [domainChoice, setDomainChoice] = useState<{ projectId: string; domain: string } | null>(null);
+  const availableDomains = projectData.id === id ? projectData.domains ?? [] : [];
+  const selectedDomain = projectData.id !== id ? "" :
+    domainChoice?.projectId === id && availableDomains.some((d) => d.domain === domainChoice.domain)
+      ? domainChoice.domain : domain;
+  const setSelectedDomain = useCallback((domain: string) => {
+    setDomainChoice({ projectId: id, domain });
+  }, [id]);
 
   // Derived: do we have multi-service rendering paths to enable?
   // projectData hint OR serviceCount > 1 OR loaded services > 1.
@@ -449,11 +606,21 @@ export const ProjectSettingsProvider: React.FC<ProviderProps> = ({
 
   // Fetch git
   const isLoadingGitRef = useRef(false);
+  // True once git info has loaded for the CURRENT project. Re-opening the Source
+  // tab remounts GitSettings and re-calls refreshGit; without this that flashed
+  // the skeleton on every visit even though the context already had the data.
+  // Now a re-open refreshes in the BACKGROUND (data stays visible). Reset on id
+  // change so a different project still shows the skeleton once.
+  const gitLoadedRef = useRef(false);
+  useEffect(() => {
+    gitLoadedRef.current = false;
+  }, [id]);
   const refreshGit = useCallback(async () => {
     try {
       if (isLoadingGitRef.current) return;
       isLoadingGitRef.current = true;
-      setGitData((prev) => ({ ...prev, isLoading: true, error: null }));
+      // Only the first load shows the skeleton; later refreshes update in place.
+      setGitData((prev) => ({ ...prev, isLoading: !gitLoadedRef.current, error: null }));
 
       if (!id) {
         setGitData((prev) => ({ ...prev, isLoading: false }));
@@ -476,6 +643,10 @@ export const ProjectSettingsProvider: React.FC<ProviderProps> = ({
         setGitData({
           repository: {
             name: `${response.owner}/${response.repo}`,
+            // `full_name` is the GitHub-canonical field the Source tab's
+            // auto-deploy switch gates on; without it that control was hidden
+            // for every git project.
+            full_name: `${response.owner}/${response.repo}`,
             provider: "GitHub",
             url: `https://github.com/${response.owner}/${response.repo}`,
           },
@@ -532,6 +703,9 @@ export const ProjectSettingsProvider: React.FC<ProviderProps> = ({
       }));
     } finally {
       isLoadingGitRef.current = false;
+      // Fetch attempt completed for this project → subsequent refreshGit calls
+      // (tab re-open, post-action refresh) update in the background, no skeleton.
+      gitLoadedRef.current = true;
     }
   }, [id]);
 
@@ -579,11 +753,14 @@ export const ProjectSettingsProvider: React.FC<ProviderProps> = ({
     null,
   );
   const servicesRequestIdRef = useRef(0);
+  /** Which project the list in `servicesData` belongs to. null = holds nothing. */
+  const servicesLoadedIdRef = useRef<string | null>(null);
 
   const refreshServices = useCallback(async () => {
     if (!id || id === "undefined") {
       servicesRequestIdRef.current += 1;
       servicesRequestRef.current = null;
+      servicesLoadedIdRef.current = null;
       setServicesData({ services: [], isLoading: false, error: null });
       return [];
     }
@@ -597,28 +774,30 @@ export const ProjectSettingsProvider: React.FC<ProviderProps> = ({
 
     let promise!: Promise<Service[]>;
     promise = (async () => {
-      setServicesData((prev) => ({ ...prev, isLoading: true, error: null }));
+      const loadedId = servicesLoadedIdRef.current;
+      setServicesData((prev) => beginServicesFetch(prev, loadedId, id));
+
+      const fail = () => {
+        if (servicesRequestIdRef.current !== requestId) return;
+        setServicesData((prev) => failServicesFetch(prev, loadedId, id));
+        if (loadedId !== id) servicesLoadedIdRef.current = null;
+      };
 
       try {
         const response = await servicesApi.list(id);
-        const services = response.success ? (response.services ?? []) : [];
+        if (!response.success) {
+          fail();
+          return [];
+        }
+        const services = response.services ?? [];
         if (servicesRequestIdRef.current === requestId) {
-          setServicesData({
-            services,
-            isLoading: false,
-            error: response.success ? null : "Failed to load services",
-          });
+          servicesLoadedIdRef.current = id;
+          setServicesData({ services, isLoading: false, error: null });
         }
         return services;
       } catch (error) {
         console.error("Failed to fetch project services:", error);
-        if (servicesRequestIdRef.current === requestId) {
-          setServicesData({
-            services: [],
-            isLoading: false,
-            error: "Failed to load services",
-          });
-        }
+        fail();
         return [];
       } finally {
         if (servicesRequestRef.current?.promise === promise) {
@@ -631,12 +810,13 @@ export const ProjectSettingsProvider: React.FC<ProviderProps> = ({
     return promise;
   }, [id]);
 
-  const refreshEnvironments = useCallback(async () => {
-    if (!id) return;
+  const fetchEnvironments = useCallback(async (): Promise<ProjectEnvironment[]> => {
+    if (!id) return [];
     const response = await projectsApi.getEnvironments(id);
-    if (response.success) {
-      setEnvironments(response.data || []);
+    if (!response.success) {
+      throw new Error("Failed to refresh environments");
     }
+    return (response.data || []) as ProjectEnvironment[];
   }, [id]);
 
   const createEnvironment = useCallback(
@@ -652,10 +832,30 @@ export const ProjectSettingsProvider: React.FC<ProviderProps> = ({
       if (!response.success || !response.data) {
         throw new Error(response.error || "Failed to create environment");
       }
-      await refreshEnvironments();
-      return response.data as ProjectEnvironment;
+      const created = response.data as ProjectEnvironment;
+      await reconcileCreatedProjectEnvironment({
+        currentId: id,
+        environments,
+        created,
+        refresh: fetchEnvironments,
+        commit: setEnvironments,
+        invalidate: invalidateProjectCachesFor,
+        onRefreshError: (error) =>
+          console.warn("Failed to reconcile project environments after create", error),
+      });
+
+      return created;
     },
-    [id, refreshEnvironments],
+    [environments, fetchEnvironments, id],
+  );
+
+  const removeEnvironment = useCallback(
+    (environmentId: string) => {
+      const remaining = removeProjectEnvironment(environments, environmentId);
+      setEnvironments(remaining);
+      invalidateProjectCachesFor(projectEnvironmentIds(environmentId, environments));
+    },
+    [environments],
   );
 
   // Terminal Logs Management
@@ -695,76 +895,27 @@ export const ProjectSettingsProvider: React.FC<ProviderProps> = ({
     }));
   }, []);
 
-  // Server Logs Management
-  const MAX_SERVER_LOGS = 100;
-
-  const getServerLogKey = useCallback((log: any) => {
-    if (!log || typeof log !== "object") return String(log);
-    const parsedTimestamp =
-      typeof log.timestamp === "string" ? Date.parse(log.timestamp) : Number.NaN;
-    const timestampKey = Number.isFinite(parsedTimestamp)
-      ? Math.floor(parsedTimestamp / 1000)
-      : String(log.timestamp ?? "");
-
-    return [
-      timestampKey,
-      log.ip,
-      log.method,
-      log.path,
-      log.statusCode,
-      log.responseTime,
-      log.requestSize,
-      log.responseSize,
-    ].join("|");
+  // Server Logs Management — dedup/sort logic lives in ./server-log-dedup (pure, unit-tested).
+  const addServerLog = useCallback((log: any) => {
+    setServerLogsData((prev) => ({
+      ...prev,
+      logs: dedupeServerLogs([log, ...prev.logs]),
+    }));
   }, []);
 
-  const dedupeServerLogs = useCallback(
-    (logs: any[]) => {
-      const seen = new Set<string>();
-      const merged: any[] = [];
+  const mergeServerLogs = useCallback((logs: any[]) => {
+    setServerLogsData((prev) => ({
+      ...prev,
+      logs: dedupeServerLogs([...prev.logs, ...logs]),
+    }));
+  }, []);
 
-      for (const log of logs) {
-        const key = getServerLogKey(log);
-        if (seen.has(key)) continue;
-        seen.add(key);
-        merged.push(log);
-        if (merged.length >= MAX_SERVER_LOGS) break;
-      }
-
-      return merged;
-    },
-    [getServerLogKey],
-  );
-
-  const addServerLog = useCallback(
-    (log: any) => {
-      setServerLogsData((prev) => ({
-        ...prev,
-        logs: dedupeServerLogs([log, ...prev.logs]),
-      }));
-    },
-    [dedupeServerLogs],
-  );
-
-  const mergeServerLogs = useCallback(
-    (logs: any[]) => {
-      setServerLogsData((prev) => ({
-        ...prev,
-        logs: dedupeServerLogs([...prev.logs, ...logs]),
-      }));
-    },
-    [dedupeServerLogs],
-  );
-
-  const setServerLogs = useCallback(
-    (logs: any[]) => {
-      setServerLogsData((prev) => ({
-        ...prev,
-        logs: dedupeServerLogs(logs),
-      }));
-    },
-    [dedupeServerLogs],
-  );
+  const setServerLogs = useCallback((logs: any[]) => {
+    setServerLogsData((prev) => ({
+      ...prev,
+      logs: dedupeServerLogs(logs),
+    }));
+  }, []);
 
   const clearServerLogs = useCallback(() => {
     setServerLogsData((prev) => ({
@@ -808,23 +959,59 @@ export const ProjectSettingsProvider: React.FC<ProviderProps> = ({
     return tab || undefined; // let default be set by tab list below
   };
 
-  const tabs = useMemo(() => {
+  const tabs = useMemo<ProjectTab[]>(() => {
     const tl = t.projects.sidebar.tabs;
-    return [
+    const all = [
       { id: "overview", label: tl.overview, icon: "setting-100-1658432731.png" },
+      { id: "topology", label: tl.topology, icon: "layers.png" },
       { id: "services", label: tl.services, icon: "layers.png" },
       { id: "domains", label: tl.domains, icon: "server-59-1658435258.png" },
       { id: "deployments", label: tl.deployments, icon: "heart%20rate-118-1658433496.png" },
-      { id: "source", label: tl.source, icon: "git%20branch-159-1658431404.png" },
-      { id: "runtime", label: tl.runtime, icon: "setting-40-1662364403.png" },
+      { id: "health", label: tl.health, icon: "heart%20rate-118-1658433496.png" },
+      // Shown on cloud AND self-hosted, deliberately: both halves of the tab work
+      // in both modes through adapters that already exist — resource usage via
+      // RuntimeAdapter.getUsage (dockerode | Oblien metrics) and visitor geography
+      // via the traffic-source resolver (OpenResty mgmt API | Oblien analytics).
+      { id: "monitoring", label: tl.monitoring, icon: "chart-1658432731.png" },
+      {
+        id: "source",
+        label: tl.sourceAndTriggers,
+        icon: "git%20branch-159-1658431404.png",
+        sections: [
+          { id: "source", label: tl.source },
+          { id: "webhooks", label: tl.webhooks },
+        ],
+      },
       { id: "logs", label: tl.logs, icon: "terminal-184-1658431404.png" },
       { id: "backup", label: tl.backup, icon: "database.png" },
-      { id: "advanced", label: tl.advanced, icon: "error%20triangle-81-1658234612.png" },
+      {
+        id: "runtime",
+        label: tl.settings,
+        icon: "setting-40-1662364403.png",
+        sections: [
+          { id: "runtime", label: tl.runtime },
+          { id: "advanced", label: tl.advanced },
+        ],
+      },
     ];
-  }, [t]);
+    const isCloud = projectData.deployTarget === "cloud";
+    return all.filter((tab) => {
+      // Configuration also owns shared project environment for service projects.
+      // Health is fed by the self-hosted container health watch, so it needs BOTH
+      // halves to be true: the control plane has to be the always-on self-hosted
+      // one that runs the watch job (not SaaS, not desktop), and the workload has
+      // to be a container we can poll (Oblien exposes no stability probe).
+      if (tab.id === "health" && (!isServerHost || isCloud)) return false;
+      // Source & Triggers is available on cloud too. Webhook job actions and
+      // the self-hosted webhook-domain picker remain gated inside their section.
+      return true;
+    });
+  }, [t, projectData.deployTarget, isServerHost]);
 
   const defaultTab = tabs[0].id;
   const [activeTab, setActiveTab] = useState(resolveTab(slug?.[0]) || defaultTab);
+  const activeTabGroup = findTabGroup(tabs, activeTab)?.id || defaultTab;
+  const [pendingDomainAction, setPendingDomainAction] = useState<"add" | null>(null);
 
   useEffect(() => {
     void refreshServices();
@@ -835,8 +1022,7 @@ export const ProjectSettingsProvider: React.FC<ProviderProps> = ({
   useEffect(() => {
     const resolved = resolveTab(slugTab) || defaultTab;
     // If the resolved tab isn't valid for this project type, fall back to default
-    const validIds = tabs.map((t) => t.id);
-    const target = validIds.includes(resolved) ? resolved : defaultTab;
+    const target = findTabGroup(tabs, resolved) ? resolved : defaultTab;
     if (target !== activeTab) {
       setActiveTab(target);
     }
@@ -882,12 +1068,17 @@ export const ProjectSettingsProvider: React.FC<ProviderProps> = ({
       id,
       environments,
       createEnvironment,
+      removeEnvironment,
       domain,
+      access,
       selectedDomain,
       setSelectedDomain,
       slug,
       activeTab,
+      activeTabGroup,
       setActiveTab,
+      pendingDomainAction,
+      setPendingDomainAction,
       tabs,
     }),
     [
@@ -919,10 +1110,15 @@ export const ProjectSettingsProvider: React.FC<ProviderProps> = ({
       id,
       environments,
       createEnvironment,
+      removeEnvironment,
       domain,
+      access,
       selectedDomain,
+      setSelectedDomain,
       slug,
       activeTab,
+      activeTabGroup,
+      pendingDomainAction,
       tabs,
     ],
   );
@@ -931,6 +1127,9 @@ export const ProjectSettingsProvider: React.FC<ProviderProps> = ({
     <ProjectSettingsContext.Provider value={value}>{children}</ProjectSettingsContext.Provider>
   );
 };
+
+/** Service panels can also be opened from a server, outside the project route tree. */
+export const useOptionalProjectSettings = () => useContext(ProjectSettingsContext);
 
 export const useProjectSettings = () => {
   const context = useContext(ProjectSettingsContext);

@@ -1,0 +1,75 @@
+---
+title: Connections and access
+description: Authenticate, select an installation, manage tokens, and call HTTP endpoints.
+---
+
+The CLI stores named **contexts** in `~/.openship/config.json`. Each context contains an API URL,
+dashboard URL, and personal access token. One context is active at a time.
+
+## Log in
+
+```bash
+openship login \
+  --api-url https://ship.example.com \
+  --dashboard-url https://ship.example.com \
+  --context production
+```
+
+The CLI opens the dashboard token page and prompts for a token. For scripts, pass
+`--token "$OPENSHIP_TOKEN"`. Login validates the token before storing it and selects the context.
+The local default API is `http://localhost:4000`; the local dashboard default is `http://localhost:3001`.
+
+## Switch contexts
+
+```bash
+openship context list
+openship context use production
+openship status
+```
+
+`context add` stores endpoints and a token without validating them. Use `login` when you want
+validation. `context rm` removes an inactive context. `logout` clears a token while keeping its endpoints.
+
+```bash
+openship logout --context production
+```
+
+See the [context](/docs/cli/reference/context), [login](/docs/cli/reference/login), and
+[logout](/docs/cli/reference/logout) references for all options.
+
+## Create a token
+
+Choose explicit access for each token:
+
+```bash
+openship token create deploy-bot --grant project:proj_123:read,write
+openship token create report-reader --read-only --expires 30 --full-access
+openship token list
+```
+
+Pass either `--grant` or `--full-access`; omitting both is refused. A full-access token acts with your
+own permissions. Scoped credentials cannot mint unrestricted credentials.
+
+Copy a new token's secret when it is created; later reads show only metadata. Revoke by token ID:
+
+```bash
+openship token revoke pat_123
+```
+
+See [token options](/docs/cli/reference/token) and [permission scopes](/docs/security/permissions).
+
+## Call an HTTP endpoint
+
+```bash
+openship api /projects
+openship api /domains --query projectId=proj_123
+```
+
+Paths are relative to `/api`. Use `--method` to select a method and `--data` for a JSON body; supplying
+data defaults the method to POST. Responses are printed, and non-success HTTP results exit nonzero.
+See [raw API options](/docs/cli/reference/api) and the [HTTP reference](/docs/api).
+
+## Native mode
+
+Contexts describe remote HTTP connections. [Native mode](/docs/cli/native) uses an explicitly trusted
+configuration file to select an owned installation and identity.

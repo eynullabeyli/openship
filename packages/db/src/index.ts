@@ -1,28 +1,50 @@
 // ─── Database client ─────────────────────────────────────────────────────────
-export { db, getDriver, getPgPool, closeDb, type Database, type Driver } from "./client";
+export { db, getDriver, getPgPool, closeDb, type Database, type DatabaseTransaction, type Driver } from "./client";
+// The dev hot-reload contract: shutdown must free the PGlite lock inside the
+// successor's takeover grace, or every reload hard-kills the DB mid-close.
+export { DEV_LOCK_TAKEOVER_GRACE_MS, isDevWatchReload } from "./pglite-lock";
 
 // ─── Advisory locking (cross-process serialization) ──────────────────────────
-export { withAdvisoryLock, hashStringToInt } from "./advisory-lock";
+export {
+  withAdvisoryLock,
+  tryAcquireAdvisoryLock,
+  hashStringToInt,
+  type AdvisoryLockHandle,
+} from "./advisory-lock";
 
 // ─── Schema (table definitions) ──────────────────────────────────────────────
 export * as schema from "./schema";
-export type { ComposeServiceSpec } from "./schema/service";
+export type { ComposeServiceSpec, ServicePublicEndpoint } from "./schema/service";
+export type { ServerContainerDetail } from "./schema/server-container-status";
+export type {
+  IncomingWebhookActionType,
+  IncomingWebhookActionConfig,
+  IncomingWebhookAuthMode,
+} from "./schema/incoming-webhook";
+export { INCIDENT_KINDS, type IncidentKind } from "./schema/service-incident";
+export { RESOURCE_BUCKET_MINUTES, SINGLE_APP_SERVICE_KEY } from "./schema/resource-usage";
 
 // ─── Dump / restore (team-mode migration + project transfer) ─────────────────
 export {
   dumpSubgraph,
+  countInstanceSubgraphTables,
   restoreSubgraph,
+  restoreSubgraphInTransaction,
+  assertActiveDeploymentOwnership,
   deleteProjectSubgraph,
   dumpDatabase,
   restoreDatabase,
   DUMP_FORMAT_VERSION,
   PkCollisionError,
   ENCRYPTED_COLUMNS,
+  EXCLUDED_TABLES,
+  topoOrderedTables,
   stripEncryptedInPlace,
   type DatabaseDump,
   type DumpOptions,
   type RestoreOptions,
   type SubgraphScope,
+  type TableSpec,
 } from "./dump";
 
 // ─── Repositories (all DB access goes through here) ──────────────────────────
@@ -32,8 +54,11 @@ export {
   createSessionRepo,
   createAccountRepo,
   createGitInstallationRepo,
-  createProjectAppRepo,
+  createGitSourceRepo,
+  createProjectGroupRepo,
   createProjectRepo,
+  createCloudDockerWorkspaceRepo,
+  type CloudDockerWorkspace,
   createDeploymentRepo,
   createDomainRepo,
   createServiceRepo,
@@ -42,9 +67,19 @@ export {
   normalizeRoutingFields,
   toComposeSpec,
   composeSpecsEqual,
+  reconcileComposeSpec,
+  unresolvedComposeEnvironmentKeys,
   composeSpecDiff,
   createSettingsRepo,
   createServerRepo,
+  createServerClusterRepo,
+  type ServerClusterRecord,
+  type ClusterVerificationRecord,
+  type ManagedNetworkOperationRecord,
+  createNetworkPreparationRepo,
+  type NetworkPreparationRecord,
+  createServerGithubAuthRepo,
+  createGithubDeployKeyRepo,
   createServerTunnelRepo,
   createAnalyticsRepo,
   createTerminalSessionRepo,
@@ -55,8 +90,10 @@ export {
   type Account,
   type GitInstallation,
   type NewGitInstallation,
-  type ProjectApp,
-  type NewProjectApp,
+  type GitSource,
+  type NewGitSource,
+  type ProjectGroup,
+  type NewProjectGroup,
   type Project,
   type NewProject,
   type EnvVar,
@@ -67,6 +104,13 @@ export {
   type NewBuildSession,
   type Domain,
   type NewDomain,
+  type DnsCredential,
+  type NewDnsCredential,
+  type Credential,
+  type NewCredential,
+  type MailInboundRule,
+  type NewMailInboundRule,
+  type MailInboundScope,
   type Service,
   type NewService,
   type ServiceDeployment,
@@ -80,6 +124,10 @@ export {
   type NewUserSettings,
   type Server,
   type NewServer,
+  type ServerGithubAuth,
+  type NewServerGithubAuth,
+  type GithubDeployKey,
+  type NewGithubDeployKey,
   type ServerTunnel,
   type NewServerTunnel,
   type ServerAnalyticsRow,
@@ -101,13 +149,32 @@ export {
   type NewBackupRestore,
   type BackupRunStatus,
   type BackupRestoreStatus,
+  type PolicyLastRunSummary,
+  type DockerMigrationRun,
+  type NewDockerMigrationRun,
+  type DockerMigrationStatus,
   type Member,
   type MemberRole,
   type Invitation,
   type AuditEvent,
   type NewAuditEvent,
+  createJobRunRepo,
+  type JobRun,
+  type NewJobRun,
+  createJobRepo,
+  type Job,
+  type NewJob,
   type OrphanedResource,
   type NewOrphanedResource,
+  createHostPortClaimRepo,
+  HostPortClaimConflictError,
+  HOST_PORT_QUARANTINE_OWNER,
+  type HostPortClaim,
+  type NewHostPortClaim,
+  type HostPortTargetKey,
+  type HostPortClaimIdentity,
+  type HostPortClaimOwner,
+  type PruneHostPortClaimsInput,
   type ResourceGrant,
   type Permission,
   type ResourceType,
@@ -121,6 +188,23 @@ export {
   type NotificationDelivery,
   type ChannelKind,
   type DeliveryStatus,
+  createUpdateStatusRepo,
+  type UpdateStatus,
+  type NewUpdateStatus,
+  createServerContainerStatusRepo,
+  type ServerContainerStatus,
+  type NewServerContainerStatus,
+  type ServerContainerComponent,
+  type IncomingWebhook,
+  type NewIncomingWebhook,
+  type WebhookDelivery,
+  type EdgeTargetVerification,
+  createServiceIncidentRepo,
+  incidentSeverity,
+  type ServiceIncident,
+  type NewServiceIncident,
+  type ResourceUsageRow,
+  type NewResourceUsage,
 } from "./repos";
 
 // ─── Drizzle operators (re-exported for convenience) ─────────────────────────
@@ -146,3 +230,8 @@ export {
   sql,
   count,
 } from "drizzle-orm";
+export * from "./project-transfer";
+
+export { createComputeClusterRepo, type ComputeClusterRecord } from "./repos/compute-cluster.repo";
+export { createClusterRuntimeRepo, type ClusterRuntimeRecord } from "./repos/cluster-runtime.repo";
+export { createClusterDatabaseRepo, type ClusterDatabaseRecord } from "./repos/cluster-database.repo";

@@ -3,10 +3,12 @@
  * control plane on the user's Node — no monorepo, no bun, no external Postgres.
  *
  * Produces apps/cli/dist/server/:
- *   index.js       the API as one node-runnable bundle (@repo/* + deps inlined;
- *                  cpu-features left external — ssh2 guards it and falls back)
+ *   index.js       the API as one node-runnable bundle (@repo/* + deps inlined,
+ *                  EXCEPT the SSH/Docker native stack — see `external` below)
  *   pglite/        pglite.wasm + pglite.data → OPENSHIP_PGLITE_ASSETS_DIR
  *   migrations/    drizzle .sql → OPENSHIP_MIGRATIONS_DIR
+ *   engine/        iRedMail engine tree → MAIL_SERVER_ENGINE_DIR (mail-server install source)
+ *   lua/           OpenResty scripts read by openresty-lua.ts relative to its own bundled path
  *
  * Runs (under bun) after tsup, since tsup's `clean` wipes dist first. This only
  * runs at build/publish time in the monorepo; the published package ships the
@@ -30,7 +32,13 @@ const result = await Bun.build({
   target: "node",
   outdir: OUT,
   naming: "index.js",
-  external: ["cpu-features"],
+  // ssh2 + dockerode MUST stay external and load from the installed package's
+  // node_modules (they're runtime `dependencies` of the CLI). Bundling them
+  // mangles ssh2's dynamic cipher/KEX `require()`s and dockerode's transport,
+  // so a bundled build hangs at the SSH handshake / Docker socket-forward
+  // (works under `bun dev` only because that loads them unbundled). cpu-features
+  // is ssh2's optional native dep — external + optional, ssh2 falls back.
+  external: ["cpu-features", "ssh2", "dockerode"],
 });
 if (!result.success) {
   console.error("[stage-server] API bundle failed:");
@@ -53,5 +61,23 @@ for (const file of ["pglite.wasm", "pglite.data"]) {
 
 cpSync(join(REPO_ROOT, "packages/db/drizzle"), join(OUT, "migrations"), { recursive: true });
 
+// iRedMail engine → dist/server/engine. mail.service.ts packs this tree and
+// streams it to the target VPS during mail-server setup; its default path
+// resolves relative to apps/api's cwd (monorepo dev), which the bundled CLI
+// doesn't have, so up.ts pins MAIL_SERVER_ENGINE_DIR at this staged copy.
+const engineSrc = join(REPO_ROOT, "apps/email/engine");
+if (!existsSync(join(engineSrc, "iRedMail.sh"))) {
+  console.error(`[stage-server] iRedMail engine missing or incomplete: ${join(engineSrc, "iRedMail.sh")}`);
+  process.exit(1);
+}
+cpSync(engineSrc, join(OUT, "engine"), {
+  recursive: true,
+  filter: (src) => !src.endsWith("/.DS_Store"),
+});
+
+// openresty-lua.ts resolves LUA_SRC_DIR relative to its own bundled module path
+// (dist/server/index.js after bundling), i.e. it expects dist/server/lua/*.lua.
+cpSync(join(REPO_ROOT, "packages/adapters/src/infra/lua"), join(OUT, "lua"), { recursive: true });
+
 const mb = (statSync(join(OUT, "index.js")).size / 1024 / 1024).toFixed(1);
-console.log(`[stage-server] staged API bundle → dist/server (${mb} MB) + pglite + migrations`);
+console.log(`[stage-server] staged API bundle → dist/server (${mb} MB) + pglite + migrations + engine + lua`);

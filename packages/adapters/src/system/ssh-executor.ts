@@ -1,23 +1,73 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createReadStream } from "node:fs";
 import { mkdtemp, rm as fsRm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join, posix } from "node:path";
 
 import { prepareSourceTarArgs } from "../archive";
-import type {
-  CommandExecutor,
-  LogEntry,
-  ShellOptions,
-  ShellSession,
-  SshConfig,
-} from "../types";
+import type { CommandExecutor, LogEntry, ShellOptions, ShellSession, SshConfig } from "../types";
 import { logEntry, sq } from "./local-shell";
-import { canUseRemoteRsync, extractRemoteArchive, packLocalArchive, uploadFileWithRsync } from "./remote-transfer";
-import type { Client as SshClient, SFTPWrapper } from "ssh2";
+import {
+  canUseRemoteRsync,
+  extractRemoteArchive,
+  packLocalArchive,
+  uploadFileWithRsync,
+} from "./remote-transfer";
+import type { Client as SshClient, ClientChannel, SFTPWrapper } from "ssh2";
 import type { Readable, Duplex } from "node:stream";
-import { connectSshClient, openSftp, openSshUnixSocket, type StreamLocalCapableClient } from "./ssh-client";
-import { SshDisconnectedError } from "./errors";
+import {
+  connectSshClient,
+  openSftp,
+  openSshUnixSocket,
+  openDockerDialStdioChannel,
+  type StreamLocalCapableClient,
+} from "./ssh-client";
+import {
+  commandForError,
+  isSshExecRequestError,
+  SshDisconnectedError,
+  SshExecRequestError,
+} from "./errors";
 import { TRANSFER_EXCLUDES, formatBytes } from "@repo/core";
+
+/**
+ * `dirname` for a path on the TARGET box, which is Linux — so always POSIX,
+ * never the control plane's native separators. A backslash reaching SSH is an
+ * ordinary filename character there: the file lands in the login shell's cwd
+ * under that literal name instead of the directory it was meant to name.
+ *
+ * The plain `join` above is the other namespace — LOCAL staging paths under
+ * tmpdir, where native separators are correct.
+ */
+const remoteDirname = posix.dirname;
+
+/** File operations are small control-plane payloads (state, vhosts, app
+ * config), not bulk transfers.  No ssh2 callback may own a deployment lock
+ * forever if the channel loses a reply. */
+const SFTP_OPERATION_TIMEOUT_MS = 30_000;
+/** Give ssh2 a short graceful-close window before destroying the transport.
+ * Destruction is the bounded fallback that guarantees the remote SFTP process
+ * can no longer receive mutations before the deployment lock is released. */
+const CHANNEL_CLOSE_GRACE_MS = 750;
+const TRANSPORT_CLOSE_GRACE_MS = 250;
+
+/**
+ * ssh2 exposes SSH_MSG_CHANNEL_FAILURE for an exec request as one untyped
+ * sentinel. Tag it while we still know the error came from `Client.exec`'s
+ * pre-stream callback; matching later would confuse remote command stderr with
+ * a command that never started.
+ */
+function tagExecRequestError(error: Error): Error {
+  return error.message === "Unable to exec" ? new SshExecRequestError(error) : error;
+}
+
+function abortError(operation: string, signal: AbortSignal): Error {
+  const reason = signal.reason;
+  const suffix = reason instanceof Error && reason.message ? `: ${reason.message}` : "";
+  const error = new Error(`SSH ${operation} cancelled${suffix}`);
+  error.name = "AbortError";
+  return error;
+}
 
 /** Clamp a window dimension to a sane range to avoid garbage values
  *  reaching ssh2.Client.shell() / channel.setWindow(). */
@@ -33,10 +83,21 @@ function clampWindow(value: number | undefined, fallback: number, min: number, m
 export class SshExecutor implements CommandExecutor {
   private client: SshClient | null = null;
   private connecting: Promise<SshClient> | null = null;
+  /** One shared SFTP subsystem channel per client — see sftp(). */
+  private sftpChannel: Promise<SFTPWrapper> | null = null;
+  private sftpWrapper: SFTPWrapper | null = null;
+  /** All requests cancelled on one shared channel join the same close/reset
+   * barrier, so the second listener cannot miss the first listener's `close`
+   * event and needlessly wait for the force-reset deadline. */
+  private readonly sftpQuiescence = new WeakMap<SFTPWrapper, Promise<void>>();
   private readonly config: SshConfig;
+  /** Deployment cancellation belongs to an async call tree, not to this pooled
+   * executor instance.  AsyncLocalStorage prevents one deployment from making
+   * unrelated users of the same SSH connection inherit its signal. */
+  private readonly abortScope = new AsyncLocalStorage<AbortSignal>();
   /** Subscribers notified when the transport drops (see onDisconnect). */
   private readonly disconnectListeners = new Set<(err: Error) => void>();
-  /** In-flight cancelable ops — each entry aborts ONE exec/stream on a drop,
+  /** In-flight cancelable ops — each entry aborts ONE exec/stream/SFTP request on a drop,
    *  so a dead channel fails fast instead of hanging to its command timeout. */
   private readonly inflight = new Set<(err: Error) => void>();
   /** Reverse-forward handlers keyed by the remote bound port (see reverseForward). */
@@ -51,16 +112,73 @@ export class SshExecutor implements CommandExecutor {
     this.config = config;
   }
 
-  private async connect(): Promise<SshClient> {
-    if (this.client) return this.client;
-    if (this.connecting) return this.connecting;
+  runWithAbortSignal<T>(signal: AbortSignal, fn: () => Promise<T>): Promise<T> {
+    if (signal.aborted) return Promise.reject(abortError("operation", signal));
+    return this.abortScope.run(signal, async () => {
+      this.throwIfAborted("operation");
+      return fn();
+    });
+  }
 
-    this.connecting = (async () => {
+  private operationSignal(): AbortSignal | undefined {
+    return this.abortScope.getStore();
+  }
+
+  private throwIfAborted(operation: string, signal = this.operationSignal()): void {
+    if (signal?.aborted) throw abortError(operation, signal);
+  }
+
+  private resolvedSignal(explicit?: AbortSignal): AbortSignal | undefined {
+    const ambient = this.operationSignal();
+    if (!explicit || explicit === ambient) return ambient ?? explicit;
+    if (!ambient) return explicit;
+    return AbortSignal.any([explicit, ambient]);
+  }
+
+  /** A handshake is already bounded by ssh2's readyTimeout.  A deployment
+   * cancellation may stop waiting sooner because no remote mutation can have
+   * started before connect() resolves; the shared attempt is left alive for an
+   * unrelated/following caller instead of tearing down pooled state. */
+  private awaitConnection(attempt: Promise<SshClient>): Promise<SshClient> {
+    const signal = this.operationSignal();
+    if (!signal) return attempt;
+    this.throwIfAborted("connection", signal);
+    return new Promise<SshClient>((resolve, reject) => {
+      let settled = false;
+      const finish = (act: () => void) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        act();
+      };
+      const onAbort = () => finish(() => reject(abortError("connection", signal)));
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      attempt.then(
+        (client) => finish(() => resolve(client)),
+        (error) => finish(() => reject(error)),
+      );
+    });
+  }
+
+  private async connect(): Promise<SshClient> {
+    if (this.client) {
+      this.throwIfAborted("connection");
+      return this.client;
+    }
+    if (this.connecting) return this.awaitConnection(this.connecting);
+
+    const attempt = (async () => {
       const client = await connectSshClient(this.config);
 
       const onTransportDown = (cause?: Error) => {
         if (this.client !== client) return; // superseded / already handled
         this.client = null;
+        this.sftpChannel = null; // channel died with the client
+        this.sftpWrapper = null;
         this.handleDisconnect(cause);
       };
 
@@ -69,11 +187,22 @@ export class SshExecutor implements CommandExecutor {
       client.on("error", (err: Error) => onTransportDown(err));
 
       this.client = client;
-      this.connecting = null;
       return client;
     })();
 
-    return this.connecting;
+    this.connecting = attempt;
+
+    // Drop the memo however it settles, not just on success. A rejected promise
+    // left cached here is permanent: once one connect failed, every later host
+    // operation replayed that same rejection without redialing, so opening the
+    // firewall that caused it (#490) appeared to change nothing until the API
+    // process restarted.
+    const clearMemo = () => {
+      if (this.connecting === attempt) this.connecting = null;
+    };
+    attempt.then(clearMemo, clearMemo);
+
+    return this.awaitConnection(attempt);
   }
 
   /**
@@ -96,35 +225,247 @@ export class SshExecutor implements CommandExecutor {
     const err = new SshDisconnectedError(
       cause?.message ? `SSH connection lost: ${cause.message}` : "SSH connection lost",
     );
-    const aborts = [...this.inflight];
-    this.inflight.clear();
-    for (const abort of aborts) {
-      try { abort(err); } catch { /* per-op settle guard handles double-settle */ }
-    }
+    this.rejectInflight(err);
     for (const cb of [...this.disconnectListeners]) {
       try { cb(err); } catch { /* a listener bug must not break disconnect handling */ }
     }
   }
 
+  private rejectInflight(err: Error): void {
+    const aborts = [...this.inflight];
+    this.inflight.clear();
+    for (const abort of aborts) {
+      try { abort(err); } catch { /* per-op settle guard handles double-settle */ }
+    }
+  }
+
+  private async waitForChannelClose(
+    channel: SFTPWrapper | ClientChannel,
+    close: () => void,
+  ): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      const finish = (closed: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        channel.removeListener("close", onClose);
+        channel.removeListener("error", onError);
+        resolve(closed);
+      };
+      const onClose = () => finish(true);
+      // Keep an error listener installed while close is pending, but do not
+      // mistake `error` for proof that the remote channel has quiesced.
+      const onError = () => {};
+      const timer = setTimeout(() => finish(false), CHANNEL_CLOSE_GRACE_MS);
+      timer.unref?.();
+      channel.once("close", onClose);
+      channel.once("error", onError);
+      try {
+        close();
+      } catch {
+        finish(false);
+      }
+    });
+  }
+
+  /** Hard transport reset used only when a channel cannot prove it closed.
+   * Every operation on that transport is rejected before we return, and a
+   * later operation must establish a fresh connection. */
+  private async forceResetTransport(client: SshClient, cause: Error): Promise<void> {
+    if (this.client !== client) return;
+    this.client = null;
+    this.connecting = null;
+    this.sftpChannel = null;
+    this.sftpWrapper = null;
+    if (this.reverseListenerClient === client) this.reverseListenerClient = null;
+
+    this.rejectInflight(
+      new SshDisconnectedError(`SSH connection reset to quiesce an operation: ${cause.message}`),
+    );
+
+    let closed = false;
+    const closePromise = new Promise<void>((resolve) => {
+      const done = () => {
+        if (closed) return;
+        closed = true;
+        resolve();
+      };
+      client.once("close", done);
+      client.once("end", done);
+    });
+    try { client.end(); } catch {}
+    // `end()` is graceful and can itself wait behind a wedged subsystem.
+    // Destroy the socket as the authoritative bounded cancellation fallback.
+    try { client.destroy(); } catch {}
+    await Promise.race([
+      closePromise,
+      new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, TRANSPORT_CLOSE_GRACE_MS);
+        timer.unref?.();
+      }),
+    ]);
+  }
+
+  private quiesceSftp(
+    client: SshClient,
+    wrapper: SFTPWrapper | null,
+    cause: Error,
+  ): Promise<void> {
+    if (wrapper) {
+      const existing = this.sftpQuiescence.get(wrapper);
+      if (existing) return existing;
+    }
+    const quiescence = this.quiesceSftpOnce(client, wrapper, cause);
+    if (wrapper) this.sftpQuiescence.set(wrapper, quiescence);
+    return quiescence;
+  }
+
+  private async quiesceSftpOnce(
+    client: SshClient,
+    wrapper: SFTPWrapper | null,
+    cause: Error,
+  ): Promise<void> {
+    if (!wrapper || this.sftpWrapper === wrapper) {
+      this.sftpChannel = null;
+      this.sftpWrapper = null;
+    }
+    if (wrapper) {
+      const closed = await this.waitForChannelClose(wrapper, () => wrapper.end());
+      if (closed) return;
+    }
+    await this.forceResetTransport(client, cause);
+  }
+
+  private awaitSftpOpen(
+    opening: Promise<SFTPWrapper>,
+    client: SshClient,
+  ): Promise<SFTPWrapper> {
+    const signal = this.operationSignal();
+    this.throwIfAborted("SFTP channel open", signal);
+
+    return new Promise<SFTPWrapper>((resolve, reject) => {
+      let settled = false;
+      let terminating = false;
+      const cleanup = () => {
+        clearTimeout(timer);
+        this.inflight.delete(abort);
+        signal?.removeEventListener("abort", onSignalAbort);
+      };
+      const finish = (act: () => void) => {
+        if (settled || terminating) return;
+        settled = true;
+        cleanup();
+        act();
+      };
+      const terminate = (error: Error) => {
+        if (settled || terminating) return;
+        terminating = true;
+        cleanup();
+        const settle = () => {
+          settled = true;
+          reject(error);
+        };
+        void this.forceResetTransport(client, error).then(settle, settle);
+      };
+      const abort = (error: Error) => terminate(error);
+      const onSignalAbort = () => terminate(abortError("SFTP channel open", signal!));
+      const timer = setTimeout(
+        () => terminate(new Error(`SFTP channel open timed out after ${SFTP_OPERATION_TIMEOUT_MS}ms`)),
+        SFTP_OPERATION_TIMEOUT_MS,
+      );
+      timer.unref?.();
+      this.inflight.add(abort);
+      signal?.addEventListener("abort", onSignalAbort, { once: true });
+      if (signal?.aborted) {
+        onSignalAbort();
+        return;
+      }
+      opening.then(
+        (wrapper) => finish(() => resolve(wrapper)),
+        (error) => finish(() => reject(error)),
+      );
+    });
+  }
+
+  /**
+   * One SFTP subsystem channel per client, opened lazily and shared by every
+   * file op. ssh2's SFTPWrapper pipelines many concurrent requests over a
+   * single channel, so file operations cost exactly ONE session against the
+   * server's MaxSessions — not one channel per op, which leaks and exhausts
+   * the quota, then takes down the whole connection (incl. a live build) on
+   * the next channel-open failure (#34). Self-clears on the channel's own
+   * close/error and on resetConnection/dispose so the next op reopens clean.
+   */
   private async sftp(): Promise<SFTPWrapper> {
     const client = await this.connect();
-    return openSftp(client);
+    this.throwIfAborted("SFTP channel open");
+    if (this.sftpChannel) return this.awaitSftpOpen(this.sftpChannel, client);
+
+    const opening = openSftp(client).then((wrapper) => {
+      // A cancelled/timed-out opener may complete late.  Never publish that
+      // orphan channel into the next deployment's fresh transport lifecycle.
+      if (this.client !== client || this.sftpChannel !== opening) {
+        try { wrapper.end(); } catch {}
+        throw new SshDisconnectedError("SFTP channel opened after its SSH transport was reset");
+      }
+      const drop = () => {
+        if (this.sftpChannel === opening) {
+          this.sftpChannel = null;
+          this.sftpWrapper = null;
+        }
+      };
+      wrapper.once("close", drop);
+      wrapper.once("error", drop);
+      this.sftpWrapper = wrapper;
+      return wrapper;
+    });
+    opening.catch(() => {
+      if (this.sftpChannel === opening) this.sftpChannel = null;
+    });
+    this.sftpChannel = opening;
+    return this.awaitSftpOpen(opening, client);
+  }
+
+  /** Close + forget the shared SFTP channel (frees its session) without
+   *  touching the SSH client, so file ops can reopen on the same connection. */
+  private dropSftp(): void {
+    const ch = this.sftpChannel;
+    this.sftpChannel = null;
+    this.sftpWrapper = null;
+    if (ch) ch.then((w) => { try { w.end(); } catch {} }).catch(() => {});
   }
 
   /**
    * Force-close the current connection so the next call reconnects.
    */
   private resetConnection(): void {
+    this.dropSftp();
     if (this.client) {
       try { this.client.end(); } catch {}
+      try { this.client.destroy(); } catch {}
       this.client = null;
     }
     this.connecting = null;
   }
 
-  /** Returns true if the error is an SSH channel-open failure. */
+  /**
+   * Recover from a channel-open failure without killing live work. If other
+   * ops are still streaming on this connection (a docker build, an exec), the
+   * failure is session pressure — NOT a dead socket — so ending the client
+   * would abort that in-flight command (#34). Free the SFTP channel and keep
+   * the connection. With nothing in flight the cached socket is stale (idle
+   * drop), so reset it fully.
+   */
+  private recoverFromChannelError(): void {
+    if (this.inflight.size > 0) this.dropSftp();
+    else this.resetConnection();
+  }
+
+  /** Returns true if the error is an SSH channel-open or channel-exec failure. */
   private static isChannelError(err: unknown): boolean {
     if (!(err instanceof Error)) return false;
+    if (isSshExecRequestError(err)) return true;
     const msg = err.message.toLowerCase();
     return msg.includes("channel open failure") || msg.includes("open failed");
   }
@@ -132,17 +473,19 @@ export class SshExecutor implements CommandExecutor {
   /**
    * Run an operation, and if it fails opening an SSH channel on a half-dead
    * cached connection ("Channel open failure: open failed" — common after the
-   * idle timeout drops the socket), drop the connection and retry ONCE on a
-   * fresh one. This is why `exec` survives a stale connection; the SFTP-based
-   * ops (writeFile/readFile/exists) must go through it too, or a deploy's route
+   * idle timeout drops the socket), recover channel capacity and retry ONCE.
+   * An idle connection is replaced; a busy one stays alive so its other command
+   * is not aborted (see recoverFromChannelError). The SFTP-based ops
+   * (writeFile/readFile/exists) must go through this too, or a deploy's route
    * write fails spuriously and only succeeds on a manual redeploy.
    */
   private async withChannelRetry<T>(fn: () => Promise<T>): Promise<T> {
+    this.throwIfAborted("operation");
     try {
       return await fn();
     } catch (err) {
-      if (SshExecutor.isChannelError(err)) {
-        this.resetConnection();
+      if (SshExecutor.isChannelError(err) && !this.operationSignal()?.aborted) {
+        this.recoverFromChannelError();
         return fn();
       }
       throw err;
@@ -160,30 +503,69 @@ export class SshExecutor implements CommandExecutor {
   private async _exec(command: string, opts?: { timeout?: number }): Promise<string> {
     const client = await this.connect();
     const timeout = opts?.timeout ?? 30_000;
+    const signal = this.operationSignal();
+    this.throwIfAborted("command", signal);
 
     return new Promise<string>((resolve, reject) => {
       let settled = false;
+      let terminating = false;
       let timer: ReturnType<typeof setTimeout> | null = null;
+      let channel: ClientChannel | null = null;
 
-      // `abort` cancels THIS op on a transport drop; `finish` is the single
-      // settle path (guards double-settle, clears the timer, deregisters).
-      const abort = (err: Error) => finish(() => reject(err));
-      const finish = (act: () => void) => {
-        if (settled) return;
-        settled = true;
+      const cleanup = () => {
         if (timer) clearTimeout(timer);
         this.inflight.delete(abort);
+        signal?.removeEventListener("abort", onSignalAbort);
+      };
+      const finish = (act: () => void) => {
+        if (settled || terminating) return;
+        settled = true;
+        cleanup();
         act();
       };
+      // Do not reject until the command channel has closed. Releasing a host
+      // mutation lock while the remote command keeps running is not atomic.
+      const terminate = (error: Error) => {
+        if (settled || terminating) return;
+        terminating = true;
+        cleanup();
+        const quiesce = (async () => {
+          if (channel) {
+            const closed = await this.waitForChannelClose(channel, () => channel!.close());
+            if (!closed) await this.forceResetTransport(client, error);
+          } else {
+            // A lost `client.exec` callback gives us no channel to close.
+            await this.forceResetTransport(client, error);
+          }
+        })();
+        const settle = () => {
+          settled = true;
+          reject(error);
+        };
+        void quiesce.then(settle, settle);
+      };
+      const abort = (err: Error) => terminate(err);
+      const onSignalAbort = () => terminate(abortError("command", signal!));
       this.inflight.add(abort);
+      signal?.addEventListener("abort", onSignalAbort, { once: true });
+      if (signal?.aborted) {
+        onSignalAbort();
+        return;
+      }
 
       timer = setTimeout(
-        () => finish(() => reject(new Error(`Command timed out after ${timeout}ms: ${command}`))),
+        () => terminate(new Error(`Command timed out after ${timeout}ms: ${commandForError(command)}`)),
         timeout,
       );
+      timer.unref?.();
 
       client.exec(SshExecutor.ENV_PREFIX + command, (err, stream) => {
-        if (err) return finish(() => reject(err));
+        if (err) return finish(() => reject(tagExecRequestError(err)));
+        channel = stream;
+        if (terminating) {
+          try { stream.close(); } catch {}
+          return;
+        }
 
         let stdout = "";
         let stderr = "";
@@ -195,11 +577,16 @@ export class SshExecutor implements CommandExecutor {
         stream.stderr.on("data", (data: Buffer) => {
           stderr += data.toString();
         });
+        stream.on("error", (error: Error) => finish(() => reject(error)));
 
         stream.on("close", (code: number) => {
           finish(() => {
-            if (code !== 0) reject(new Error(stderr.trim() || `Exit code ${code}`));
-            else resolve(stdout.trim());
+            if (code !== 0) {
+              // Include stdout too — certbot & friends write the real error there
+              // while stderr only has boilerplate, so stderr-only hid the cause.
+              const detail = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n");
+              reject(new Error(detail || `Exit code ${code}`));
+            } else resolve(stdout.trim());
           });
         });
       });
@@ -209,11 +596,13 @@ export class SshExecutor implements CommandExecutor {
   streamExec(
     command: string,
     onLog: (log: LogEntry) => void,
+    opts?: { signal?: AbortSignal },
   ): Promise<{ code: number; output: string }> {
-    return this._streamExec(command, onLog).catch((err) => {
-      if (SshExecutor.isChannelError(err)) {
-        this.resetConnection();
-        return this._streamExec(command, onLog);
+    const scopedOpts = { ...opts, signal: this.resolvedSignal(opts?.signal) };
+    return this._streamExec(command, onLog, scopedOpts).catch((err) => {
+      if (SshExecutor.isChannelError(err) && !scopedOpts.signal?.aborted) {
+        this.recoverFromChannelError();
+        return this._streamExec(command, onLog, scopedOpts);
       }
       throw err;
     });
@@ -222,32 +611,79 @@ export class SshExecutor implements CommandExecutor {
   private async _streamExec(
     command: string,
     onLog: (log: LogEntry) => void,
+    opts?: { signal?: AbortSignal },
   ): Promise<{ code: number; output: string }> {
     const client = await this.connect();
+    const signal = opts?.signal;
 
     return new Promise<{ code: number; output: string }>((resolve, reject) => {
       let settled = false;
+      let terminating = false;
+      // Hoisted so an abort mid-stream can still hand back what did arrive.
+      const chunks: string[] = [];
+      let channel: ClientChannel | null = null;
 
+      const cleanup = () => {
+        this.inflight.delete(abort);
+        signal?.removeEventListener("abort", onSignalAbort);
+      };
+      const finish = (act: () => void) => {
+        if (settled || terminating) return;
+        settled = true;
+        cleanup();
+        act();
+      };
+      const terminate = (error: Error, intentional: boolean) => {
+        if (settled || terminating) return;
+        terminating = true;
+        cleanup();
+        const quiesce = (async () => {
+          if (channel) {
+            const closed = await this.waitForChannelClose(channel, () => channel!.close());
+            if (!closed) await this.forceResetTransport(client, error);
+          } else {
+            await this.forceResetTransport(client, error);
+          }
+        })();
+        const settle = () => {
+          settled = true;
+          if (intentional) resolve({ code: 0, output: chunks.join("") });
+          else reject(error);
+        };
+        void quiesce.then(settle, settle);
+      };
       // A transport drop mid-stream rejects with SshDisconnectedError instead
       // of silently resolving `code ?? 1` (truncated output). Callers treat the
       // throw as a real failure; the manager can reconnect/re-drive.
-      const abort = (err: Error) => finish(() => reject(err));
-      const finish = (act: () => void) => {
-        if (settled) return;
-        settled = true;
-        this.inflight.delete(abort);
-        act();
-      };
+      const abort = (err: Error) => terminate(err, false);
+      const onSignalAbort = () => terminate(abortError("streaming command", signal!), true);
       this.inflight.add(abort);
+      signal?.addEventListener("abort", onSignalAbort, { once: true });
+
+      // Caller-driven teardown (a disconnected browser tearing down the log stream).
+      // Closing the ssh2 channel closes the sshd side too, which breaks the remote
+      // `docker exec curl`'s stdout pipe (the daemon buffers it, so nothing else ever
+      // gives it an EPIPE) and lets it exit — instead of lingering until pipe_stream's
+      // 1h cap and holding an SSH channel that would eventually starve MaxSessions. An
+      // intentional abort is not a failure, so resolve with whatever bytes arrived —
+      // but only AFTER close/reset proves the transport has quiesced.
+      if (signal?.aborted) {
+        onSignalAbort();
+        return;
+      }
 
       client.exec(SshExecutor.ENV_PREFIX + command, (err, stream) => {
-        if (err) return finish(() => reject(err));
+        if (err) return finish(() => reject(tagExecRequestError(err)));
+        channel = stream;
+        // The abort may have fired between the check above and the channel opening.
+        if (terminating || signal?.aborted) {
+          try { stream.close(); } catch {}
+          return;
+        }
 
         // Raw passthrough (see LocalExecutor.streamExec): forward the untouched
         // byte stream as rawData so the client's xterm renders "\r"/ANSI
         // natively — progress lines repaint in place instead of new lines.
-        const chunks: string[] = [];
-
         const onChunk = (data: Buffer, level: LogEntry["level"]) => {
           const text = data.toString();
           if (!text) return;
@@ -257,16 +693,97 @@ export class SshExecutor implements CommandExecutor {
 
         stream.on("data", (data: Buffer) => onChunk(data, "info"));
         stream.stderr.on("data", (data: Buffer) => onChunk(data, "warn"));
+        stream.on("error", (error: Error) => finish(() => reject(error)));
 
-        stream.on("close", (code: number) => {
-          finish(() => resolve({ code: code ?? 1, output: chunks.join("") }));
+        // ssh2's 'close' often carries no code; the real exit status arrives on
+        // 'exit'. A close with NO exit status means the channel was torn down
+        // under the command (connection reset / session exhaustion), not a real
+        // exit — surface that instead of masking it as a generic exit code 1 (#34).
+        let exitCode: number | null = null;
+        stream.on("exit", (code: number | null) => { exitCode = code; });
+        stream.on("close", (code: number | null) => {
+          finish(() => {
+            const final = typeof code === "number" ? code : exitCode;
+            if (final == null) {
+              reject(
+                new Error(
+                  "remote channel closed without an exit status — the SSH connection or channel was terminated mid-command",
+                ),
+              );
+            } else {
+              resolve({ code: final, output: chunks.join("") });
+            }
+          });
         });
       });
     });
   }
 
-  async writeFile(path: string, content: string): Promise<void> {
-    const dir = dirname(path);
+  /** Turn ssh2's callback-only SFTP request into a bounded operation.  A lost
+   * callback used to leave the compose deploy promise and its host mutex tail
+   * pending forever.  Cancellation/timeout closes the shared subsystem first;
+   * if close itself wedges, the parent SSH transport is destroyed before this
+   * promise rejects. */
+  private runSftpRequest<T>(
+    client: SshClient,
+    sftp: SFTPWrapper,
+    operation: string,
+    start: (done: (error?: Error | null, value?: T) => void) => void,
+  ): Promise<T> {
+    const signal = this.operationSignal();
+    this.throwIfAborted(operation, signal);
+
+    return new Promise<T>((resolve, reject) => {
+      let settled = false;
+      let terminating = false;
+      const cleanup = () => {
+        clearTimeout(timer);
+        this.inflight.delete(abort);
+        signal?.removeEventListener("abort", onSignalAbort);
+      };
+      const finish = (act: () => void) => {
+        if (settled || terminating) return;
+        settled = true;
+        cleanup();
+        act();
+      };
+      const terminate = (error: Error) => {
+        if (settled || terminating) return;
+        terminating = true;
+        cleanup();
+        const settle = () => {
+          settled = true;
+          reject(error);
+        };
+        void this.quiesceSftp(client, sftp, error).then(settle, settle);
+      };
+      const abort = (error: Error) => terminate(error);
+      const onSignalAbort = () => terminate(abortError(operation, signal!));
+      const timer = setTimeout(
+        () => terminate(new Error(`${operation} timed out after ${SFTP_OPERATION_TIMEOUT_MS}ms`)),
+        SFTP_OPERATION_TIMEOUT_MS,
+      );
+      timer.unref?.();
+      this.inflight.add(abort);
+      signal?.addEventListener("abort", onSignalAbort, { once: true });
+      if (signal?.aborted) {
+        onSignalAbort();
+        return;
+      }
+
+      try {
+        start((error, value) => {
+          if (error) finish(() => reject(error));
+          else finish(() => resolve(value as T));
+        });
+      } catch (error) {
+        finish(() => reject(error));
+      }
+    });
+  }
+
+  async writeFile(path: string, content: string, opts?: { mode?: number }): Promise<void> {
+    const dir = remoteDirname(path);
     try {
       await this.exec(`mkdir -p ${sq(dir)}`);
     } catch {
@@ -275,22 +792,42 @@ export class SshExecutor implements CommandExecutor {
 
     return this.withChannelRetry(async () => {
       const sftp = await this.sftp();
-      return new Promise<void>((resolve, reject) => {
-        sftp.writeFile(path, content, { encoding: "utf-8" }, (err) => {
-          if (err) reject(err);
-          else resolve();
+      const client = this.client;
+      if (!client) throw new SshDisconnectedError("SSH connection lost before SFTP write");
+      const write = (data: string, mode?: number) =>
+        this.runSftpRequest<void>(client, sftp, `SFTP write ${path}`, (done) => {
+          sftp.writeFile(path, data, { encoding: "utf-8", mode }, (err) => done(err));
         });
-      });
+      const chmod = (mode: number) =>
+        this.runSftpRequest<void>(client, sftp, `SFTP chmod ${path}`, (done) => {
+          sftp.chmod(path, mode, (err) => done(err));
+        });
+
+      if (opts?.mode !== undefined) {
+        // SFTP's creation mode does not change an existing inode. Truncate it
+        // empty, tighten it, then send the payload so no secret bytes exist
+        // while the old permissive mode is still in force.
+        await write("", opts.mode);
+        await chmod(opts.mode);
+        await write(content);
+      } else {
+        await write(content);
+      }
     });
+  }
+
+  async rename(from: string, to: string): Promise<void> {
+    await this.exec(`mv ${sq(from)} ${sq(to)}`);
   }
 
   async readFile(path: string): Promise<string> {
     return this.withChannelRetry(async () => {
       const sftp = await this.sftp();
-      return new Promise<string>((resolve, reject) => {
+      const client = this.client;
+      if (!client) throw new SshDisconnectedError("SSH connection lost before SFTP read");
+      return this.runSftpRequest<string>(client, sftp, `SFTP read ${path}`, (done) => {
         sftp.readFile(path, { encoding: "utf-8" }, (err, data) => {
-          if (err) reject(err);
-          else resolve(data.toString());
+          done(err, data?.toString());
         });
       });
     });
@@ -299,9 +836,13 @@ export class SshExecutor implements CommandExecutor {
   async exists(path: string): Promise<boolean> {
     return this.withChannelRetry(async () => {
       const sftp = await this.sftp();
-      return new Promise<boolean>((resolve) => {
+      const client = this.client;
+      if (!client) throw new SshDisconnectedError("SSH connection lost before SFTP stat");
+      return this.runSftpRequest<boolean>(client, sftp, `SFTP stat ${path}`, (done) => {
         sftp.stat(path, (err) => {
-          resolve(!err);
+          // ENOENT and permission errors both retain the historical `false`
+          // contract; only a missing callback is now a bounded failure.
+          done(null, !err);
         });
       });
     });
@@ -339,6 +880,72 @@ export class SshExecutor implements CommandExecutor {
             onClose,
             kill: () => { try { stream.close(); } catch {} },
           });
+        });
+      });
+    })();
+  }
+
+  /**
+   * Pipe `body` into a remote command's stdin over a raw ssh2 channel, half-
+   * closing stdin at EOF. The streaming inverse of rawExec: used to stream a
+   * `docker save` tar straight into `docker load` on another host without
+   * staging the (multi-GB) image to a temp file. Bounded stderr tail for
+   * diagnostics; registered for transport-drop abort like _exec/_streamExec.
+   */
+  execWithInput(command: string, body: Readable): Promise<{ code: number; stderr: string; stdout: string }> {
+    return (async () => {
+      const client = await this.connect();
+      return new Promise<{ code: number; stderr: string; stdout: string }>((resolve, reject) => {
+        let settled = false;
+        const abort = (err: Error) => finish(() => reject(err));
+        const finish = (act: () => void) => {
+          if (settled) return;
+          settled = true;
+          this.inflight.delete(abort);
+          act();
+        };
+        this.inflight.add(abort);
+
+        client.exec(command, (err, stream) => {
+          if (err) return finish(() => reject(err));
+
+          let stderr = "";
+          stream.stderr.on("data", (d: Buffer) => {
+            stderr += d.toString();
+            if (stderr.length > 16 * 1024) stderr = stderr.slice(-16 * 1024);
+          });
+          // Capture stdout (docker load prints "Loaded image( ID)?: <ref>", which
+          // the caller needs to retag) AND keep the channel flowing so it doesn't
+          // stall on an unread buffer.
+          let stdout = "";
+          stream.on("data", (d: Buffer) => {
+            stdout += d.toString();
+            if (stdout.length > 16 * 1024) stdout = stdout.slice(-16 * 1024);
+          });
+
+          let exitCode: number | null = null;
+          stream.on("exit", (code: number | null) => {
+            exitCode = code;
+          });
+          stream.on("close", (code: number | null) => {
+            finish(() => {
+              const final = typeof code === "number" ? code : exitCode;
+              if (final == null) {
+                reject(
+                  new Error(
+                    "remote channel closed without an exit status — the SSH connection was terminated mid-command",
+                  ),
+                );
+              } else {
+                resolve({ code: final, stderr: stderr.trim(), stdout: stdout.trim() });
+              }
+            });
+          });
+
+          // body → channel stdin; end() sends EOF so the reader exits.
+          body.on("error", (e) => finish(() => { try { stream.close(); } catch {} reject(e); }));
+          stream.on("error", (e: Error) => finish(() => reject(e)));
+          body.pipe(stream);
         });
       });
     })();
@@ -409,6 +1016,29 @@ export class SshExecutor implements CommandExecutor {
     return openSshUnixSocket(client as StreamLocalCapableClient, socketPath);
   }
 
+  /**
+   * Carry the Docker Engine API over a `docker system dial-stdio` exec channel
+   * on the pooled connection — the streamlocal-free transport used when the
+   * SSH server (or the Bun-compiled desktop runtime) can't do socket
+   * forwarding.
+   *
+   * Deliberately WITHOUT `ENV_PREFIX`: that prefix only exports apt's
+   * non-interactive variables (it sets no PATH, despite what the comment here
+   * used to claim), and the bridge's own ephemeral dial-stdio client opens the
+   * bare command. Two dial-stdio channels that differ by a shell prefix are two
+   * transports, and the bridge picks one by probing the other.
+   *
+   * Failure diagnostics (daemon down, socket permission, `docker: command not
+   * found`, an sshd ForceCommand banner) ride ON the returned channel — see
+   * `attachDialStdioDiagnostics`. They used to go to `console.warn` while the
+   * caller got a bare socket reset, which is how a host with no running dockerd
+   * reported itself as `socket hang up`.
+   */
+  async openDockerDialStdio(): Promise<Duplex> {
+    const client = await this.connect();
+    return openDockerDialStdioChannel(client);
+  }
+
   async forwardPort(remoteHost: string, remotePort: number): Promise<Duplex> {
     const client = await this.connect();
     return new Promise<Duplex>((resolve, reject) => {
@@ -476,6 +1106,8 @@ export class SshExecutor implements CommandExecutor {
 
   async dispose(): Promise<void> {
     this.connecting = null;
+    this.sftpChannel = null;
+    this.sftpWrapper = null;
     this.reverseHandlers.clear();
     this.reverseListenerClient = null;
     if (this.client) {
@@ -488,7 +1120,7 @@ export class SshExecutor implements CommandExecutor {
     localPath: string,
     remotePath: string,
     onLog?: (log: LogEntry) => void,
-    options?: { excludes?: string[]; includes?: string[] },
+    options?: { excludes?: string[]; includes?: string[]; alsoInclude?: string[] },
   ): Promise<void> {
     // Pack the tree into ONE archive, upload that single file, verify + extract.
     // Transport: rsync (fast + resumable) when the toolchain allows; otherwise
@@ -498,6 +1130,7 @@ export class SshExecutor implements CommandExecutor {
     const { args: tarArgs, cleanup: cleanupTarList } = await prepareSourceTarArgs(localPath, {
       excludes,
       includes: options?.includes,
+      alsoInclude: options?.alsoInclude,
     });
     const tmpLocalDir = await mkdtemp(join(tmpdir(), "openship-xfer-"));
     const localArchive = join(tmpLocalDir, "context.tar.gz");
@@ -508,7 +1141,7 @@ export class SshExecutor implements CommandExecutor {
       onLog?.(logEntry("Packing source into a single archive..."));
       await packLocalArchive(tarArgs, localArchive);
       const totalBytes = (await stat(localArchive)).size;
-      await this.exec(`mkdir -p ${sq(dirname(remoteArchive))}`);
+      await this.exec(`mkdir -p ${sq(remoteDirname(remoteArchive))}`);
 
       const rsync = await canUseRemoteRsync(deps);
       if (rsync.ok) {

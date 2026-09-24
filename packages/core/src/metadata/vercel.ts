@@ -6,6 +6,7 @@ import type {
   RoutingConfig,
   MetadataParser,
 } from "./types";
+import { trimmed } from "./text";
 
 /**
  * Map Vercel's `framework` slugs to openship StackIds. Only the slugs that
@@ -38,10 +39,6 @@ export interface VercelConfig {
   headers?: DeploymentHeaderRule[];
   cleanUrls?: boolean;
   trailingSlash?: boolean;
-}
-
-function trimmed(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
 }
 
 /** A rule that matches conditionally (`has`/`missing`) can't be faithfully
@@ -85,7 +82,10 @@ function parseHeaders(value: unknown): DeploymentHeaderRule[] | undefined {
   if (!Array.isArray(value)) return undefined;
   const rules: DeploymentHeaderRule[] = [];
   for (const entry of value) {
-    if (!entry || typeof entry !== "object") continue;
+    // Like rewrites/redirects, a `has`/`missing` rule can't be reproduced by a
+    // plain nginx location — emitting its headers would apply them to EVERY
+    // request, not just the matching ones — so drop it rather than mis-apply it.
+    if (!entry || typeof entry !== "object" || isConditional(entry)) continue;
     const e = entry as { source?: unknown; headers?: unknown };
     if (typeof e.source !== "string" || !Array.isArray(e.headers)) continue;
     const headers: { key: string; value: string }[] = [];
@@ -125,6 +125,9 @@ export function parseVercelConfig(raw: string): VercelConfig | null {
   } catch {
     return null;
   }
+  // `JSON.parse("null")` succeeds → guard before property access, or a stray
+  // `null` file would throw and crash the metadata pipeline (cf. railway.ts).
+  if (typeof parsed !== "object" || parsed === null) return null;
   const cfg: VercelConfig = {};
   const installCommand = trimmed(parsed.installCommand);
   const buildCommand = trimmed(parsed.buildCommand);

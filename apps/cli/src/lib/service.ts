@@ -11,18 +11,26 @@
  *   - Windows → Scheduled Task at logon (best-effort; see docs)
  */
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync, rmSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
-const HOME = homedir();
-const OS_DIR = join(HOME, ".openship");
-const LOG_DIR = join(OS_DIR, "logs");
+import { readCliInstall } from "./cli-install";
+import { IS_ALT_HOME, LOG_DIR, OS_DIR } from "./paths";
+import { readStoredPorts } from "./ports";
+import { thisHost } from "./this-host";
 
-const MAC_LABEL = "io.openship.up";
+const HOME = homedir();
+/** Where the tarball install's stable launcher + PATH entry live. */
+const OPENSHIP_BIN = join(OS_DIR, "bin");
+
+// A from-source/dev install (OPENSHIP_HOME set → IS_ALT_HOME) gets its OWN boot
+// service, so `openship up` from source never clobbers or fights a production
+// install's service. Same derivation across install/stop/restart/status.
+const MAC_LABEL = IS_ALT_HOME ? "io.openship-dev.up" : "io.openship.up";
 const MAC_PLIST = join(HOME, "Library", "LaunchAgents", `${MAC_LABEL}.plist`);
-const SYSTEMD_NAME = "openship";
-const WIN_TASK = "Openship";
+const SYSTEMD_NAME = IS_ALT_HOME ? "openship-dev" : "openship";
+const WIN_TASK = IS_ALT_HOME ? "OpenshipDev" : "Openship";
 
 /** Flags the user gave to `openship up`, replayed into the service's run command. */
 export interface UpFlags {
@@ -32,10 +40,30 @@ export interface UpFlags {
   /** false → pass --no-ui */
   ui?: boolean;
   uiVersion?: string;
+  /** Serve remotely at this public URL (enables proxy + login). */
+  publicUrl?: string;
+  /** Trust X-Forwarded-For from a front proxy. */
+  trustProxy?: boolean;
+  /** Bind the dashboard to this interface (reverse-proxy / LAN access). */
+  host?: string;
+  /** Managed edge: install OpenResty + Let's Encrypt on this box and route here. */
+  managedEdge?: boolean;
+  /** ACME contact email for the managed edge. */
+  acmeEmail?: string;
+  /** Openship Mail: default the dashboard to the mail control plane. */
+  mail?: boolean;
 }
 
 /** The CLI's own runtime + entry, so the service invokes THIS install. */
-function selfInvocation(): { runtime: string; args: string[] } {
+export function selfInvocation(): { runtime: string; args: string[] } {
+  // Tarball installs run through the stable launcher (~/.openship/bin/openship):
+  // it re-resolves node and cli/current on every boot, so `openship update` and
+  // Node bumps repoint symlinks with NO service-unit rewrite. The launcher
+  // `exec`s node, preserving the PID/process-group semantics up.ts supervises.
+  const cli = readCliInstall();
+  if (cli?.method === "tarball" && existsSync(cli.launcher)) {
+    return { runtime: cli.launcher, args: [] };
+  }
   const runtime = process.execPath; // node or bun that's running us
   const entry = resolve(process.argv[1] ?? ""); // dist/index.js (absolute)
   return { runtime, args: [entry] };
@@ -48,6 +76,15 @@ function upArgs(flags: UpFlags): string[] {
   if (flags.dashboardPort) a.push("--dashboard-port", flags.dashboardPort);
   if (flags.ui === false) a.push("--no-ui");
   if (flags.uiVersion) a.push("--ui-version", flags.uiVersion);
+  if (flags.publicUrl) a.push("--public-url", flags.publicUrl);
+  if (flags.trustProxy) a.push("--trust-proxy");
+  if (flags.host) a.push("--host", flags.host);
+  if (flags.managedEdge) a.push("--managed-edge");
+  if (flags.acmeEmail) a.push("--acme-email", flags.acmeEmail);
+  // Replayed, not carried in the unit's Environment=: the supervised process is
+  // `up --foreground`, which builds its own env from the flags. Without this the
+  // service would boot the platform shell on a box installed as Openship Mail.
+  if (flags.mail) a.push("--mail");
   return a;
 }
 
@@ -62,6 +99,32 @@ function run(cmd: string, args: string[]): { ok: boolean; out: string } {
   return { ok: r.status === 0, out: `${r.stdout ?? ""}${r.stderr ?? ""}`.trim() };
 }
 
+/** Block synchronously for `ms` — restart()/serviceStatus() are sync and the
+ *  wizard calls them sync, so we poll launchd without going async. */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * A launchd agent's LIVE pid, or null. `launchctl list <label>` prints a
+ * plist-ish dict; the `"PID"` key is present ONLY while an instance is actually
+ * running. A loaded-but-crashed/throttled agent has no PID (just a non-zero
+ * `"LastExitStatus"`) — so this is the real "is it up?" check, unlike
+ * `launchctl list`'s exit code (which is 0 whenever the label is merely loaded).
+ */
+function launchdPid(): number | null {
+  const r = run("launchctl", ["list", MAC_LABEL]);
+  if (!r.ok) return null;
+  const m = r.out.match(/"PID"\s*=\s*(\d+)/);
+  return m ? Number(m[1]) : null;
+}
+
+/** The agent's last exit status (from `launchctl list`), or null if unknown. */
+function launchdLastExit(): number | null {
+  const m = run("launchctl", ["list", MAC_LABEL]).out.match(/"LastExitStatus"\s*=\s*(-?\d+)/);
+  return m ? Number(m[1]) : null;
+}
+
 function isRoot(): boolean {
   return typeof process.getuid === "function" && process.getuid() === 0;
 }
@@ -71,15 +134,15 @@ export type ServiceKind = "launchd" | "systemd-user" | "systemd-system" | "schta
 export function detectKind(): ServiceKind {
   if (process.platform === "darwin") return "launchd";
   if (process.platform === "linux") {
-    if (!hasSystemd()) return "unsupported";
+    // The resolver's systemd test, not a `command -v systemctl` of our own: systemctl is
+    // installed in plenty of containers where systemd is not the init, and this one asked
+    // only whether the binary existed — so a docker build reported `systemd-user` and then
+    // failed to install a unit. The resolver requires a live /run/systemd/system too.
+    if (thisHost().profile.serviceManager !== "systemd") return "unsupported";
     return isRoot() ? "systemd-system" : "systemd-user";
   }
   if (process.platform === "win32") return "schtasks";
   return "unsupported";
-}
-
-function hasSystemd(): boolean {
-  return spawnSync("sh", ["-c", "command -v systemctl"]).status === 0;
 }
 
 /* ── file builders ──────────────────────────────────────────────────────── */
@@ -88,10 +151,30 @@ function xmlEscape(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+/** Extra env the service should carry, only when set (unset in production so
+ *  nothing changes). OPENSHIP_DASHBOARD_DIR lets a from-source install serve its
+ *  locally-built dashboard; OPENSHIP_HOME pins the supervised process to the
+ *  same alternate home (data dir / tokens / ports) the install runs under —
+ *  without it the boot service would fall back to the production ~/.openship. */
+function serviceEnv(): Record<string, string> {
+  const extra: Record<string, string> = {};
+  const dashDir = process.env.OPENSHIP_DASHBOARD_DIR?.trim();
+  if (dashDir) extra.OPENSHIP_DASHBOARD_DIR = dashDir;
+  const home = process.env.OPENSHIP_HOME?.trim();
+  if (home) extra.OPENSHIP_HOME = home;
+  return extra;
+}
+
 function plist(flags: UpFlags): string {
   const argv = runArgv(flags);
   const items = argv.map((a) => `      <string>${xmlEscape(a)}</string>`).join("\n");
-  const path = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", join(HOME, ".bun/bin")].join(":");
+  // Tarball installs need ~/.openship/bin on PATH (the launcher resolves system
+  // node from the standard dirs); npm/bun installs keep ~/.bun/bin.
+  const runtimeBin = readCliInstall()?.method === "tarball" ? OPENSHIP_BIN : join(HOME, ".bun/bin");
+  const path = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", runtimeBin].join(":");
+  const extraEnv = Object.entries(serviceEnv())
+    .map(([k, v]) => `<key>${xmlEscape(k)}</key><string>${xmlEscape(v)}</string>`)
+    .join("");
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -106,7 +189,7 @@ ${items}
   <key>StandardOutPath</key><string>${join(LOG_DIR, "up.log")}</string>
   <key>StandardErrorPath</key><string>${join(LOG_DIR, "up.err.log")}</string>
   <key>EnvironmentVariables</key>
-  <dict><key>PATH</key><string>${path}</string></dict>
+  <dict><key>PATH</key><string>${path}</string>${extraEnv}</dict>
 </dict>
 </plist>
 `;
@@ -115,6 +198,15 @@ ${items}
 function systemdUnit(flags: UpFlags): string {
   const argv = runArgv(flags);
   const execStart = argv.map((a) => (/\s/.test(a) ? `"${a}"` : a)).join(" ");
+  const extraEnv = Object.entries(serviceEnv())
+    .map(([k, v]) => `Environment=${k}=${v}\n`)
+    .join("");
+  // Tarball launcher resolves system node off PATH; systemd's default PATH is
+  // minimal, so pin one that covers the standard install dirs + ~/.openship/bin.
+  const pathEnv =
+    readCliInstall()?.method === "tarball"
+      ? `Environment=PATH=${["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin", OPENSHIP_BIN].join(":")}\n`
+      : "";
   return `[Unit]
 Description=Openship control plane
 After=network-online.target
@@ -126,7 +218,7 @@ ExecStart=${execStart}
 Restart=always
 RestartSec=2
 Environment=NODE_ENV=production
-
+${pathEnv}${extraEnv}
 [Install]
 WantedBy=default.target
 `;
@@ -138,6 +230,27 @@ export interface ServiceResult {
   kind: ServiceKind;
   /** Human note about what happened / how to inspect it. */
   detail: string;
+}
+
+/**
+ * How `installAndStart` enables + starts the service on this manager, as one line
+ * for `up --dry-run`. Lives beside the code that runs it so the preview and the
+ * commands below can't drift.
+ */
+export function installStepFor(kind: ServiceKind): string {
+  switch (kind) {
+    case "launchd":
+      return "launchctl bootstrap  (starts it now and at login)";
+    case "systemd-user":
+      return "systemctl --user enable --now + loginctl enable-linger  (starts it now, on boot, without a login session)";
+    case "systemd-system":
+      return "systemctl enable --now  (starts it now and on boot)";
+    case "schtasks":
+      return "schtasks /Create /SC ONLOGON  (starts it at logon)";
+    default:
+      // detectKind found nothing to install into — installAndStart throws here.
+      return "nothing — no supported service manager on this box (needs systemd on Linux); `up --foreground` or `up --compose` instead";
+  }
 }
 
 /** Return (don't write) the service definition — for `--dry-run`/debugging. */
@@ -197,17 +310,127 @@ export function installAndStart(flags: UpFlags): ServiceResult {
   );
 }
 
+/**
+ * Restart the installed service in place (pick up a new bundle after
+ * `openship update`). Returns restarted:false when no service is installed —
+ * the caller then tells the operator to `openship up` manually.
+ */
+export function restart(): { restarted: boolean; detail: string } {
+  const kind = detectKind();
+
+  if (kind === "launchd") {
+    if (!existsSync(MAC_PLIST)) return { restarted: false, detail: "no launchd agent installed" };
+    const uid = String(process.getuid?.() ?? "");
+    const r = run("launchctl", ["kickstart", "-k", `gui/${uid}/${MAC_LABEL}`]);
+    if (!r.ok) return { restarted: false, detail: r.out || "launchctl kickstart failed" };
+    // `kickstart` returns 0 as soon as the relaunch REQUEST is accepted — it
+    // does NOT wait for the process to come up and stay up. Reporting r.ok as
+    // "restarted" is a false positive when the new instance crashes on boot
+    // (port already bound, PGlite data-dir lock held by another process, a bad
+    // bundle/env). Poll for a live PID so we only claim success once it's
+    // actually running.
+    for (let i = 0; i < 6; i++) {
+      sleepSync(500);
+      if (launchdPid() != null) return { restarted: true, detail: `restarted ${MAC_LABEL}` };
+    }
+    const exit = launchdLastExit();
+    return {
+      restarted: false,
+      detail: `${MAC_LABEL} was killed but didn't stay up${
+        exit != null ? ` (last exit ${exit})` : ""
+      } — check logs in ${LOG_DIR}`,
+    };
+  }
+
+  if (kind === "systemd-user" || kind === "systemd-system") {
+    const sysArgs = kind === "systemd-user" ? ["--user"] : [];
+    const unitPath = kind === "systemd-user"
+      ? join(HOME, ".config/systemd/user", `${SYSTEMD_NAME}.service`)
+      : `/etc/systemd/system/${SYSTEMD_NAME}.service`;
+    if (!existsSync(unitPath)) return { restarted: false, detail: "no systemd unit installed" };
+    const r = run("systemctl", [...sysArgs, "restart", SYSTEMD_NAME]);
+    return { restarted: r.ok, detail: r.ok ? `restarted ${SYSTEMD_NAME}` : r.out };
+  }
+
+  if (kind === "schtasks") {
+    run("schtasks", ["/End", "/TN", WIN_TASK]);
+    const r = run("schtasks", ["/Run", "/TN", WIN_TASK]);
+    return { restarted: r.ok, detail: r.ok ? `restarted ${WIN_TASK}` : r.out };
+  }
+
+  return { restarted: false, detail: "no supported service manager" };
+}
+
+/** Is the `openship up` service installed on this box, and is it running now? */
+export function serviceStatus(): { kind: ServiceKind; installed: boolean; running: boolean } {
+  const kind = detectKind();
+  if (kind === "launchd") {
+    // Installed = the plist exists (agent loaded). Running = it has a LIVE PID —
+    // a loaded-but-crashed agent reports no PID, so `launchctl list`'s exit code
+    // alone would falsely read as "running".
+    return { kind, installed: existsSync(MAC_PLIST), running: launchdPid() != null };
+  }
+  if (kind === "systemd-user" || kind === "systemd-system") {
+    const sysArgs = kind === "systemd-user" ? ["--user"] : [];
+    const unitPath =
+      kind === "systemd-user"
+        ? join(HOME, ".config/systemd/user", `${SYSTEMD_NAME}.service`)
+        : `/etc/systemd/system/${SYSTEMD_NAME}.service`;
+    return {
+      kind,
+      installed: existsSync(unitPath),
+      running: run("systemctl", [...sysArgs, "is-active", SYSTEMD_NAME]).out.trim() === "active",
+    };
+  }
+  if (kind === "schtasks") {
+    const q = run("schtasks", ["/Query", "/TN", WIN_TASK]);
+    return { kind, installed: q.ok, running: q.ok && /Running/i.test(q.out) };
+  }
+  return { kind, installed: false, running: false };
+}
+
 /** Stop AND disable the service — it won't restart or return on reboot. */
+/**
+ * Best-effort reaper for processes still holding our canonical API/dashboard
+ * ports. The supervisor stop should tear down the tree, but a previously
+ * hard-killed `openship up` (kill -9 / OOM / an old build that leaked the
+ * reaper) can orphan the API + dashboard onto the port — leaving `stop`
+ * reporting success while `lsof -i :4000` still shows live processes. Scoped to
+ * OUR ports (from ports.json) so it never touches an unrelated app. POSIX only.
+ *
+ * Reads through readStoredPorts (OS_DIR), NOT a hardcoded `~/.openship`: this used
+ * to inline its own path, so a from-source install (OPENSHIP_HOME=~/.openship-dev)
+ * swept the PRODUCTION install's ports — `openship stop` in the dev tree could
+ * SIGKILL the production API and dashboard. Every other part of this file already
+ * derives from OS_DIR precisely so the two installs can't fight.
+ */
+function sweepOrphanPorts(): void {
+  if (process.platform === "win32") return;
+  const stored = readStoredPorts();
+  const ports = [stored.api, stored.dashboard].filter((n): n is number => typeof n === "number");
+  if (ports.length === 0) return; // no remembered ports → nothing scoped to sweep
+  const self = process.pid;
+  for (const port of ports) {
+    const q = run("lsof", ["-ti", `tcp:${port}`]);
+    if (!q.ok) continue;
+    for (const token of q.out.split(/\s+/).filter(Boolean)) {
+      const pid = Number(token);
+      if (Number.isInteger(pid) && pid > 1 && pid !== self) {
+        try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+      }
+    }
+  }
+}
+
 export function stop(): ServiceResult {
   const kind = detectKind();
+  let result: ServiceResult;
 
   if (kind === "launchd") {
     run("launchctl", ["bootout", `gui/${process.getuid?.() ?? ""}/${MAC_LABEL}`]);
     if (existsSync(MAC_PLIST)) rmSync(MAC_PLIST, { force: true });
-    return { kind, detail: `launchd agent ${MAC_LABEL} stopped + removed` };
-  }
-
-  if (kind === "systemd-user" || kind === "systemd-system") {
+    result = { kind, detail: `launchd agent ${MAC_LABEL} stopped + removed` };
+  } else if (kind === "systemd-user" || kind === "systemd-system") {
     const sysArgs = kind === "systemd-user" ? ["--user"] : [];
     run("systemctl", [...sysArgs, "disable", "--now", SYSTEMD_NAME]);
     const unitPath = kind === "systemd-user"
@@ -215,14 +438,16 @@ export function stop(): ServiceResult {
       : `/etc/systemd/system/${SYSTEMD_NAME}.service`;
     if (existsSync(unitPath)) rmSync(unitPath, { force: true });
     run("systemctl", [...sysArgs, "daemon-reload"]);
-    return { kind, detail: `systemd unit ${SYSTEMD_NAME} stopped + disabled` };
-  }
-
-  if (kind === "schtasks") {
+    result = { kind, detail: `systemd unit ${SYSTEMD_NAME} stopped + disabled` };
+  } else if (kind === "schtasks") {
     run("schtasks", ["/End", "/TN", WIN_TASK]);
     run("schtasks", ["/Delete", "/TN", WIN_TASK, "/F"]);
-    return { kind, detail: `Scheduled Task ${WIN_TASK} stopped + removed` };
+    result = { kind, detail: `Scheduled Task ${WIN_TASK} stopped + removed` };
+  } else {
+    result = { kind, detail: "no supported service manager — nothing to stop" };
   }
 
-  return { kind, detail: "no supported service manager — nothing to stop" };
+  // Reap any leftovers on our ports so `stop` genuinely frees them.
+  sweepOrphanPorts();
+  return result;
 }

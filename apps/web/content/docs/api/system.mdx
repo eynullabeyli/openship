@@ -1,0 +1,158 @@
+---
+title: Installation settings
+description: Read and change self-hosted installation settings and setup.
+---
+
+import { TypeTable } from 'fumadocs-ui/components/type-table';
+
+Installation settings control a self-hosted Openship instance. Resource operations below use the shared
+SDK/HTTP interface where available; onboarding, recovery, and remaining setup endpoints are HTTP-only.
+
+See [Servers](/docs/api/servers) for hosts and component installation, [Edge administration](/docs/api/edge)
+for existing sites, and [Data transfer](/docs/api/data-transfer) for imports, exports, and team-mode migration.
+
+## Onboarding & setup
+
+`GET /api/system/onboarding` returns `{ configured: boolean }` — `true` once at least one server exists. The
+`POST` variant runs the same logic as the internal `/setup` push but only while the instance is unconfigured
+(it returns **403 "Instance already configured"** afterward), so first-run flows don't need a token.
+
+```
+POST /api/system/onboarding
+```
+
+<TypeTable
+  type={{
+    sshHost: { type: 'string', description: 'SSH host / IP of the target server. When present, a server row is created.' },
+    serverName: { type: 'string', description: 'Display name for the server.' },
+    sshPort: { type: 'number', description: 'SSH port.', default: '22' },
+    sshUser: { type: 'string', description: 'SSH user.', default: 'root' },
+    sshAuthMethod: { type: 'string', description: 'Auth method: password, key, or agent.' },
+    sshPassword: { type: 'string', description: 'SSH password (encrypted at rest).' },
+    sshKeyPath: { type: 'string', description: 'Path to a private key on the host.' },
+    sshKeyPassphrase: { type: 'string', description: 'Private-key passphrase (encrypted at rest).' },
+    sshJumpHost: { type: 'string', description: 'SSH jump / bastion host.' },
+    sshArgs: { type: 'string', description: 'Extra raw ssh args.' },
+    authMode: { type: '"none" | "local" | "cloud"', description: 'Instance auth mode.', default: 'none' },
+    tunnelProvider: { type: 'string', description: 'Tunnel provider.' },
+    tunnelToken: { type: 'string', description: 'Tunnel token.' },
+    defaultBuildMode: { type: 'string', description: 'Default build mode for new deployments.', default: 'auto' },
+    defaultRollbackWindow: { type: 'number', description: 'How many past releases to retain for rollback.' },
+  }}
+/>
+
+The `POST /api/system/setup` route accepts the same body but is reserved for the desktop app and requires the
+`internalAuth` shared token rather than a user session; it can also target an existing server by passing
+`serverId`.
+
+## Instance settings
+
+`GET /api/system/settings` returns the instance config (auth mode, tunnel provider, default build mode and
+rollback window, invitation mail source, team mode, migration target). `PATCH` updates only the fields you
+send. `DELETE` wipes instance settings **and** every server row.
+
+<Tabs items={['SDK', 'REST API']} groupId="api-transport" persist>
+<Tab value="SDK">
+
+```ts
+const result = await ship.system.updateSettings({
+  defaultBuildMode: "docker",
+});
+console.log(result);
+```
+
+</Tab>
+<Tab value="REST API">
+
+```bash
+curl -X PATCH "$OPENSHIP_URL/api/system/settings" \
+  -H "Authorization: Bearer $OPENSHIP_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"defaultBuildMode":"docker"}'
+```
+
+</Tab>
+</Tabs>
+
+<TypeTable
+  type={{
+    authMode: { type: '"none" | "local" | "cloud"', description: 'Instance auth mode. Switching to none on a non-desktop deployment is gated (see below).' },
+    confirm: { type: 'string', description: 'Required when setting authMode to "none" on a non-desktop box — must be exactly "I-understand-no-auth".' },
+    tunnelProvider: { type: 'string', description: 'Tunnel provider (send empty to clear).' },
+    tunnelToken: { type: 'string', description: 'Tunnel token.' },
+    defaultBuildMode: { type: 'string', description: 'Default build mode.', default: 'auto' },
+    defaultRollbackWindow: { type: 'number', description: 'Releases retained for rollback.' },
+    invitationMailSource: { type: '"platform" | "cloud"', description: 'Where team-invite emails are sent from.' },
+  }}
+/>
+
+<Callout title="Zero-auth is double-gated" type="warn">
+Setting `authMode: "none"` on anything other than a desktop deployment means anyone who can reach the API acts
+as admin. The operator must **both** start the process with `OPENSHIP_ALLOW_ZERO_AUTH=true` (else **403**) and
+send `confirm: "I-understand-no-auth"` in the body (else **400**).
+</Callout>
+
+## Promote zero-auth to a real login
+
+`POST /api/system/upgrade-to-auth` turns the synthetic zero-auth user into an email/password account and flips
+`authMode` from `none` to `local`, keeping the same user id so existing projects, deployments, and audit rows
+still resolve. It is only callable while `authMode === "none"` (otherwise **400**).
+
+```
+POST /api/system/upgrade-to-auth
+```
+
+<TypeTable
+  type={{
+    name: { type: 'string', description: 'Account display name (1–100 chars).', required: true },
+    email: { type: 'string', description: 'Account email (valid address, ≤254 chars).', required: true },
+    password: { type: 'string', description: 'Account password (8–128 chars).', required: true },
+    useOwnMailServer: { type: 'boolean', description: 'Warm the self-hosted mail server so it can send auth emails.', default: 'false' },
+  }}
+/>
+
+## Browse the host filesystem
+
+`GET /api/system/browse?path=<dir>` lists child directories of a path (defaults to the host's home
+directory), flagging which look like deployable projects. Used by the "deploy a local folder" picker.
+
+Returns `{ path, directories: [{ name, path, isProject }] }` — projects first, then alphabetical. Non-directory
+paths return **400**, missing paths **404**.
+
+## Operations
+
+{/* api-operations:start */}
+
+### Resource methods
+
+| Operation | SDK | REST API |
+| --- | --- | --- |
+| Browse an authorized host filesystem location. | `system.browse(input?)` | `GET /api/system/browse`<br />`settings:read` |
+| Read database and installation health. | `system.health()` | `GET /api/system/diagnostics`<br />`settings:read` |
+| Read instance settings. | `system.getSettings()` | `GET /api/system/settings`<br />`settings:read` |
+| Change instance settings. | `system.updateSettings(input)` | `PATCH /api/system/settings`<br />`settings:write` |
+| Read SMTP settings with secrets masked. | `system.getEmailSettings()` | `GET /api/system/settings/email`<br />`settings:read` |
+| Configure SMTP delivery for the installation. | `system.updateEmailSettings(input)` | `PUT /api/system/settings/email`<br />`settings:write` |
+| Send a test message using the configured SMTP settings. | `system.sendTestEmail(input)` | `POST /api/system/settings/email/test`<br />`settings:write` |
+| Reset supported instance settings. | `system.resetSettings()` | `DELETE /api/system/settings`<br />`settings:admin` |
+
+### HTTP endpoints
+
+| Operation | SDK | REST API |
+| --- | --- | --- |
+| Create the initial administrator during authorized bootstrap. | HTTP only | `POST /api/system/bootstrap-admin`<br />`Internal operator` · Self-hosted |
+| Begin the installation's Cloud account connection. | HTTP only | `POST /api/system/cloud-connect`<br />`Internal operator` · Self-hosted |
+| Read the installation's Cloud connection status. | HTTP only | `GET /api/system/cloud-status`<br />`Internal operator` · Self-hosted |
+| Read installation health. | HTTP only | `GET /api/system/health`<br />`Internal operator` · Self-hosted |
+| Create an account from an eligible self-hosted invitation. | HTTP only | `POST /api/system/invite-signup`<br />`Handler authentication` · Self-hosted |
+| First-run check — is any server configured yet? | HTTP only | `GET /api/system/onboarding`<br />`Handler authentication` · Self-hosted |
+| First-run setup; persists settings and creates the first server. Returns 403 once configured. | HTTP only | `POST /api/system/onboarding`<br />`Handler authentication` · Self-hosted |
+| Test a connection during initial onboarding. | HTTP only | `POST /api/system/onboarding/test-connection`<br />`Handler authentication` · Self-hosted |
+| Reset the administrator password through the local recovery boundary. | HTTP only | `POST /api/system/reset-admin-password`<br />`Internal operator` · Self-hosted |
+| Register the Openship installation as a managed application. | HTTP only | `POST /api/system/self-register`<br />`Internal operator` · Self-hosted |
+| Stream installation registration progress. | HTTP only | `GET /api/system/self-register/stream`<br />`Internal operator` · Self-hosted |
+| Read instance config for the desktop app. | HTTP only | `GET /api/system/setup`<br />`Internal operator` · Self-hosted |
+| Push instance config from the desktop app. | HTTP only | `POST /api/system/setup`<br />`Internal operator` · Self-hosted |
+| Promote a zero-auth instance to email/password login. | HTTP only | `POST /api/system/upgrade-to-auth`<br />`Handler authentication` · Self-hosted |
+
+{/* api-operations:end */}

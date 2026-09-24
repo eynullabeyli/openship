@@ -1,5 +1,13 @@
 import type { Deployment } from "./types";
 import type { Dictionary } from "@/i18n";
+import { DEPLOYMENT_HISTORY_STATUSES, type DeploymentHistoryFilter } from "@repo/core";
+
+/** UI aliases and raw API statuses use the same groups as server-side history. */
+function historyGroup(status: string): DeploymentHistoryFilter | undefined {
+  if (Object.hasOwn(DEPLOYMENT_HISTORY_STATUSES, status)) return status as DeploymentHistoryFilter;
+  return (Object.keys(DEPLOYMENT_HISTORY_STATUSES) as DeploymentHistoryFilter[])
+    .find((group) => (DEPLOYMENT_HISTORY_STATUSES[group] as readonly string[]).includes(status));
+}
 
 export const mapRowToDeployment = (row: any): Deployment => {
   const statusMap: Record<string, Deployment["status"]> = {
@@ -30,6 +38,7 @@ export const mapRowToDeployment = (row: any): Deployment => {
     branch: row.branch ?? undefined,
     projectId: row.projectId,
     projectName: row.projectName,
+    favicon: row.favicon ?? null,
     failureReason: row.errorMessage ?? undefined,
     /* Rollback state — flows from the listing endpoint, which enriches
      * each row with isActive and surfaces the orchestrator-owned
@@ -79,23 +88,23 @@ export const getStatusConfig = (status: string) => {
     case "success":
       return {
         icon: 'checkmark-72-1658234612.png',
-        color: "var(--color-emerald-500)",
-        bgColor: "bg-emerald-500/10",
-        borderColor: "border-emerald-500/20",
+        color: "var(--color-success)",
+        bgColor: "bg-success-bg",
+        borderColor: "border-success-border",
         label: "Deployed",
       };
     case "failed":
       return {
         icon: 'close remove-802-1662363936.png',
-        color: "var(--color-red-500)",
-        bgColor: "bg-red-500/10",
-        borderColor: "border-red-500/20",
+        color: "var(--color-danger)",
+        bgColor: "bg-danger-bg",
+        borderColor: "border-danger-border",
         label: "Failed",
       };
     case "canceled":
       return {
         icon: 'close%20circle-73-1658234612.png',
-        color: "var(--color-gray-500)",
+        color: "var(--color-neutral)",
         bgColor: "bg-muted/60",
         borderColor: "border-border/50",
         label: "Canceled",
@@ -103,26 +112,38 @@ export const getStatusConfig = (status: string) => {
     case "building":
       return {
         icon: 'loading-51-1663582768.png',
-        color: "var(--color-blue-500)",
-        bgColor: "bg-blue-500/10",
-        borderColor: "border-blue-500/20",
+        color: "var(--color-info)",
+        bgColor: "bg-info-bg",
+        borderColor: "border-info-border",
         label: "Building",
       };
     case "deploying":
       return {
         icon: 'loading-51-1663582768.png',
-        color: "var(--color-blue-500)",
-        bgColor: "bg-blue-500/10",
-        borderColor: "border-blue-500/20",
+        color: "var(--color-info)",
+        bgColor: "bg-info-bg",
+        borderColor: "border-info-border",
         label: "Deploying",
       };
     case "cancelled":
       return {
         icon: 'close%20circle-73-1658234612.png',
-        color: "var(--color-gray-500)",
+        color: "var(--color-neutral)",
         bgColor: "bg-muted/60",
         borderColor: "border-border/50",
         label: "Canceled",
+      };
+    case "no_changes":
+      // Nothing shipped because nothing had changed — a healthy outcome, so
+      // neutral rather than the warning tone a "didn't land" state gets. Kept out
+      // of `statusMap` above so it isn't folded into "canceled", which would tell
+      // the operator to redeploy something that is already current.
+      return {
+        icon: 'checkmark-72-1658234612.png',
+        color: "var(--color-neutral)",
+        bgColor: "bg-muted/60",
+        borderColor: "border-border/50",
+        label: "No changes",
       };
     case "partial_failure":
       // Some services succeeded, others failed. Treated as a
@@ -131,9 +152,9 @@ export const getStatusConfig = (status: string) => {
       // wholly green.
       return {
         icon: 'circle%20clock-39-1658435834.png',
-        color: "var(--color-amber-500)",
-        bgColor: "bg-amber-500/10",
-        borderColor: "border-amber-500/20",
+        color: "var(--color-warning)",
+        bgColor: "bg-warning-bg",
+        borderColor: "border-warning-border",
         label: "Partial",
       };
     case "rejected":
@@ -142,7 +163,7 @@ export const getStatusConfig = (status: string) => {
       // (otherwise the project falls back to draft). Record + logs are kept.
       return {
         icon: 'close%20circle-73-1658234612.png',
-        color: "var(--color-gray-500)",
+        color: "var(--color-neutral)",
         bgColor: "bg-muted/60",
         borderColor: "border-border/50",
         label: "Rejected",
@@ -153,17 +174,29 @@ export const getStatusConfig = (status: string) => {
       // status resolves to deployed/failed once the host is reachable.
       return {
         icon: 'loading-51-1663582768.png',
-        color: "var(--color-amber-500)",
-        bgColor: "bg-amber-500/10",
-        borderColor: "border-amber-500/20",
+        color: "var(--color-warning)",
+        bgColor: "bg-warning-bg",
+        borderColor: "border-warning-border",
         label: "Verifying",
+      };
+    case "action_required":
+      // A failure whose cause we can name and the operator can clear (today: the
+      // port was held by another process). Nothing deployed — but unlike a plain
+      // red "Failed" there is a next step, so it reads amber to match the project
+      // card's "Action Required" badge rather than looking like a dead end.
+      return {
+        icon: 'circle%20clock-39-1658435834.png',
+        color: "var(--color-warning)",
+        bgColor: "bg-warning-bg",
+        borderColor: "border-warning-border",
+        label: "Action required",
       };
     default:
       return {
         icon: 'circle%20clock-39-1658435834.png',
-        color: "var(--color-amber-500)",
-        bgColor: "bg-amber-500/10",
-        borderColor: "border-amber-500/20",
+        color: "var(--color-warning)",
+        bgColor: "bg-warning-bg",
+        borderColor: "border-warning-border",
         label: "Pending",
       };
   }
@@ -192,9 +225,7 @@ export const filterDeployments = (
   const { status = "all", searchQuery = "", projectId = "all" } = filters;
 
   return deployments.filter((deployment) => {
-    // Handle both "canceled" and "cancelled" spellings
-    const deploymentStatus = deployment.status === 'cancelled' ? 'canceled' : deployment.status;
-    const matchesStatus = status === "all" || deploymentStatus === status;
+    const matchesStatus = status === "all" || historyGroup(deployment.status) === status;
     const matchesSearch =
       !searchQuery ||
       deployment.commit.message.toLowerCase().includes(searchQuery.toLowerCase()) ||
@@ -211,14 +242,10 @@ export const filterDeployments = (
  * Calculates deployment statistics
  */
 export const calculateDeploymentStats = (deployments: Deployment[]) => {
-  return {
-    total: deployments.length,
-    success: deployments.filter((d) => d.status === "success").length,
-    failed: deployments.filter((d) => d.status === "failed").length,
-    building: deployments.filter((d) => d.status === "building").length,
-    pending: deployments.filter((d) => d.status === "pending").length,
-    // Handle both "canceled" and "cancelled" spellings
-    canceled: deployments.filter((d) => d.status === "canceled" || d.status === "cancelled").length,
-  };
+  const counts = { total: deployments.length, success: 0, failed: 0, building: 0, pending: 0, canceled: 0 };
+  for (const deployment of deployments) {
+    const group = historyGroup(deployment.status);
+    if (group) counts[group] += 1;
+  }
+  return counts;
 };
-

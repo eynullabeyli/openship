@@ -34,9 +34,9 @@ import { RestoreWizard } from "@/components/backup/RestoreWizard";
 
 const ICON_TONES = {
   primary: "bg-primary/10 text-primary",
-  amber: "bg-amber-500/10 text-amber-500",
-  emerald: "bg-emerald-500/10 text-emerald-500",
-  red: "bg-red-500/10 text-red-500",
+  amber: "bg-warning-bg text-warning",
+  emerald: "bg-success-bg text-success",
+  red: "bg-danger-bg text-danger",
   muted: "bg-muted/60 text-muted-foreground",
 } as const;
 
@@ -86,7 +86,7 @@ export function BackupSettings(): React.JSX.Element {
   const [runs, setRuns] = useState<BackupRun[]>([]);
   const [loading, setLoading] = useState(true);
   const [editingPolicy, setEditingPolicy] = useState<
-    { existing: BackupPolicy | null; serviceId: string | null; serviceName?: string } | null
+    { existing: BackupPolicy | null; serviceId: string | null; serviceName?: string; serviceImage?: string | null } | null
   >(null);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [restoreFromRun, setRestoreFromRun] = useState<BackupRun | null>(null);
@@ -156,6 +156,7 @@ export function BackupSettings(): React.JSX.Element {
           projectId={projectId}
           serviceId={editingPolicy.serviceId}
           serviceName={editingPolicy.serviceName}
+          serviceImage={editingPolicy.serviceImage}
           existing={editingPolicy.existing}
           onClose={() => setEditingPolicy(null)}
           onSaved={async () => {
@@ -210,12 +211,12 @@ export function BackupSettings(): React.JSX.Element {
                   <span className="ms-2 text-xs text-muted-foreground">{d.kind}</span>
                 </div>
                 {d.lastVerifiedAt ? (
-                  <span className="inline-flex items-center gap-1 text-[11px] text-emerald-600 dark:text-emerald-400">
+                  <span className="inline-flex items-center gap-1 text-[11px] text-success">
                     <CheckCircle2 className="size-3" />
                     {t.projectSettings.backup.destinations.verified}
                   </span>
                 ) : d.lastVerifyError ? (
-                  <span className="inline-flex items-center gap-1 text-[11px] text-red-600 dark:text-red-400">
+                  <span className="inline-flex items-center gap-1 text-[11px] text-danger">
                     <XCircle className="size-3" />
                     {t.projectSettings.backup.destinations.failed}
                   </span>
@@ -241,6 +242,59 @@ export function BackupSettings(): React.JSX.Element {
           </button>
         }
       >
+        {servicesData.services.length > 0 &&
+          (() => {
+            // Project-level policy — one policy that fans out to EVERY service.
+            const projectPolicy = policyByService.get(null) ?? null;
+            return (
+              <div className="mb-3 flex items-center justify-between gap-3 rounded-xl border border-border/50 bg-muted/20 px-3 py-2.5">
+                <div className="min-w-0">
+                  <p className="text-sm font-medium text-foreground">
+                    {t.widgets.backup.policyEditor.projectLevel}
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    {projectPolicy
+                      ? `${t.projectSettings.backup.services.policyLabel} ${projectPolicy.payloadKind}${projectPolicy.cronExpression ? ` · cron ${projectPolicy.cronExpression}` : ` · ${t.projectSettings.backup.services.manualOnly}`}`
+                      : t.projectSettings.backup.services.noPolicy}
+                  </p>
+                </div>
+                <div className="flex items-center gap-1">
+                  {projectPolicy ? (
+                    <>
+                      <button
+                        onClick={() => void handleRunNow(projectPolicy.id)}
+                        className="inline-flex items-center gap-1 rounded-lg bg-primary px-2.5 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90"
+                      >
+                        <PlayCircle className="size-3" />
+                        {t.projectSettings.backup.services.backupNow}
+                      </button>
+                      <button
+                        onClick={() => setEditingPolicy({ existing: projectPolicy, serviceId: null })}
+                        className="inline-flex items-center gap-1 rounded-lg bg-muted/50 px-2 py-1.5 text-xs font-medium hover:bg-muted"
+                        title={t.projectSettings.backup.services.editPolicy}
+                      >
+                        <Settings className="size-3" />
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      onClick={() => setEditingPolicy({ existing: null, serviceId: null })}
+                      disabled={destinations.length === 0}
+                      title={
+                        destinations.length === 0
+                          ? t.projectSettings.backup.services.addDestinationFirst
+                          : t.projectSettings.backup.services.createPolicyHint
+                      }
+                      className="inline-flex items-center gap-1 rounded-lg bg-muted/50 px-2.5 py-1.5 text-xs font-medium hover:bg-muted disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      <Plus className="size-3" />
+                      {t.projectSettings.backup.services.createPolicy}
+                    </button>
+                  )}
+                </div>
+              </div>
+            );
+          })()}
         {servicesData.services.length === 0 ? (
           <p className="text-sm text-muted-foreground">
             {t.projectSettings.backup.services.empty}
@@ -275,6 +329,7 @@ export function BackupSettings(): React.JSX.Element {
                               existing: policy,
                               serviceId: svc.id,
                               serviceName: svc.name,
+                              serviceImage: svc.image,
                             })
                           }
                           className="inline-flex items-center gap-1 rounded-lg bg-muted/50 px-2 py-1.5 text-xs font-medium hover:bg-muted"
@@ -290,6 +345,7 @@ export function BackupSettings(): React.JSX.Element {
                             existing: null,
                             serviceId: svc.id,
                             serviceName: svc.name,
+                            serviceImage: svc.image,
                           })
                         }
                         disabled={destinations.length === 0}
@@ -331,7 +387,7 @@ export function BackupSettings(): React.JSX.Element {
                 <li key={run.id} className="flex items-center justify-between gap-3 py-2.5 first:pt-0 last:pb-0">
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2 flex-wrap">
-                      <StatusChip status={run.status} />
+                      <StatusChip status={run.status} statusLabels={t.widgets.backup.runCard.status} />
                       <span className="text-xs text-muted-foreground">
                         {new Date(run.startedAt).toLocaleString()}
                       </span>
@@ -342,7 +398,7 @@ export function BackupSettings(): React.JSX.Element {
                       ) : null}
                       {isProtected && (
                         <span
-                          className="inline-flex items-center gap-1 rounded-full bg-amber-500/10 px-1.5 py-0.5 text-[10px] text-amber-600 dark:text-amber-400"
+                          className="inline-flex items-center gap-1 rounded-full bg-warning-bg px-1.5 py-0.5 text-[10px] text-warning"
                           title={t.projectSettings.backup.recent.protectedTitle}
                         >
                           <Lock className="size-2.5" />
@@ -351,7 +407,7 @@ export function BackupSettings(): React.JSX.Element {
                       )}
                     </div>
                     {run.errorMessage && (
-                      <p className="mt-0.5 truncate text-xs text-red-500" title={run.errorMessage}>
+                      <p className="mt-0.5 truncate text-xs text-danger" title={run.errorMessage}>
                         {run.errorMessage}
                       </p>
                     )}
@@ -398,24 +454,52 @@ export function BackupSettings(): React.JSX.Element {
   );
 }
 
-function StatusChip({ status }: { status: BackupRun["status"] }): React.JSX.Element {
+function StatusChip({
+  status,
+  statusLabels,
+}: {
+  status: BackupRun["status"];
+  statusLabels: ReturnType<typeof useI18n>["t"]["widgets"]["backup"]["runCard"]["status"];
+}): React.JSX.Element {
   const meta = (() => {
     switch (status) {
       case "succeeded":
-        return { color: "text-emerald-600 dark:text-emerald-400 bg-emerald-500/10", icon: CheckCircle2 };
+        return { color: "text-success bg-success-bg", icon: CheckCircle2 };
       case "failed":
       case "server_error":
       case "cancelled":
-        return { color: "text-red-600 dark:text-red-400 bg-red-500/10", icon: XCircle };
+        return { color: "text-danger bg-danger-bg", icon: XCircle };
       default:
-        return { color: "text-blue-600 dark:text-blue-400 bg-blue-500/10", icon: Loader2 };
+        return { color: "text-info bg-info-bg", icon: Loader2 };
     }
   })();
   const Icon = meta.icon;
+  const label = (() => {
+    switch (status) {
+      case "queued":
+        return statusLabels.queued;
+      case "preparing":
+        return statusLabels.preparing;
+      case "snapshotting":
+        return statusLabels.snapshotting;
+      case "uploading":
+        return statusLabels.uploading;
+      case "verifying":
+        return statusLabels.verifying;
+      case "succeeded":
+        return statusLabels.succeeded;
+      case "failed":
+        return statusLabels.failed;
+      case "cancelled":
+        return statusLabels.cancelled;
+      case "server_error":
+        return statusLabels.serverError;
+    }
+  })();
   return (
     <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium ${meta.color}`}>
       <Icon className={`size-3 ${status === "succeeded" || status === "failed" || status === "server_error" || status === "cancelled" ? "" : "animate-spin"}`} />
-      {status}
+      {label}
     </span>
   );
 }

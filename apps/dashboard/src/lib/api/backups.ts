@@ -31,6 +31,9 @@ export interface BackupDestinationSummary {
   isDefault: boolean;
   createdAt: string;
   updatedAt: string;
+  /** Storage rollup for this destination (bytes stored, backups run, last run).
+   *  Present on the list endpoint; null when unavailable. */
+  stats: { storedBytes: number; runCount: number; lastRunAt: string | null } | null;
 }
 
 export interface CreateDestinationInput {
@@ -103,6 +106,30 @@ export interface BackupRestore {
   bytesRestored: number | null;
   errorMessage: string | null;
   confirmationToken: string | null;
+  /**
+   * Outcome facts a status can't carry. `integrity` records WHICH check prepare
+   * ran; `destructive` / `partialWrite` say whether a cancelled or failed
+   * restore left the target holding half an archive.
+   */
+  meta?: {
+    integrity?: "sha256" | "size-only" | "deferred";
+    destructive?: boolean;
+    destructiveSource?: string;
+    partialWrite?: boolean;
+    serviceLeftStopped?: boolean;
+    forced?: boolean;
+  } | null;
+  cancelRequested?: boolean;
+}
+
+/** What POST /cancel reports. `status: "applying"` means the request was taken
+ *  and the running phase will honor it — not that it already happened. */
+export interface CancelRestoreResult {
+  ok: true;
+  accepted: boolean;
+  status: BackupRestore["status"];
+  destructive: boolean;
+  forced: boolean;
 }
 
 export interface BackupRun {
@@ -135,11 +162,36 @@ export interface BackupRun {
 
 // ─── API ─────────────────────────────────────────────────────────────────────
 
+/** One policy that targets a destination (destination detail "used by" view). */
+export interface DestinationUsagePolicy {
+  policyId: string;
+  sourceKind: string;
+  projectId: string | null;
+  projectName: string | null;
+  projectSlug: string | null;
+  serviceId: string | null;
+  serviceName: string | null;
+  mailServerId: string | null;
+  payloadKind: string;
+  cronExpression: string | null;
+  enabled: boolean;
+  lastRun:
+    | { id: string; status: string; startedAt: string; finishedAt: string | null; bytesTransferred: number | null }
+    | null;
+}
+
+export interface DestinationUsage {
+  destination: BackupDestinationSummary;
+  policies: DestinationUsagePolicy[];
+}
+
 export const backupDestinationsApi = {
   list: () =>
     api.get<{ data: BackupDestinationSummary[] }>(endpoints.backupDestinations.list),
   get: (id: string) =>
     api.get<{ data: BackupDestinationSummary }>(endpoints.backupDestinations.get(id)),
+  usage: (id: string) =>
+    api.get<{ data: DestinationUsage }>(endpoints.backupDestinations.usage(id)),
   create: (body: CreateDestinationInput) =>
     api.post<{ data: BackupDestinationSummary }>(
       endpoints.backupDestinations.create,
@@ -156,6 +208,13 @@ export const backupDestinationsApi = {
     api.post<{ data: { ok: boolean; reason?: string } }>(
       endpoints.backupDestinations.preflight(id),
     ),
+  /** Test an unsaved destination. Pass `id` to reuse stored secrets for
+   *  fields left blank (edit mode). Nothing is persisted. */
+  preflightDraft: (body: CreateDestinationInput & { id?: string }) =>
+    api.post<{ data: { ok: boolean; reason?: string } }>(
+      endpoints.backupDestinations.preflightDraft,
+      body,
+    ),
 };
 
 export const backupsApi = {
@@ -166,14 +225,17 @@ export const backupsApi = {
     body: {
       serviceId?: string | null;
       destinationId: string;
-      cronExpression?: string;
+      cronExpression?: string | null;
       triggerOnPreDeploy?: boolean;
-      retainCount?: number;
-      retainDays?: number;
+      enableWebhook?: boolean;
+      /** Explicit null = keep every run. Omitted = the instance default (7). The
+       *  two are NOT the same, which is why null is allowed here. */
+      retainCount?: number | null;
+      retainDays?: number | null;
       payloadKind?: string;
       payloadConfig?: Record<string, unknown>;
-      preHook?: string;
-      postHook?: string;
+      preHook?: string | null;
+      postHook?: string | null;
       enabled?: boolean;
     },
   ) =>
@@ -218,7 +280,7 @@ export const backupsApi = {
     ),
 
   cancelRestore: (restoreId: string) =>
-    api.post<{ data: { ok: true } }>(endpoints.backups.cancelRestore(restoreId)),
+    api.post<{ data: CancelRestoreResult }>(endpoints.backups.cancelRestore(restoreId)),
 
   getRestore: (restoreId: string) =>
     api.get<{ data: BackupRestore }>(endpoints.backups.getRestore(restoreId)),

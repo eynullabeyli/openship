@@ -1,3 +1,4 @@
+import { createEncryption } from "../encryption";
 import { describe, it, expect, beforeEach } from "vitest";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
@@ -22,7 +23,7 @@ async function freshRepo() {
   const db = drizzle(client, { schema });
   await migrate(db, { migrationsFolder: MIGRATIONS_DIR });
   await client.exec("SET session_replication_role = replica;"); // skip FK seeding
-  return { db, repo: createProjectRepo(db) };
+  return { db, repo: createProjectRepo(db, createEncryption("repository-test-secret")) };
 }
 
 async function seed(db: Awaited<ReturnType<typeof freshRepo>>["db"]) {
@@ -51,7 +52,7 @@ describe("project.repo env writes (PGlite)", () => {
   beforeEach(async () => {
     ctx = await freshRepo();
     await seed(ctx.db);
-  });
+  }, 30_000);
 
   it("mergeEnvVars touches ONLY the named keys — untouched secret + other scopes survive", async () => {
     await ctx.repo.mergeEnvVars(

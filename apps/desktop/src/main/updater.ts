@@ -5,13 +5,29 @@
  * downloadUpdate() (streams the platform installer with progress) →
  * installUpdate() (seamless self-replace + relaunch).
  *
- * No code signing needed: we download the installer and swap the app
- * ourselves (not Squirrel.Mac, which requires signing). A detached script
- * does the swap because a running app can't overwrite its own bundle.
+ * We download the installer and swap the app ourselves (not Squirrel.Mac, which
+ * requires signing). A detached script does the swap because a running app can't
+ * overwrite its own bundle.
+ *
+ * Trust: the release feed and asset host are pinned, and the download must match
+ * the release's sha256 sidecar or it is refused. That's integrity only — the
+ * sidecar shares the asset's trust domain, so an attacker who can replace the
+ * release asset can replace it too. Real code-signature verification is the
+ * remaining gap.
  */
 
 import { app, net, shell } from "electron";
-import { resolveDesktopUpdate, type GithubReleasePayload } from "@repo/core";
+import {
+  changelogMarkdownUrl,
+  extractChangelogSection,
+  resolveDesktopUpdate,
+  RELEASES_LATEST_API,
+  type DesktopUpdateAsset,
+  type DesktopUpdateCheck,
+  type DesktopUpdateSnapshot,
+  type GithubReleasePayload,
+} from "@repo/core";
+import { createHash } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import {
   chmodSync,
@@ -23,49 +39,110 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { advisoryManifestUrl, parseManifest, type AdvisoryManifest } from "@repo/core";
+import { isAllowedUpdateAssetUrl } from "./security";
 
-const RELEASES_API = "https://api.github.com/repos/oblien/openship/releases/latest";
+export type UpdateAsset = DesktopUpdateAsset;
+export type UpdateInfo = Extract<DesktopUpdateCheck, { available: true }>;
+export type UpdateCheck = DesktopUpdateSnapshot;
 
-export interface UpdateAsset {
-  name: string;
-  url: string;
-  size: number;
+let cachedCheck: UpdateCheck | null = null;
+let inFlightCheck: Promise<UpdateCheck> | null = null;
+
+/** Startup, renderer navigation and manual checks share one request in flight. */
+export function checkForUpdate(options: { force?: boolean } = {}): Promise<UpdateCheck> {
+  if (inFlightCheck) return inFlightCheck;
+  if (!options.force && cachedCheck) return Promise.resolve(cachedCheck);
+  inFlightCheck = checkForUpdateUncached()
+    .then((result) => {
+      // Offline is not a successful session cache: allow the next caller to retry.
+      cachedCheck = result.latest ? result : null;
+      return result;
+    })
+    .finally(() => {
+      inFlightCheck = null;
+    });
+  return inFlightCheck;
 }
-export interface UpdateInfo {
-  available: true;
-  version: string;
-  notes: string;
-  asset: UpdateAsset;
-}
-export type UpdateCheck = UpdateInfo | { available: false };
 
 /**
- * Ask GitHub for the latest release; return update info if it's newer than
- * the running version and has an installer for this platform. Never throws —
- * a failed check (offline, rate-limited) resolves to "no update". The asset
- * selection + version gate live in @repo/core (`resolveDesktopUpdate`) so they
- * are unit-tested against synthetic release payloads — that is the single
- * source of truth for which asset each platform pulls.
+ * Ask GitHub for the latest release, then read the changelog and advisory
+ * manifest pinned to its tag before handing the result to
+ * `resolveDesktopUpdate`. Never throws — a failed release check (offline,
+ * rate-limited) resolves to "no update".
+ *
+ * This function is I/O only. The whole decision — which asset this platform
+ * pulls, whether the release is newer, and whether an advisory authorizes
+ * interrupting the user — lives in @repo/core, unit-tested against synthetic
+ * payloads. Nothing here re-checks or re-derives any of it.
  */
-export async function checkForUpdate(): Promise<UpdateCheck> {
+async function checkForUpdateUncached(): Promise<UpdateCheck> {
   try {
-    const res = await net.fetch(RELEASES_API, {
+    const res = await net.fetch(RELEASES_LATEST_API, {
       headers: {
         Accept: "application/vnd.github+json",
         "User-Agent": "Openship-Desktop",
       },
       signal: AbortSignal.timeout(10_000),
     });
-    if (!res.ok) return { available: false };
+    if (!res.ok) return { available: false, latest: null, manifest: null };
     const data = (await res.json()) as GithubReleasePayload;
-    return resolveDesktopUpdate({
-      releasePayload: data,
-      platform: process.platform,
-      arch: process.arch,
-      currentVersion: app.getVersion(),
-    });
+    const tag = (data?.tag_name ?? "").trim();
+    if (!tag) return { available: false, latest: null, manifest: null };
+    // These are independent, fail-soft reads. A missing changelog must never
+    // suppress a critical advisory (or the reverse).
+    const [manifest, changelogNotes] = await Promise.all([fetchManifest(tag), fetchChangelog(tag)]);
+    return {
+      ...resolveDesktopUpdate({
+        releasePayload: data,
+        platform: process.platform,
+        arch: process.arch,
+        currentVersion: app.getVersion(),
+        manifest,
+        changelogNotes,
+      }),
+      latest: { version: tag.replace(/^v/, ""), tag, notes: changelogNotes ?? "" },
+      manifest,
+    };
   } catch {
-    return { available: false };
+    return { available: false, latest: null, manifest: null };
+  }
+}
+
+/** Exact release section from the immutable changelog at this release tag. */
+async function fetchChangelog(tag: string): Promise<string | null> {
+  if (!tag) return null;
+  try {
+    const res = await net.fetch(changelogMarkdownUrl(tag), {
+      headers: { Accept: "text/markdown", "User-Agent": "Openship-Desktop" },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) return null;
+    return extractChangelogSection(await res.text(), tag);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The advisory manifest for a release tag, validated through the same
+ * `parseManifest` the dashboard uses (it's untrusted third-party JSON as far as
+ * any client is concerned).
+ *
+ * Fails CLOSED: no tag, unreachable, or malformed → null → no announcement → we
+ * stay quiet. A broken manifest must never become an unexpected modal on launch.
+ */
+async function fetchManifest(tag: string): Promise<AdvisoryManifest | null> {
+  if (!tag) return null;
+  try {
+    const res = await net.fetch(advisoryManifestUrl(tag), {
+      headers: { Accept: "application/json", "User-Agent": "Openship-Desktop" },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) return null;
+    return parseManifest(await res.json());
+  } catch {
+    return null;
   }
 }
 
@@ -74,6 +151,13 @@ export async function downloadUpdate(
   asset: UpdateAsset,
   onProgress: (fraction: number) => void,
 ): Promise<string> {
+  // The release feed comes from the pinned repo, but the asset URL inside it was
+  // previously followed wherever it pointed — so a tampered feed could source the
+  // installer from any host. Pin it to GitHub's own release hosts.
+  if (!isAllowedUpdateAssetUrl(asset.url)) {
+    throw new Error(`Refusing to download update from untrusted URL: ${asset.url}`);
+  }
+
   const dir = join(app.getPath("temp"), "openship-update");
   mkdirSync(dir, { recursive: true });
   const dest = join(dir, asset.name);
@@ -88,12 +172,14 @@ export async function downloadUpdate(
   const total = Number(res.headers.get("content-length")) || asset.size || 0;
   const file = createWriteStream(dest);
   const reader = res.body.getReader();
+  const hash = createHash("sha256");
   let received = 0;
 
   try {
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
+      hash.update(value);
       if (!file.write(Buffer.from(value))) {
         await new Promise<void>((r) => file.once("drain", r));
       }
@@ -107,6 +193,45 @@ export async function downloadUpdate(
     file.on("finish", () => r());
     file.on("error", j);
   });
+
+  // Integrity gate: verify the sha256 sidecar the release publishes, and FAIL
+  // CLOSED. A mismatch and a missing sidecar are both refusals — treating absence
+  // as "install anyway" made the check bypassable by whoever could swap the asset,
+  // which is the only attacker it defends against. release.yml publishes a sidecar
+  // for every desktop artifact, and the sidecar is always read from the release
+  // we're installing, so failing closed can't strand a real release.
+  //
+  // This is integrity, NOT authenticity: the sidecar shares the asset's trust
+  // domain. Genuine signature verification is still missing.
+  const digest = hash.digest("hex");
+  let expected: string | null = null;
+  let sidecarError = "unreachable";
+  try {
+    const shaRes = await net.fetch(`${asset.url}.sha256`, {
+      headers: { "User-Agent": "Openship-Desktop" },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!shaRes.ok) sidecarError = `HTTP ${shaRes.status}`;
+    else {
+      const tok = (await shaRes.text()).trim().split(/\s+/)[0]?.toLowerCase();
+      if (tok && /^[0-9a-f]{64}$/.test(tok)) expected = tok;
+      else sidecarError = "malformed";
+    }
+  } catch {
+    sidecarError = "unreachable";
+  }
+  if (!expected) {
+    rmSync(dest, { force: true });
+    throw new Error(
+      `Update integrity check failed — no usable .sha256 for ${asset.name} (${sidecarError}). Refusing to install.`,
+    );
+  }
+  if (expected !== digest) {
+    rmSync(dest, { force: true });
+    throw new Error(
+      `Update checksum mismatch — refusing to install ${asset.name} (expected ${expected}, got ${digest}).`,
+    );
+  }
   return dest;
 }
 
@@ -156,11 +281,9 @@ function installMac(dmg: string): void {
   const staged = join(app.getPath("temp"), "openship-update", "Openship.app");
 
   // Mount, copy the new .app out, unmount — all before we quit.
-  const attach = spawnSync(
-    "hdiutil",
-    ["attach", "-nobrowse", "-readonly", "-noverify", dmg],
-    { encoding: "utf8" },
-  );
+  const attach = spawnSync("hdiutil", ["attach", "-nobrowse", "-readonly", "-noverify", dmg], {
+    encoding: "utf8",
+  });
   if (attach.status !== 0) return fallbackOpen(dmg);
   const mount = (attach.stdout.match(/\/Volumes\/[^\n]*/g) ?? []).pop()?.trim();
   if (!mount) return fallbackOpen(dmg);
@@ -175,15 +298,27 @@ function installMac(dmg: string): void {
     spawnSync("hdiutil", ["detach", mount, "-quiet"]);
   }
 
-  // Wait for us to exit, swap the bundle, relaunch.
+  // Wait for us to exit, then swap SAFELY: build the new bundle BESIDE the old
+  // (a failed copy can't brick us — the old app is untouched), swap it in with
+  // two atomic renames, and if the new bundle won't open, roll back to the
+  // backup. The previous version did `rm -rf <live> && ditto` — a `ditto`
+  // failure after the delete left NO app.
   runDetachedAfterExit(
     [
       "#!/bin/bash",
       `while kill -0 ${process.pid} 2>/dev/null; do sleep 0.4; done`,
-      `rm -rf "${installedApp}"`,
-      `ditto "${staged}" "${installedApp}"`,
-      `open "${installedApp}"`,
-      `rm -rf "${staged}"`,
+      `INSTALLED="${installedApp}"`,
+      `STAGED="${staged}"`,
+      `NEW="$INSTALLED.new"; BAK="$INSTALLED.bak"`,
+      `rm -rf "$NEW" "$BAK"`,
+      // Copy into place beside the old bundle first; on failure relaunch the
+      // untouched old app and bail.
+      `if ! ditto "$STAGED" "$NEW"; then open "$INSTALLED"; rm -rf "$NEW"; exit 0; fi`,
+      // Atomic double-rename (same filesystem) — the install path is never empty
+      // for more than a rename.
+      `mv "$INSTALLED" "$BAK" && mv "$NEW" "$INSTALLED"`,
+      // Relaunch; roll back to the backup if the new bundle fails to open.
+      `if open "$INSTALLED"; then rm -rf "$BAK" "$STAGED"; else rm -rf "$INSTALLED"; mv "$BAK" "$INSTALLED"; open "$INSTALLED"; fi`,
       "",
     ].join("\n"),
     "sh",
@@ -249,13 +384,16 @@ function installWindows(zip: string): void {
 function installLinux(appImage: string): void {
   const current = process.env.APPIMAGE;
   if (!current) return fallbackOpen(appImage);
+  // Stage beside the live AppImage then atomic-rename — a `cp -f` straight over
+  // the running file could leave a half-written, unlaunchable binary if it fails
+  // mid-copy. On any failure the current AppImage is left untouched.
   runDetachedAfterExit(
     [
       "#!/bin/bash",
       `while kill -0 ${process.pid} 2>/dev/null; do sleep 0.4; done`,
-      `cp -f "${appImage}" "${current}"`,
-      `chmod +x "${current}"`,
-      `"${current}" &`,
+      `CUR="${current}"`,
+      `if cp -f "${appImage}" "$CUR.new" && chmod +x "$CUR.new"; then mv -f "$CUR.new" "$CUR"; else rm -f "$CUR.new"; fi`,
+      `"$CUR" &`,
       "",
     ].join("\n"),
     "sh",

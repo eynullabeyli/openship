@@ -1,0 +1,144 @@
+---
+title: Domains and TLS
+description: Attach hostnames, verify DNS, and manage certificates.
+---
+
+import { TypeTable } from 'fumadocs-ui/components/type-table';
+
+Domains connect hostnames to a project and track DNS verification and TLS certificates. The SDK takes a
+project ID as the first argument when creating or listing domains; REST includes it in the body or query.
+
+## Add a domain
+
+<Tabs items={['SDK', 'REST API']} groupId="api-transport" persist>
+<Tab value="SDK">
+
+```ts
+const result = await ship.domains.create("proj_123", {
+  hostname: "app.example.com",
+});
+console.log(result);
+```
+
+</Tab>
+<Tab value="REST API">
+
+```bash
+curl -X POST "$OPENSHIP_URL/api/domains" \
+  -H "Authorization: Bearer $OPENSHIP_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"projectId":"proj_123","hostname":"app.example.com"}'
+```
+
+</Tab>
+</Tabs>
+
+<TypeTable
+  type={{
+    projectId: { type: 'string', description: 'The project to attach the domain to.', required: true },
+    hostname: { type: 'string', description: 'The fully-qualified domain, e.g. app.example.com.', required: true },
+    isPrimary: { type: 'boolean', description: "Make this the project's primary domain.", default: 'false' },
+    externalIngress: { type: 'boolean', description: 'TLS is terminated upstream (Cloudflare Tunnel, a load balancer). Openship verifies ownership by DNS TXT only, does not require the domain to resolve to this box, and issues no certificate.', default: 'false' },
+    includeWww: { type: 'boolean', description: 'Also claim www.<hostname> as a SEPARATE domain — its own row, DNS record, verification and certificate, created as a 301 to the bare domain. The response carries its id in `www` (or the reason it could not be claimed in `wwwError`), and `records` includes its DNS record.', default: 'false' },
+    redirectTo: { type: 'string', description: 'Answer a redirect to another domain of the SAME project instead of serving the app. Must be one of the project\'s own hostnames; self-targets and loops are refused. Self-hosted only.' },
+    redirectStatus: { type: 'number', description: 'Redirect code used with redirectTo: 301, 302, 307 or 308.', default: '301' },
+  }}
+/>
+
+<Callout title="Adding a domain doesn't make it live by itself" type="info">
+After adding, you must point your DNS at Openship and then **verify**. Use `POST /api/domains/preview`
+(or `openship domain preview <hostname>`) to see the exact records to add at your DNS provider first.
+</Callout>
+
+## Preview required DNS
+
+Side-effect-free: pass a hostname, get back the records to create. `POST` is used only so the hostname
+travels in the body.
+
+<Tabs items={['SDK', 'REST API']} groupId="api-transport" persist>
+<Tab value="SDK">
+
+```ts
+const result = await ship.domains.preview({
+  hostname: "app.example.com",
+});
+console.log(result);
+```
+
+</Tab>
+<Tab value="REST API">
+
+```bash
+curl -X POST "$OPENSHIP_URL/api/domains/preview" \
+  -H "Authorization: Bearer $OPENSHIP_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"hostname":"app.example.com"}'
+```
+
+</Tab>
+</Tabs>
+
+The response's `mode` tells you which setup applies: `selfhosted` (an A record to your server), `cloud`
+(a CNAME to Openship Cloud), or `external` (a TXT record only — you front TLS yourself).
+
+## Verify a domain
+
+<Tabs items={['SDK', 'REST API']} groupId="api-transport" persist>
+<Tab value="SDK">
+
+```ts
+const verification = await ship.domains.verify("dom_123");
+console.log(verification);
+```
+
+</Tab>
+<Tab value="REST API">
+
+```bash
+curl -X POST "$OPENSHIP_URL/api/domains/dom_123/verify" \
+  -H "Authorization: Bearer $OPENSHIP_TOKEN"
+```
+
+</Tab>
+</Tabs>
+
+Once DNS is in place, verify it. Openship checks the routing record and the ownership TXT record, marks the
+domain active, and (unless it's external-ingress) provisions SSL in the background.
+
+## Errors
+
+<Callout title="422 — verification failed" type="warn">
+The DNS records aren't resolving yet, or don't match. DNS can take minutes to hours to propagate. Confirm
+the records match `preview` exactly, then retry. The response's `cnameVerified` / `txtVerified` flags tell
+you which check is still failing.
+</Callout>
+
+<Callout title="404 on a per-domain route" type="error">
+The `:id` doesn't belong to your organization (or was deleted). List your domains with `GET /api/domains`
+to get valid IDs.
+</Callout>
+
+## Operations
+
+{/* api-operations:start */}
+
+| Operation | SDK | REST API |
+| --- | --- | --- |
+| Stream domain verification progress. | `domains.verifyStream(id, input?, options?)` | `POST /api/domains/:id/verify/stream`<br />`domain:write` |
+| List domains using the supplied filters. | `domains.list(id)` | `GET /api/domains`<br />`domain:list` |
+| Attach a domain using the requested project and routing configuration. | `domains.create(id, input)` | `POST /api/domains`<br />`domain:write` |
+| Read one domain record. | `domains.get(id)` | `GET /api/domains/:id`<br />`domain:read` |
+| Remove a domain and its routing binding. | `domains.remove(id)` | `DELETE /api/domains/:id`<br />`domain:admin` |
+| Run domain verification. | `domains.verify(id, input?)` | `POST /api/domains/:id/verify`<br />`domain:write` |
+| Read DNS records required by a domain. | `domains.records(id, input?)` | `GET /api/domains/:id/records`<br />`domain:read` |
+| Preview DNS changes before applying them. | `domains.dnsPlan(id, input?)` | `GET /api/domains/:id/dns/plan`<br />`domain:read` |
+| Apply the authorized DNS plan. | `domains.dnsApply(id, input?)` | `POST /api/domains/:id/dns/apply`<br />`domain:write` |
+| Select the project’s primary domain. | `domains.setPrimary(id)` | `POST /api/domains/:id/primary`<br />`domain:write` |
+| Request certificate renewal for a domain record. | `domains.renewSsl(id)` | `POST /api/domains/:id/renew`<br />`domain:write` |
+| Check the domain’s current certificate. | `domains.verifySsl(id)` | `POST /api/domains/:id/verify-ssl`<br />`domain:write` |
+| Install a supplied certificate and private key. | `domains.uploadCert(id, input)` | `POST /api/domains/:id/certificate`<br />`domain:write` · Self-hosted |
+| Preview domain connection requirements. | `domains.preview(input)` | `POST /api/domains/preview`<br />`domain:read` |
+| Request renewal for eligible certificates. | `domains.renewAllSsl()` | `POST /api/domains/renew-all`<br />`domain:write` |
+| Verify pending domains visible to the caller. | `domains.verifyPending(input?)` | `POST /api/domains/verify-pending`<br />`domain:write` |
+
+{/* api-operations:end */}

@@ -1,0 +1,52 @@
+---
+title: Openship CLI
+description: Deploy applications and manage Openship from your terminal.
+---
+
+Use the CLI to deploy code, inspect releases, manage services, and operate a self-hosted installation.
+
+## Install
+
+```bash
+npm install -g openship
+openship --help
+```
+
+Node.js 22 or later is required. A local `npm install openship` also provides the command through `npx`.
+The reference follows this repository; use `--help` to check your installed version. Native SDK mode and
+SDK imports require the [preview package](/docs/api/sdk/installation) until its release is published.
+
+## Connect and deploy
+
+Start a [local installation](/docs/cli/run), or connect to an existing one:
+
+```bash
+openship login \
+  --api-url https://ship.example.com \
+  --dashboard-url https://ship.example.com \
+  --context production
+
+openship project list
+openship init --project proj_123
+openship deploy --watch
+```
+
+`login` opens the token settings page and asks for a personal access token. `init` links the current
+directory to a project. `deploy --watch` submits a deployment and follows its progress.
+
+## Choose a workflow
+
+<Cards>
+  <Card title="Connect and authenticate" href="/docs/cli/access" description="Manage contexts, tokens, and direct HTTP requests." />
+  <Card title="Deploy and inspect releases" href="/docs/cli/deploy" description="Deploy folders or Git projects, read logs, and roll back." />
+  <Card title="Manage applications" href="/docs/cli/projects" description="Work with projects, services, domains, and catalog apps." />
+  <Card title="Operate infrastructure" href="/docs/cli/self-host" description="Manage servers, backups, mail, and installation settings." />
+  <Card title="Use native SDK mode" href="/docs/cli/native" description="Run supported commands against an explicitly configured native installation." />
+  <Card title="Complete command reference" href="/docs/cli/reference" description="Every command, subcommand, argument, and option, grouped by task." />
+</Cards>
+
+## Scripts and application code
+
+Use `openship --json project list` for machine-readable command output. See [automation](/docs/cli/automation)
+for CI setup and exit handling. To call the same operations directly from JavaScript or TypeScript,
+use the [Node.js SDK](/docs/api/sdk).

@@ -25,9 +25,15 @@
  */
 
 import type { Context } from "hono";
-import { setSignedCookie } from "hono/cookie";
-import { auth, COOKIE_PREFIX } from "../../lib/auth";
-import { env, localDashboardUrl } from "../../config/env";
+import { auth, isSaasDeployment } from "@repo/platform/engine/lib/auth";
+import { repos } from "@repo/db";
+import {
+  invitationAccountCreationMode,
+  resolveInvitationClaim,
+} from "@repo/platform/engine/lib/invitation-claim";
+import { setSessionCookie } from "../../lib/session-cookie";
+import { localDashboardUrl } from "@repo/platform/engine/config/env";
+import { alignLoopbackOrigin } from "@repo/core";
 
 // ─── HTML result page ────────────────────────────────────────────────────────
 
@@ -44,33 +50,46 @@ function desktopResultPage(title: string, message: string, success = false): str
 </body></html>`;
 }
 
-/**
- * Stamp the response with a signed Better Auth session cookie. Shared
- * by every successful auth path so cookie attributes (httpOnly, Lax,
- * /, expiry) stay consistent — drift between paths would cause subtle
- * "logged in but redirected to /login" bugs.
- */
-async function setSessionCookie(
-  c: Context,
-  token: string,
-  expiresAt: Date,
-): Promise<void> {
-  await setSignedCookie(
-    c,
-    `${COOKIE_PREFIX}.session_token`,
-    token,
-    env.BETTER_AUTH_SECRET,
-    {
-      httpOnly: true,
-      secure: false,
-      sameSite: "Lax",
-      path: "/",
-      expires: expiresAt,
-    },
-  );
-}
-
 // ─── Handlers ────────────────────────────────────────────────────────────────
+
+/**
+ * GET /api/auth/invitation-preview/:id
+ *
+ * Invitation claim pages must load before an invitee has a session. Better
+ * Auth's own get-invitation endpoint is session-bound, so expose only the
+ * token-bound, non-secret projection the page needs. Every invalid lifecycle
+ * state is the same 404 to avoid turning this into an invitation oracle.
+ */
+export async function invitationPreview(c: Context) {
+  c.header("Cache-Control", "no-store");
+  c.header("Referrer-Policy", "no-referrer");
+
+  const invitationId = (c.req.param("id") ?? "").trim();
+  const claim = await resolveInvitationClaim(invitationId);
+  if (!claim) {
+    return c.json({ error: "This invitation is invalid or has expired." }, 404);
+  }
+
+  const existingUser = await repos.user.findByEmail(claim.email);
+  const accountCreation = invitationAccountCreationMode({
+    accountExists: !!existingUser,
+    isSaas: isSaasDeployment,
+    inviterIsInstanceAdmin: claim.inviterIsInstanceAdmin,
+  });
+
+  return c.json({
+    data: {
+      invitation: {
+        id: claim.id,
+        email: claim.email,
+        role: claim.role,
+        expiresAt: claim.expiresAt.toISOString(),
+      },
+      organization: claim.organization,
+      accountCreation,
+    },
+  });
+}
 
 /**
  * GET /api/auth/get-session
@@ -97,9 +116,13 @@ export async function getSession(c: Context) {
     // session lookup failed — fall through to zero-auth bootstrap below
   }
 
-  const { getAuthMode } = await import("../../lib/auth-mode");
-  const authMode = await getAuthMode();
-  if (authMode !== "none") {
+  // This endpoint MINTS an owner-privileged session, so it must pass the SAME
+  // zero-auth gate as authMiddleware — not just authMode===none. Without the
+  // kernel-peer loopback check + public/CLI refusals, a network peer reaching a
+  // desktop API bound to 0.0.0.0 could mint an admin session unauthenticated.
+  const { zeroAuthAllowed } = await import("../../middleware/zero-auth-guard");
+  const gate = await zeroAuthAllowed(c);
+  if (!gate.ok) {
     return c.json({ error: "Unauthorized" }, 401);
   }
 
@@ -143,10 +166,23 @@ export async function getSession(c: Context) {
  * the cookie, and reaches the dashboard.
  */
 export async function desktopLogin(c: Context) {
-  const { getAuthMode } = await import("../../lib/auth-mode");
-  const authMode = await getAuthMode();
-  if (authMode !== "none") {
-    return c.redirect(`${localDashboardUrl}/login`);
+  // The session cookie we mint below is host-only, scoped to whatever loopback
+  // host the browser used to reach this endpoint. Align the dashboard redirect
+  // to that SAME host (Host header) so the just-set cookie is actually sent —
+  // otherwise the fixed localDashboardUrl (e.g. localhost:3001) differs from the
+  // cookie's host (e.g. 127.0.0.1) and the dashboard lands cookieless, bouncing
+  // to /login (#44). Non-loopback hosts pass through unchanged (never off-box).
+  const host = c.req.header("host");
+  const proto = c.req.header("x-forwarded-proto")?.split(",")[0]?.trim() || "http";
+  const dashboardUrl = host
+    ? alignLoopbackOrigin(localDashboardUrl, `${proto}://${host}`)
+    : localDashboardUrl;
+
+  // Same mint gate as getSession — loopback-only zero-auth, never remote.
+  const { zeroAuthAllowed } = await import("../../middleware/zero-auth-guard");
+  const gate = await zeroAuthAllowed(c);
+  if (!gate.ok) {
+    return c.redirect(`${dashboardUrl}/login`);
   }
 
   const { ensureLocalUser } = await import("../../lib/local-user");
@@ -161,7 +197,7 @@ export async function desktopLogin(c: Context) {
   });
   await setSessionCookie(c, session.token, session.expiresAt);
 
-  return c.redirect(localDashboardUrl);
+  return c.redirect(dashboardUrl);
 }
 
 /**

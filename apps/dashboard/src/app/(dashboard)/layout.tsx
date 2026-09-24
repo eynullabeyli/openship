@@ -1,6 +1,8 @@
 import { redirect } from "next/navigation";
-import { getSession, getDeploymentInfo } from "@/lib/server/session";
-import { Sidebar } from "@/components/sidebar";
+import { getSession, getDeploymentInfoOrNull } from "@/lib/server/session";
+import { resolveRequestProductView } from "@/lib/server/product-view";
+import { ApiUnavailable } from "@/components/api-unavailable";
+import { DashboardShell } from "@/components/dashboard-shell";
 import { UpdateCenter } from "@/components/updates/UpdateCenter";
 import { MigratedLauncher } from "@/components/migrated-launcher";
 import { MigrationInProgress } from "@/components/migration-in-progress";
@@ -17,10 +19,9 @@ type OrgListResponse = { data?: OrgListItem[] } | OrgListItem[] | null;
 
 async function fetchUserOrgs(): Promise<OrgListItem[]> {
   try {
-    const res = await serverApi.get<OrgListResponse>(
-      "auth/organization/list",
-      { cache: "no-store" },
-    );
+    const res = await serverApi.get<OrgListResponse>("auth/organization/list", {
+      cache: "no-store",
+    });
     if (!res) return [];
     if (Array.isArray(res)) return res;
     return res.data ?? [];
@@ -52,9 +53,13 @@ async function fetchUserOrgs(): Promise<OrgListItem[]> {
 async function resolveOrgChooserGate(
   activeOrganizationId: string | null | undefined,
 ): Promise<{ redirectTo?: string }> {
-  if (activeOrganizationId) return {};
-
   const orgs = await fetchUserOrgs();
+  // Trust the session's active org ONLY if it's an actual membership. A
+  // stale/foreign active org — e.g. the zero-auth Local User's workspace
+  // carried into a cloud user's session after cloud-connect — would otherwise
+  // scope the whole UI (Team members, cloud status, everything) to an org the
+  // user isn't in. Reconcile to a real membership instead.
+  if (activeOrganizationId && orgs.some((o) => o.id === activeOrganizationId)) return {};
   if (orgs.length >= 2) {
     return { redirectTo: "/select-organization" };
   }
@@ -91,9 +96,7 @@ export default async function DashboardLayout({ children }: { children: React.Re
   // single-org users get the only one auto-set server-side. Runs BEFORE
   // the migration / teamMode gates because those are configured per-org
   // and reading them with the wrong active org would mis-route.
-  const { redirectTo } = await resolveOrgChooserGate(
-    session.session.activeOrganizationId,
-  );
+  const { redirectTo } = await resolveOrgChooserGate(session.session.activeOrganizationId);
   if (redirectTo) redirect(redirectTo);
 
   // Layout MUST see fresh `migrationInProgress` to route correctly during
@@ -102,7 +105,8 @@ export default async function DashboardLayout({ children }: { children: React.Re
   // render the normal UI (writes would 503), and a cached `true` after the
   // lock releases would trap the operator on the in-progress launcher.
   // Other callers can keep using the cache.
-  const deploymentInfo = await getDeploymentInfo({ skipCache: true });
+  const deploymentInfo = await getDeploymentInfoOrNull({ skipCache: true });
+  if (!deploymentInfo) return <ApiUnavailable />;
 
   // Mid-flight migration gate. The DB is being cut over — rendering
   // the normal UI would risk a 503'd write, and rendering the
@@ -135,27 +139,36 @@ export default async function DashboardLayout({ children }: { children: React.Re
     .get("github/home", { cache: "no-store" })
     .catch(() => null);
 
+  // Resolve the rail HERE, on the server, so the first painted sidebar is already
+  // the right one. Doing it client-side from document.cookie would render the
+  // platform rail and then flip the entire nav after hydration. Passing the
+  // deployment info we just fetched keeps this on the fresh copy.
+  const productView = await resolveRequestProductView(deploymentInfo);
+
   return (
     <DashboardProviders
       initialGithubData={initialGithubData}
       initialUser={session.user}
       selfHosted={deploymentInfo.selfHosted}
       deployMode={deploymentInfo.deployMode}
+      isServerHost={deploymentInfo.isServerHost}
+      hostControlEnabled={deploymentInfo.hostControlEnabled}
       authMode={deploymentInfo.authMode}
+      version={deploymentInfo.version}
+      productMode={deploymentInfo.productMode ?? "platform"}
+      productView={productView}
       cloudAuthUrl={deploymentInfo.cloudAuthUrl}
       cloudApiUrl={deploymentInfo.cloudApiUrl}
       machineName={deploymentInfo.machineName}
       hostDomain={deploymentInfo.hostDomain}
     >
-      <div className="flex h-dvh">
-        <Sidebar />
-        {/* Main content */}
-        <main className="flex-1 overflow-y-auto">
-          {/* Update + advisory surface (desktop & self-hosted). Renders nothing
-              unless there's an advisory, an available update, or a what's-new. */}
-          <UpdateCenter />
-          {children}
-        </main>
+      <div className="flex flex-col h-dvh">
+        {/* Update + platform-status surface — full app width, ABOVE the sidebar.
+            Renders nothing unless there's an advisory / platform notice (SaaS:
+            partial outage, maintenance) / available update / what's-new, so it
+            adds no chrome when idle. */}
+        <UpdateCenter />
+        <DashboardShell>{children}</DashboardShell>
       </div>
     </DashboardProviders>
   );

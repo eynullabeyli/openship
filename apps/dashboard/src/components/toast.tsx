@@ -1,6 +1,7 @@
 "use client";
 
 import { createContext, useCallback, useContext, useState } from "react";
+import { randomUUID } from "@/lib/random-uuid";
 
 /* ── Types ────────────────────────────────────────────────────── */
 
@@ -33,7 +34,7 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
   const [toasts, setToasts] = useState<Toast[]>([]);
 
   const toast = useCallback((type: ToastType, message: string, title?: string) => {
-    const id = crypto.randomUUID();
+    const id = randomUUID();
     let added = false;
     setToasts((prev) => {
       // Skip an identical toast that's already on screen so the same
@@ -59,9 +60,12 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
     <ToastContext.Provider value={{ toast }}>
       {children}
 
-      {/* Toast container - bottom-right */}
+      {/* Toast container - bottom-right. z-index MUST stay above the modal
+          layer (ModalContext BASE_Z_INDEX = 10000, +100 per stacked modal).
+          Toasts are the top-most transient layer, so pin to the CSS max so
+          they're never hidden behind a modal. */}
       {toasts.length > 0 && (
-        <div className="fixed bottom-5 end-5 z-[9999] flex flex-col gap-2">
+        <div className="fixed bottom-5 end-5 z-[2147483647] flex flex-col gap-2">
           {toasts.map((t) => (
             <div
               key={t.id}
@@ -93,9 +97,9 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
 
 const typeStyles: Record<ToastType, string> = {
   error:
-    "bg-rose-500/10 border-rose-500/20 text-rose-400",
+    "bg-danger-bg border-danger-border text-danger",
   success:
-    "bg-emerald-500/10 border-emerald-500/20 text-emerald-400",
+    "bg-success-bg border-success-border text-success",
   info:
     "th-card text-[var(--th-text-body)]",
 };

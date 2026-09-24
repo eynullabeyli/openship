@@ -12,44 +12,49 @@
 
 import type { CommandExecutor } from "../types";
 import type { ComponentStatus } from "./types";
-import { OPENRESTY_LUA_DIR } from "../infra/openresty-lua";
+import { containerCommand } from "./edge-container-executor";
+import { resolveOurEdgeContainer } from "./proxy/detect";
+// Direct module, not the `./proxy` barrel: that barrel pulls in the takeover path,
+// which imports this file.
+import { verifyEdgeServing } from "./proxy/ensure-container-edge";
 import { systemCatalog } from "./catalog";
+import { resolveEnvironment } from "./environment";
+import { enrichAvailableVersions } from "./available-version";
 import { getSystemComponentDefinition, SYSTEM_COMPONENTS } from "./components";
 import { formatDuration, systemDebug } from "./debug";
-import { isRemoteConnectionError } from "./errors";
-import { safeErrorMessage } from "@repo/core";
+import { probeExec, withReason } from "./probe-exec";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/** Run a command via executor, return stdout or null on failure. */
-async function tryExec(
+/**
+ * Was the daemon probe REFUSED, rather than unanswered?
+ *
+ * `docker info` reaching the socket and being denied is a different fault from the
+ * socket answering nothing, and the two remedies exclude each other. Narrow on the
+ * permission tokens on purpose: "Cannot connect to the Docker daemon … Is the docker
+ * daemon running?" must keep the not-running headline, and matching it here would send
+ * an operator to fix a group membership that was never the problem — #408 inverted.
+ */
+function isSocketDenied(error: string | null): boolean {
+  return error != null && /permission denied|eacces/i.test(error);
+}
+
+/** A cached SSH login keeps its original supplementary groups after usermod. */
+export async function needsDockerGroupRefresh(
   executor: CommandExecutor,
-  command: string,
-): Promise<string | null> {
-  const startedAt = Date.now();
-  systemDebug("checks", `exec:start ${command}`);
-  try {
-    const result = await executor.exec(command, { timeout: 10_000 });
-    systemDebug(
-      "checks",
-      `exec:ok ${command} (${formatDuration(startedAt)})`,
-    );
-    return result;
-  } catch (err) {
-    if (isRemoteConnectionError(err)) {
-      systemDebug(
-        "checks",
-        `exec:abort ${command} (${formatDuration(startedAt)}) ${safeErrorMessage(err)}`,
-      );
-      throw err;
-    }
-    const msg = safeErrorMessage(err);
-    systemDebug(
-      "checks",
-      `exec:fail ${command} (${formatDuration(startedAt)}) ${msg}`,
-    );
-    return null;
+  components: ComponentStatus[],
+): Promise<boolean> {
+  const docker = components.find((component) => component.name === "docker");
+  if (!docker || docker.healthy || !isSocketDenied(docker.message)) return false;
+  const probe = await probeExec(executor, 'id -G && id -G "$(id -un)"', "checks");
+  const lines = probe.output?.trim().split(/\r?\n/);
+  // Failed or unexpected output is not evidence that reconnecting would help.
+  if (lines?.length !== 2 || lines.some((line) => !/^\d+(?:\s+\d+)*$/.test(line.trim()))) {
+    return false;
   }
+  const current = new Set(lines[0]!.trim().split(/\s+/));
+  const account = new Set(lines[1]!.trim().split(/\s+/));
+  return current.size !== account.size || [...account].some((group) => !current.has(group));
 }
 
 function healthy(
@@ -99,21 +104,38 @@ export async function checkDocker(
 ): Promise<ComponentStatus> {
   const startedAt = Date.now();
   const recipe = systemCatalog.checks.docker;
-  const version = await tryExec(executor, recipe.versionCommand);
-  if (!version) {
+  const version = await probeExec(executor, recipe.versionCommand, "checks");
+  if (!version.output) {
     systemDebug("checks", `docker:missing (${formatDuration(startedAt)})`);
-    return unhealthy("docker", recipe.missingMessage);
+    return unhealthy("docker", withReason(recipe.missingMessage, version.error));
   }
 
-  const parsed = recipe.parseVersion(version);
+  const parsed = recipe.parseVersion(version.output);
 
-  const info = await tryExec(executor, recipe.daemonCommand!);
-  if (!info) {
-    systemDebug("checks", `docker:not-running (${formatDuration(startedAt)})`);
-    return unhealthy("docker", recipe.notRunningMessage!, {
-      version: parsed,
-      running: false,
-    });
+  // Two distinct diagnoses, one verdict: the probe failed (error carries why), or
+  // it exited 0 without naming a server version (daemon answered nothing useful).
+  // Both mean "not running" — only the first can explain itself.
+  const info = await probeExec(executor, recipe.daemonCommand!, "checks");
+  if (!info.output) {
+    const denied = isSocketDenied(info.error);
+    systemDebug(
+      "checks",
+      `docker:${denied ? "denied" : "not-running"} (${formatDuration(startedAt)}) ${
+        info.error ?? "probe exited 0 with no server version"
+      }`,
+    );
+    return unhealthy(
+      "docker",
+      withReason((denied && recipe.deniedMessage) || recipe.notRunningMessage!, info.error),
+      {
+        version: parsed,
+        // Left UNSET when denied: `running: false` would be a fact we don't have. The
+        // permission check happens before the daemon is consulted, so a refusal is
+        // equally consistent with a healthy daemon, and asserting it is stopped is the
+        // same class of guess the message above stopped making.
+        ...(denied ? {} : { running: false }),
+      },
+    );
   }
 
   systemDebug("checks", `docker:healthy (${formatDuration(startedAt)})`);
@@ -125,12 +147,12 @@ export async function checkGit(
 ): Promise<ComponentStatus> {
   const startedAt = Date.now();
   const recipe = systemCatalog.checks.git;
-  const version = await tryExec(executor, recipe.versionCommand);
-  if (!version) {
+  const version = await probeExec(executor, recipe.versionCommand, "checks");
+  if (!version.output) {
     systemDebug("checks", `git:missing (${formatDuration(startedAt)})`);
-    return unhealthy("git", recipe.missingMessage);
+    return unhealthy("git", withReason(recipe.missingMessage, version.error));
   }
-  const parsed = recipe.parseVersion(version);
+  const parsed = recipe.parseVersion(version.output);
   systemDebug("checks", `git:healthy (${formatDuration(startedAt)})`);
   return healthy("git", parsed);
 }
@@ -140,75 +162,70 @@ export async function checkRsync(
 ): Promise<ComponentStatus> {
   const startedAt = Date.now();
   const recipe = systemCatalog.checks.rsync;
-  const version = await tryExec(executor, recipe.versionCommand);
-  if (!version) {
+  const version = await probeExec(executor, recipe.versionCommand, "checks");
+  if (!version.output) {
     systemDebug("checks", `rsync:missing (${formatDuration(startedAt)})`);
-    return unhealthy("rsync", recipe.missingMessage);
+    return unhealthy("rsync", withReason(recipe.missingMessage, version.error));
   }
-  const parsed = recipe.parseVersion(version);
+  const parsed = recipe.parseVersion(version.output);
   systemDebug("checks", `rsync:healthy (${formatDuration(startedAt)})`);
   return healthy("rsync", parsed);
 }
 
-export async function checkOpenResty(
-  executor: CommandExecutor,
-): Promise<ComponentStatus> {
+/**
+ * The edge: is our openship-edge container SERVING.
+ *
+ * The edge is a Docker image whose serving path is host-side (host networking, host
+ * bind mounts for vhosts/certs/ACME), so there is no host binary, no unit and no Lua
+ * on the box to probe — and nothing to fall back to. A box without the container has
+ * no edge; installing one is a container pull.
+ *
+ * "Resolved" is deliberately NOT the verdict. `resolveOurEdgeContainer` reads plain
+ * `docker ps`, and docker reports a container crash-looping on
+ * `bind() … (98: Address already in use)` as running — so a box whose edge had never
+ * bound :80 could answer this check with a version and render healthy, because a
+ * `docker exec` landing in the brief up-window between restarts succeeds. The serving
+ * question therefore goes to `verifyEdgeServing`, the ONE definition every other edge
+ * path uses, so all of them name the same cause instead of this surface guessing
+ * "running but not responding" and sending the operator to the wrong place.
+ */
+export async function checkEdge(executor: CommandExecutor): Promise<ComponentStatus> {
   const startedAt = Date.now();
-  const recipe = systemCatalog.checks.openresty;
-  const version = await tryExec(executor, recipe.versionCommand);
 
-  // OpenResty binary must be installed - a plain nginx process doesn't count
-  if (!version) {
-    systemDebug("checks", `openresty:missing (${formatDuration(startedAt)})`);
-    return unhealthy("openresty", recipe.missingMessage);
-  }
-
-  const parsed = recipe.parseVersion(version);
-
-  const runningChecks = await Promise.all(
-    recipe.runningCommands!.map((command) => tryExec(executor, command)),
-  );
-  const running = runningChecks.some(Boolean);
-
-  if (!running) {
-    systemDebug("checks", `openresty:not-running (${formatDuration(startedAt)})`);
-    return unhealthy("openresty", recipe.notRunningMessage!, {
-      version: parsed,
-      running: false,
-    });
-  }
-
-  // Binary + process OK - verify Lua analytics/streaming scripts are deployed
-  const hasLua = await tryExec(
-    executor,
-    `test -f ${OPENRESTY_LUA_DIR}/site_logger.lua && test -f ${OPENRESTY_LUA_DIR}/pipe_stream.lua && echo ok`,
-  );
-  if (!hasLua) {
-    systemDebug("checks", `openresty:missing-lua (${formatDuration(startedAt)})`);
+  const container = await resolveOurEdgeContainer(executor);
+  if (!container) {
+    systemDebug("checks", `edge:missing (${formatDuration(startedAt)})`);
     return unhealthy(
-      "openresty",
-      "OpenResty is running but analytics scripts are not deployed - reinstall to fix",
-      { version: parsed, running: true },
+      "edge",
+      "No edge on this server. The edge is the openship-edge container — install it (requires Docker).",
     );
   }
 
-  systemDebug("checks", `openresty:healthy (${formatDuration(startedAt)})`);
-  return healthy("openresty", parsed, true);
-}
-
-export async function checkCertbot(
-  executor: CommandExecutor,
-): Promise<ComponentStatus> {
-  const startedAt = Date.now();
-  const recipe = systemCatalog.checks.certbot;
-  const version = await tryExec(executor, recipe.versionCommand);
-  if (!version) {
-    systemDebug("checks", `certbot:missing (${formatDuration(startedAt)})`);
-    return unhealthy("certbot", recipe.missingMessage);
+  const verdict = await verifyEdgeServing(executor, container);
+  if (!verdict.serving) {
+    systemDebug("checks", `edge:not-serving (${formatDuration(startedAt)})`);
+    return unhealthy(
+      "edge",
+      `The edge container ${container} is not serving — ${verdict.reason ?? "it is not listening on :80"}`,
+      { running: false },
+    );
   }
-  const parsed = recipe.parseVersion(version);
-  systemDebug("checks", `certbot:healthy (${formatDuration(startedAt)})`);
-  return healthy("certbot", parsed);
+
+  const version = await probeExec(executor, containerCommand(container, "openresty -v 2>&1"), "checks");
+  if (!version.output) {
+    systemDebug("checks", `edge:container-unresponsive (${formatDuration(startedAt)})`);
+    return unhealthy(
+      "edge",
+      withReason(
+        `The edge container ${container} is serving on :80 but not answering — check \`docker logs ${container}\``,
+        version.error,
+      ),
+      { running: false },
+    );
+  }
+
+  systemDebug("checks", `edge:healthy (${formatDuration(startedAt)})`);
+  return healthy("edge", systemCatalog.checks.openresty.parseVersion(version.output), true);
 }
 
 // ─── Registry ────────────────────────────────────────────────────────────────
@@ -217,8 +234,7 @@ type CheckFn = (executor: CommandExecutor) => Promise<ComponentStatus>;
 
 export const COMPONENT_CHECKS: Record<string, CheckFn> = {
   docker: checkDocker,
-  openresty: checkOpenResty,
-  certbot: checkCertbot,
+  edge: checkEdge,
   git: checkGit,
   rsync: checkRsync,
 };
@@ -270,8 +286,22 @@ export async function checkAll(
   const results = await mapWithConcurrency(entries, CHECK_CONCURRENCY, ([, fn]) =>
     fn(executor),
   );
+  await enrichAvailable(executor, results);
   systemDebug("checks", `checkAll:done (${formatDuration(startedAt)})`);
   return results;
+}
+
+/** Best-effort "newer version available?" enrichment; never throws. */
+async function enrichAvailable(
+  executor: CommandExecutor,
+  results: ComponentStatus[],
+): Promise<void> {
+  try {
+    const profile = await resolveEnvironment(executor);
+    await enrichAvailableVersions(executor, profile, results);
+  } catch {
+    /* leave components without an available version */
+  }
 }
 
 /** Run checks for a specific set of components with bounded concurrency. */
@@ -287,6 +317,7 @@ export async function checkComponents(
   const results = await mapWithConcurrency(fns, CHECK_CONCURRENCY, (fn) =>
     fn(executor),
   );
+  await enrichAvailable(executor, results);
   systemDebug(
     "checks",
     `checkComponents:done [${names.join(", ")}] (${formatDuration(startedAt)})`,

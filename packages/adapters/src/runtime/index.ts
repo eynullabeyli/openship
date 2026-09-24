@@ -13,12 +13,29 @@ export type {
   MultiServiceGroupHandle,
   MultiServiceDeployConfig,
   MultiServiceDeployResult,
+  DockerMount,
+  DockerPortBinding,
+  DockerContainerSummary,
+  DockerContainerDetail,
+  DockerVolumeInfo,
+  DockerNetworkInfo,
 } from "./types";
 export { assertCapability, isMultiServiceRuntime } from "./types";
-export { runBuildPipeline, BuildLogger, parseLogLevel, type BuildEnvironment } from "./build-pipeline";
+export {
+  runBuildPipeline,
+  BuildLogger,
+  parseLogLevel,
+  type BuildEnvironment,
+} from "./build-pipeline";
 
 // ─── Runtime classes ─────────────────────────────────────────────────────────
-export { DockerRuntime, type DockerConnectionOptions } from "./docker";
+export {
+  DockerRuntime,
+  type BuildCachePruneOptions,
+  type BuildCachePruneResult,
+  type DockerConnectionOptions,
+} from "./docker";
+export { containerInfoFromDockerSummary } from "./docker-container-info";
 export { BareRuntime, type BareRuntimeOptions } from "./bare";
 export { CloudRuntime } from "./cloud";
 
@@ -71,7 +88,7 @@ export async function createRuntime(opts: CreateRuntimeOptions): Promise<Runtime
       return new BareRuntime(opts.bare);
     }
     case "cloud": {
-      const { Oblien } = await import("oblien");
+      const { Oblien } = await import("../oblien");
       const { CloudRuntime } = await import("./cloud");
       const client = opts.cloudToken
         ? new Oblien({ token: opts.cloudToken })

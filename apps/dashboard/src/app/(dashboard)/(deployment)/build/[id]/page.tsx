@@ -9,29 +9,10 @@ import DeploymentProcessing from "@/components/import-project/DeploymentProcessi
 import ComposeDeploymentProcessing from "@/components/import-project/ComposeDeploymentProcessing";
 import BuildSkeleton from "@/components/import-project/BuildSkeleton";
 import { useAuth } from "@/context/AuthContext";
-import { useGitHub } from "@/context/GitHubContext";
-import { useModal } from "@/context/ModalContext";
-import { DeployCredentialModal } from "@/components/deployments/DeployCredentialModal";
-import { usePlatform } from "@/context/PlatformContext";
 import { useI18n } from "@/components/i18n-provider";
-import { Rocket, ArrowLeft, Home } from "lucide-react";
-
-/**
- * Error codes that mean "the deploy couldn't get a clone token for the
- * repo's owner". Throwing these from the backend currently lands as a
- * toast + a 'failed' build screen. This module catches those codes and
- * opens DeployCredentialModal so the user gets actual recovery options
- * instead of a dead-end.
- *
- * See apps/api/src/modules/deployments/preflight.ts and
- * apps/api/src/modules/github/github.token.ts for the throw sites.
- */
-const CLONE_TOKEN_ERROR_CODES = new Set([
-  "GITHUB_APP_INSTALLATION_REQUIRED",
-  "GITHUB_CLI_REMOTE_BUILD_REJECTED",
-  "GITHUB_REMOTE_TOKEN_REQUIRED",
-  "GITHUB_TOKEN_REQUIRED",
-]);
+import { BUILD_SESSION_ERROR_FALLBACK } from "@/context/deployment/load-session";
+import { ResourceNotFound } from "@/components/resource-not-found";
+import { Rocket, Home, PackageX, RotateCcw, TriangleAlert } from "lucide-react";
 
 const BuildPage: React.FC = () => {
   const params = useParams();
@@ -39,13 +20,17 @@ const BuildPage: React.FC = () => {
   const router = useRouter();
   const { isLoggedIn } = useAuth();
   const deploymentId = params.id as string;
-  const { state, config, connectToBuild, loadBuildSession, redeploy, updateConfig } = useDeployment();
-  const { installUrl, state: githubState } = useGitHub();
-  const { selfHosted } = usePlatform();
-  const { showModal, hideModal } = useModal();
+  const { state, config, connectToBuild, loadBuildSession, redeploy, maybeOpenCredentialModal } = useDeployment();
   const { t } = useI18n();
   const initializedDeploymentRef = useRef<string | null>(null);
   const [notFound, setNotFound] = useState(false);
+  /** Load failure that is NOT a missing deployment — a hydration exception,
+   *  5xx, or network error while the deployment usually exists (#604). Rendered
+   *  as an error state with a retry, never as "not found". */
+  const [loadError, setLoadError] = useState<string | null>(null);
+  /** Bumped by the error state's retry so the init effect re-runs for the same
+   *  deployment id (the `initializedDeploymentRef` guard alone would ignore it). */
+  const [loadRetryNonce, setLoadRetryNonce] = useState(0);
   /** Ref tracking which (deploymentId × errorCode) tuple already opened
    *  the modal — prevents reopening on every re-render. */
   const shownModalRef = useRef<string | null>(null);
@@ -83,7 +68,15 @@ const BuildPage: React.FC = () => {
       }
       const result = await loadBuildSession(deploymentId);
       if (!result.success) {
-        setNotFound(true);
+        // Only the server saying "this doesn't exist" (soft-failed status or
+        // HTTP 404) renders the not-found screen. Anything else — a throw while
+        // hydrating a successful response, a 5xx, a network blip — keeps the
+        // deployment one retry away instead of presenting it as deleted (#604).
+        if (result.notFound) {
+          setNotFound(true);
+        } else {
+          setLoadError(result.error || BUILD_SESSION_ERROR_FALLBACK);
+        }
       }
     };
 
@@ -98,7 +91,16 @@ const BuildPage: React.FC = () => {
     loadBuildSession,
     router,
     searchParams,
+    loadRetryNonce,
   ]);
+
+  // Retry a failed (non-not-found) load: clear the error, release the init
+  // guard, and re-run the effect via the nonce.
+  const retryLoadSession = useCallback(() => {
+    setLoadError(null);
+    initializedDeploymentRef.current = null;
+    setLoadRetryNonce((n) => n + 1);
+  }, []);
 
   // Handle redeploy with URL update.
   //
@@ -142,169 +144,78 @@ const BuildPage: React.FC = () => {
   // with no next step.
   useEffect(() => {
     if (!state.deploymentFailed || !state.errorCode) return;
-    if (!CLONE_TOKEN_ERROR_CODES.has(state.errorCode)) return;
-
-    // De-dupe — same deployment + same code shouldn't reopen the modal
-    // on every state tick.
+    // De-dupe — same deployment + same code shouldn't reopen the modal on every
+    // state tick. The shared handler (useDeploymentBuild.maybeOpenCredentialModal)
+    // owns the modal + its options; here we just pass the build-fail trigger and
+    // an auto-redeploy on the user's fix.
     const key = `${deploymentId}:${state.errorCode}`;
     if (shownModalRef.current === key) return;
-    shownModalRef.current = key;
-
-    let modalId = "";
-    modalId = showModal({
-      customContent: (
-        <DeployCredentialModal
-          trigger="build-fail"
-          owner={config.owner || t.misc.buildPage.thisRepo}
-          installUrl={installUrl ?? null}
-          projectId={config.projectId ?? null}
-          deployTarget={config.deployTarget}
-          buildStrategy={config.buildStrategy}
-          selfHosted={selfHosted}
-          ghCliAvailable={!!githubState?.sources.ghCli.available}
-          onChoice={(choice) => {
-            if (choice.kind === "build-local") {
-              updateConfig({ buildStrategy: "local" });
-              hideModal(modalId);
-              void handleRedeploy();
-            } else if (choice.kind === "install-app") {
-              // App popup closed; redeploy lets the backend re-check.
-              hideModal(modalId);
-              void handleRedeploy();
-            } else {
-              // add-token (navigated away) or dismiss — just close.
-              hideModal(modalId);
-            }
-          }}
-          onDismiss={() => hideModal(modalId)}
-        />
-      ),
-      maxWidth: "640px",
+    const opened = maybeOpenCredentialModal(state.errorCode, {
+      trigger: "build-fail",
+      onResolved: () => void handleRedeploy(),
     });
-  }, [
-    state.deploymentFailed,
-    state.errorCode,
-    deploymentId,
-    config.owner,
-    config.deployTarget,
-    config.buildStrategy,
-    config.projectId,
-    installUrl,
-    githubState,
-    selfHosted,
-    showModal,
-    hideModal,
-    updateConfig,
-    handleRedeploy,
-    t,
-  ]);
+    if (opened) shownModalRef.current = key;
+  }, [state.deploymentFailed, state.errorCode, deploymentId, maybeOpenCredentialModal, handleRedeploy]);
+
+  if (loadError) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-background p-6">
+        <ResourceNotFound
+          icon={<TriangleAlert className="size-7" />}
+          title={t.chrome.error.title}
+          description={
+            <>
+              {t.chrome.error.description}
+              <span className="mt-1 block break-all font-mono text-xs opacity-80">{loadError}</span>
+            </>
+          }
+          detail={deploymentId}
+          detailCopyLabel={t.chrome.notFound.copyId}
+          actions={[
+            {
+              label: t.chrome.error.tryAgain,
+              icon: <RotateCcw className="size-4" />,
+              onClick: retryLoadSession,
+            },
+            {
+              href: "/deployments",
+              label: t.misc.buildPage.viewDeployments,
+              icon: <Rocket className="size-4" />,
+            },
+            {
+              href: "/",
+              label: t.misc.buildPage.goHome,
+              variant: "secondary",
+            },
+          ]}
+        />
+      </div>
+    );
+  }
 
   if (notFound) {
     return (
-      <div className="min-h-screen bg-background flex items-center justify-center p-6">
-        <div className="max-w-md w-full text-center">
-          <div className="bg-card rounded-2xl border border-border/50 px-8 py-12">
-            {/* SVG Illustration */}
-            <div className="relative mx-auto w-56 h-40 mb-6">
-              <svg className="absolute inset-0 w-full h-full" viewBox="0 0 224 160" fill="none">
-                {/* Background broken card */}
-                <rect x="52" y="30" width="120" height="90" rx="14" fill="var(--th-sf-04)" />
-                <rect
-                  x="42"
-                  y="20"
-                  width="120"
-                  height="90"
-                  rx="14"
-                  fill="var(--th-card-bg)"
-                  stroke="var(--th-bd-default)"
-                  strokeWidth="1"
-                />
-
-                {/* Card header bar */}
-                <rect x="42" y="20" width="120" height="26" rx="14" fill="var(--th-sf-05)" />
-                <circle cx="58" cy="33" r="3.5" fill="#ef4444" fillOpacity="0.6" />
-                <circle cx="69" cy="33" r="3.5" fill="#eab308" fillOpacity="0.6" />
-                <circle cx="80" cy="33" r="3.5" fill="#22c55e" fillOpacity="0.6" />
-
-                {/* Broken content lines */}
-                <rect x="56" y="56" width="40" height="4" rx="2" fill="var(--th-on-12)" />
-                <rect x="56" y="66" width="70" height="3.5" rx="1.75" fill="var(--th-on-08)" />
-                <rect x="56" y="75" width="25" height="3.5" rx="1.75" fill="var(--th-on-08)" />
-                <rect x="88" y="75" width="30" height="3.5" rx="1.75" fill="var(--th-on-08)" />
-
-                {/* X mark in circle */}
-                <circle
-                  cx="102"
-                  cy="95"
-                  r="10"
-                  fill="var(--th-on-05)"
-                  stroke="var(--th-on-15)"
-                  strokeWidth="1"
-                />
-                <path
-                  d="M97 90l10 10M107 90l-10 10"
-                  stroke="var(--th-on-30)"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                />
-
-                {/* Question mark */}
-                <circle cx="188" cy="60" r="20" fill="var(--th-on-05)" />
-                <circle
-                  cx="188"
-                  cy="60"
-                  r="14"
-                  fill="var(--th-card-bg)"
-                  stroke="var(--th-on-20)"
-                  strokeWidth="1.5"
-                  strokeDasharray="4 3"
-                />
-                <text
-                  x="188"
-                  y="66"
-                  textAnchor="middle"
-                  fill="var(--th-on-40)"
-                  fontSize="16"
-                  fontWeight="600"
-                >
-                  ?
-                </text>
-
-                {/* Decorative dots */}
-                <circle cx="20" cy="50" r="4" fill="var(--th-on-10)" />
-                <circle cx="30" cy="130" r="5" fill="var(--th-on-08)" />
-                <circle cx="200" cy="30" r="3" fill="var(--th-on-12)" />
-                <circle cx="210" cy="120" r="4" fill="var(--th-on-06)" />
-
-                {/* Sparkles */}
-                <path d="M16 95l2-4 2 4-4-2 4 0-4 2z" fill="var(--th-on-16)" />
-                <path d="M195 140l1.5-3 1.5 3-3-1.5 3 0-3 1.5z" fill="var(--th-on-12)" />
-              </svg>
-            </div>
-
-            <h2 className="text-xl font-semibold text-foreground/80 mb-2">{t.misc.buildPage.notFoundTitle}</h2>
-            <p className="text-sm text-muted-foreground leading-relaxed mb-8 max-w-xs mx-auto">
-              {t.misc.buildPage.notFoundDescription}
-            </p>
-
-            <div className="flex flex-col gap-3">
-              <Link
-                href="/deployments"
-                className="inline-flex items-center justify-center gap-2 px-5 py-2.5 bg-primary text-primary-foreground rounded-xl text-sm font-medium hover:bg-primary/90 transition-colors"
-              >
-                <Rocket className="w-4 h-4" />
-                {t.misc.buildPage.viewDeployments}
-              </Link>
-              <Link
-                href="/"
-                className="inline-flex items-center justify-center gap-2 px-5 py-2.5 bg-muted/50 text-foreground rounded-xl text-sm font-medium hover:bg-muted transition-colors"
-              >
-                <Home className="w-4 h-4" />
-                {t.misc.buildPage.goHome}
-              </Link>
-            </div>
-          </div>
-        </div>
+      <div className="flex min-h-screen items-center justify-center bg-background p-6">
+        <ResourceNotFound
+          icon={<PackageX className="size-7" />}
+          title={t.misc.buildPage.notFoundTitle}
+          description={t.misc.buildPage.notFoundDescription}
+          detail={deploymentId}
+          detailCopyLabel={t.chrome.notFound.copyId}
+          actions={[
+            {
+              href: "/deployments",
+              label: t.misc.buildPage.viewDeployments,
+              icon: <Rocket className="size-4" />,
+            },
+            {
+              href: "/",
+              label: t.misc.buildPage.goHome,
+              icon: <Home className="size-4" />,
+              variant: "secondary",
+            },
+          ]}
+        />
       </div>
     );
   }

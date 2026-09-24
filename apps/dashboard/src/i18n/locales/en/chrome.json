@@ -19,7 +19,13 @@
     "current": "Current",
     "cloudLabel": "Cloud: {email}",
     "linkedToCloud": "Linked to Openship Cloud as {email}",
-    "backToSetup": "Back to setup"
+    "backToSetup": "Back to setup",
+    "personal": "Personal"
+  },
+  "mailRail": {
+    "selectServer": "Select a mail server",
+    "switchServer": "Switch mail server",
+    "setupIncomplete": "Setup incomplete"
   },
   "migration": {
     "inProgressTitle": "Migration in progress",
@@ -43,6 +49,38 @@
     "descGlobal": "The page you're looking for doesn't exist or has moved.",
     "descDashboard": "This page doesn't exist or may have moved. Check the URL, or head back to your dashboard.",
     "backToDashboard": "Back to dashboard",
-    "viewDeployments": "View deployments"
+    "viewDeployments": "View deployments",
+    "copyId": "Copy ID"
+  },
+  "error": {
+    "title": "This page hit an error",
+    "description": "Something in this screen failed to render. Trying again usually clears it — nothing you deployed was affected.",
+    "tryAgain": "Try again",
+    "goToProjects": "Go to projects",
+    "refCode": "Ref"
+  },
+  "apiDown": {
+    "title": "Can't reach the API",
+    "description": "The dashboard is running, but it can't talk to the Openship API — so there's nothing to show yet. Your deployments keep running regardless.",
+    "hintStatus": "Check that the API is up: run `openship status` on the host.",
+    "hintStart": "Not running? Start it with `openship up`.",
+    "hintRemote": "Managing a remote box? Confirm its URL and that the API port is reachable from here.",
+    "retry": "Retry",
+    "docs": "Self-hosting docs"
+  },
+  "errorLinks": {
+    "docs": "Documentation",
+    "github": "Report an issue"
+  },
+  "window": {
+    "minimize": "Minimize",
+    "maximize": "Maximize",
+    "restore": "Restore",
+    "close": "Close",
+    "navigation": "Navigation",
+    "back": "Back",
+    "forward": "Forward",
+    "reload": "Reload",
+    "devTools": "Developer tools"
   }
 }

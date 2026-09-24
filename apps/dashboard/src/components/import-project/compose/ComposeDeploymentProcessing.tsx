@@ -1,20 +1,24 @@
 "use client";
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { Loader2, CheckCircle2, XCircle, SlidersHorizontal } from "lucide-react";
+import { Loader2, CheckCircle2, XCircle } from "lucide-react";
 
 import ComposeSidebar from "./ComposeSidebar";
 import BuildTerminal from "../BuildTerminal";
+import { DeploymentConfigurationAction, DeploymentSuccessActions } from "../DeploymentActions";
+import { PortAdvisoryModal } from "../PortAdvisoryModal";
+import { PromptDetails } from "../PromptDetails";
 import { generateIcon } from "@/utils/icons";
 import { useRouter } from "next/navigation";
 import { useDeployment } from "@/context/DeploymentContext";
 import { useModal } from "@/context/ModalContext";
+import { useCloudDeployPricing } from "@/hooks/useCloudDeployPricing";
 import { Modal } from "@/components/ui/Modal";
 import { useToast } from "@/context/ToastContext";
 import { useTheme } from "@/components/theme-provider";
 import { deployApi } from "@/lib/api";
+import { composeServiceTally } from "@/context/deployment/types";
 import type { DeploymentStatus, ServiceDeployStatus } from "@/context/deployment/types";
-import { encodeRepoSlug, encodeLocalSlug } from "@/utils/repoSlug";
 import type { BuildLog } from "@/utils/deploymentPhaseDetector";
 import { useI18n, interpolate } from "@/components/i18n-provider";
 
@@ -36,6 +40,7 @@ const ComposeDeploymentProcessing: React.FC<Props> = ({ onRedeploy }) => {
   const { config, state, onTerminalReady, stopDeployment, respondToPrompt, deploymentStatus } =
     useDeployment();
   const { showModal, hideModal } = useModal();
+  const showCloudPricing = useCloudDeployPricing();
   const { showToast } = useToast();
   const { resolvedTheme } = useTheme();
   const { t } = useI18n();
@@ -109,13 +114,13 @@ const ComposeDeploymentProcessing: React.FC<Props> = ({ onRedeploy }) => {
     });
     return ordered;
   }, [config.services, services, state.buildLogs]);
+  // `total` stays local — this panel counts services that have produced log lines
+  // but aren't in the roster yet, which the sidebar deliberately does not. The
+  // per-status counts are shared so the two readouts can't contradict each other.
   const total = Math.max(services.length, logServiceNames.length);
-  const running = services.filter((s) => s.status === "running").length;
-  const built = services.filter((s) => s.status === "built").length;
-  const building = services.filter((s) => s.status === "building").length;
-  const failed = services.filter((s) => s.status === "failed").length;
+  const { running, built, building, failed } = composeServiceTally(services);
   const settled = running + built + failed;
-  const terminalTheme = resolvedTheme === "dark" ? "dark" : "light";
+  const terminalTheme = resolvedTheme === "light" ? "light" : "dark"; // dim → dark
 
   useEffect(() => {
     onTerminalReady();
@@ -157,7 +162,7 @@ const ComposeDeploymentProcessing: React.FC<Props> = ({ onRedeploy }) => {
   // ── Pipeline prompt modal ──────────────────────────────────────────────
   useEffect(() => {
     if (!state.pendingPrompt) return;
-    const { promptId, title, message, actions } = state.pendingPrompt;
+    const { promptId, title, message, actions, details } = state.pendingPrompt;
     if (promptModalRef.current === promptId) return;
     promptModalRef.current = promptId;
 
@@ -170,12 +175,15 @@ const ComposeDeploymentProcessing: React.FC<Props> = ({ onRedeploy }) => {
             <h3 className="text-xl font-bold text-foreground">{title}</h3>
             <p className="text-sm leading-relaxed text-muted-foreground">{message}</p>
           </div>
+
+          <PromptDetails details={details} />
+
           <div className="flex items-center justify-end gap-3 pt-2">
             {actions.map((action) => {
               const variant = (action.variant || "secondary") as "secondary" | "danger" | "primary";
               const styles =
                 variant === "danger"
-                  ? "bg-red-600 text-white hover:bg-red-700"
+                  ? "bg-danger-solid text-white hover:bg-danger-solid/90"
                   : variant === "primary"
                     ? "bg-primary text-primary-foreground hover:bg-primary/90"
                     : "border border-border bg-muted text-foreground hover:bg-muted/80";
@@ -253,6 +261,11 @@ const ComposeDeploymentProcessing: React.FC<Props> = ({ onRedeploy }) => {
       const newId = res?.data?.deployment?.id;
       router.push(newId ? `/build/${newId}` : `/projects/${state.projectId}`);
     } catch (err) {
+      if (showCloudPricing(err)) {
+        // A quota refusal created no build. Keep the failed-service retry available.
+        setDecisionResolved(false);
+        return;
+      }
       // Usually a deploy is already in progress (the previous retry) → 403. Do
       // NOT re-fire; send the user to the project where the running deploy shows.
       showToast(err instanceof Error ? err.message : cd.toast.retryFailMsg, "error", cd.toast.retryTitle);
@@ -260,7 +273,7 @@ const ComposeDeploymentProcessing: React.FC<Props> = ({ onRedeploy }) => {
     } finally {
       retryInFlightRef.current = false;
     }
-  }, [state.serviceStatuses, state.decisionFailedServiceIds, state.projectId, router, showToast, cd]);
+  }, [state.serviceStatuses, state.decisionFailedServiceIds, state.projectId, router, showToast, showCloudPricing, cd]);
 
   // Auto-open the decision dialog once per deployment when a partial failure is
   // awaiting a decision. Closing it leaves the persistent banner in place, so the
@@ -272,24 +285,6 @@ const ComposeDeploymentProcessing: React.FC<Props> = ({ onRedeploy }) => {
     autoOpenedDecisionRef.current = state.deploymentId;
     setDecisionModalOpen(true);
   }, [showDecision, state.deploymentId]);
-
-  const handleViewDashboard = () => {
-    if (state.projectId) router.push(`/projects/${state.projectId}`);
-  };
-
-  // Re-open the deploy wizard rehydrated from THIS project's saved config
-  // (mode=config → initializeFromProject: no repo re-clone/re-detect). Same
-  // "Edit" the project Runtime page uses — the single place the full config
-  // (services, build, target, …) is edited. Deploy info is already stored, so
-  // there's nothing to re-fetch from the repo.
-  const handleEditConfig = () => {
-    const projectId = state.projectId || config.projectId;
-    if (!projectId) return;
-    const slug = config.localPath
-      ? encodeLocalSlug(config.localPath)
-      : encodeRepoSlug(config.owner, config.repo);
-    router.push(`/deploy/${slug}?projectId=${projectId}&mode=config`);
-  };
 
   // ── Title ──────────────────────────────────────────────────────────────
   const title =
@@ -309,9 +304,12 @@ const ComposeDeploymentProcessing: React.FC<Props> = ({ onRedeploy }) => {
     <div className="min-h-screen bg-background max-w-[1600px] mx-auto px-4 sm:px-6 lg:px-8">
       {/* ── Header ─────────────────────────────────────────────────────── */}
       <div className="py-5">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-4">
-            <div className="flex border border-border/50 bg-muted/50 rounded-xl w-12 h-12 justify-center items-center">
+        <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex min-w-0 items-center gap-4">
+            {/* Sits on the PAGE, not a card — `bg-muted` (4%) over light's #f9f9f9
+                still reads; `/50` would not. Borderless, same rule as the chips
+                inside the panel below. */}
+            <div className="flex shrink-0 bg-muted rounded-xl w-12 h-12 justify-center items-center">
               {deploymentStatus === "failed" || deploymentStatus === "cancelled" ? (
                 <XCircle className="w-6 h-6 text-destructive" />
               ) : deploymentStatus === "ready" ? (
@@ -320,9 +318,9 @@ const ComposeDeploymentProcessing: React.FC<Props> = ({ onRedeploy }) => {
                 <Loader2 className="w-6 h-6 text-primary animate-spin" />
               )}
             </div>
-            <div>
+            <div className="min-w-0">
               <h1 className="text-xl font-semibold text-foreground">{title}</h1>
-              <p className="text-sm text-muted-foreground mt-0.5">
+              <p className="text-sm text-muted-foreground mt-0.5 break-all">
                 {config.owner}/{config.repo}
                 {total > 0 && (
                   <span className="ms-2 text-xs">
@@ -334,12 +332,7 @@ const ComposeDeploymentProcessing: React.FC<Props> = ({ onRedeploy }) => {
           </div>
 
           {deploymentStatus === "ready" && (
-            <button
-              onClick={handleViewDashboard}
-              className="flex items-center gap-2 text-primary-foreground font-medium bg-primary rounded-xl px-4 py-2 text-sm hover:bg-primary/90 shadow-md hover:shadow-lg transition-all"
-            >
-              {cd.viewDashboard}
-            </button>
+            <DeploymentConfigurationAction className="self-start sm:shrink-0" />
           )}
         </div>
       </div>
@@ -351,35 +344,45 @@ const ComposeDeploymentProcessing: React.FC<Props> = ({ onRedeploy }) => {
           {/* Decision banner — persists while a partial deploy awaits keep/reject
               (survives refresh via the server flag). Re-opens the dialog. */}
           {showDecision ? (
-            <div className="rounded-2xl border border-amber-500/40 bg-amber-500/10 px-5 py-4">
+            <div className="rounded-2xl border border-warning-border bg-warning-bg px-5 py-4">
               <div className="flex items-start justify-between gap-4">
                 <div className="min-w-0">
-                  <p className="text-sm font-semibold text-amber-700 dark:text-amber-300">
+                  <p className="text-sm font-semibold text-warning">
                     {cd.decisionBannerTitle}
                   </p>
-                  <p className="mt-1 text-sm text-amber-700/80 dark:text-amber-300/80">
+                  <p className="mt-1 text-sm text-warning/80">
                     {state.warningMessage || cd.decisionBannerDefaultMsg}
                   </p>
                 </div>
                 <button
                   type="button"
                   onClick={() => setDecisionModalOpen(true)}
-                  className="shrink-0 rounded-lg bg-amber-600 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-amber-700"
+                  className="shrink-0 rounded-lg bg-warning-solid px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-warning-solid/90"
                 >
                   {cd.review}
                 </button>
               </div>
             </div>
           ) : hasWarning ? (
-            <div className="rounded-2xl border border-amber-500/30 bg-amber-500/8 px-5 py-4">
-              <p className="text-sm font-medium text-amber-700 dark:text-amber-300">
+            <div className="rounded-2xl border border-warning-border bg-warning-bg px-5 py-4">
+              <p className="text-sm font-medium text-warning">
                 {cd.warningTitle}
               </p>
-              <p className="mt-1 text-sm text-amber-700/80 dark:text-amber-300/80">
+              <p className="mt-1 text-sm text-warning/80">
                 {state.warningMessage}
               </p>
             </div>
           ) : null}
+
+          {deploymentStatus === "ready" && (
+            <PortAdvisoryModal
+              deploymentId={state.deploymentId}
+              projectId={state.projectId || config.projectId}
+              checks={state.portCheck}
+              skipped={state.portCheckSkipped}
+              isCompose
+            />
+          )}
 
           <ComposeServiceLogsPanel
             logs={state.buildLogs}
@@ -389,6 +392,7 @@ const ComposeDeploymentProcessing: React.FC<Props> = ({ onRedeploy }) => {
             onTabChange={handleTabChange}
             deploymentStatus={deploymentStatus}
             running={running}
+            built={built}
             building={building}
             failed={failed}
             settled={settled}
@@ -431,6 +435,14 @@ const ComposeDeploymentProcessing: React.FC<Props> = ({ onRedeploy }) => {
                   cd.stopDeployment
                 )}
               </button>
+            ) : state.cancellationPending ? (
+              <button
+                disabled
+                className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl transition-all font-medium text-sm bg-muted text-muted-foreground cursor-not-allowed"
+              >
+                <Loader2 className="h-4 w-4 animate-spin" />
+                {cd.stopping}
+              </button>
             ) : (
               <>
                 {(deploymentStatus === "failed" || deploymentStatus === "cancelled") && (
@@ -451,22 +463,9 @@ const ComposeDeploymentProcessing: React.FC<Props> = ({ onRedeploy }) => {
                     {cd.redeploy}
                   </button>
                 )}
-                {deploymentStatus === "ready" && (
-                  <button
-                    onClick={handleViewDashboard}
-                    className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-primary text-primary-foreground rounded-xl font-medium text-sm hover:bg-primary/90 transition-all"
-                  >
-                    {cd.openDashboard}
-                  </button>
-                )}
-                {state.projectId && (
-                  <button
-                    onClick={handleEditConfig}
-                    className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl font-medium text-sm border border-border/60 bg-muted/40 text-foreground hover:bg-muted/70 transition-all"
-                  >
-                    <SlidersHorizontal className="h-4 w-4" />
-                    {cd.editConfiguration}
-                  </button>
+                {deploymentStatus === "ready" && <DeploymentSuccessActions />}
+                {deploymentStatus !== "ready" && (
+                  <DeploymentConfigurationAction className="w-full" />
                 )}
               </>
             )}
@@ -624,6 +623,7 @@ function ComposeServiceLogsPanel({
   onTabChange,
   deploymentStatus,
   running,
+  built,
   building,
   failed,
   settled,
@@ -638,6 +638,8 @@ function ComposeServiceLogsPanel({
   onTabChange: (tab: string) => void;
   deploymentStatus: DeploymentStatus;
   running: number;
+  /** Image built, container not up yet — see the ComposeSidebar tally. */
+  built: number;
   building: number;
   failed: number;
   settled: number;
@@ -647,6 +649,8 @@ function ComposeServiceLogsPanel({
 }) {
   const { t } = useI18n();
   const cd = t.importProject.composeDeployment;
+  // Shared with ComposeSidebar, which renders the same sentence.
+  const tally = t.importProject.composeServiceTally;
   const serviceIdToName = useMemo(() => {
     const map = new Map<string, string>();
     services.forEach((service) => {
@@ -713,7 +717,14 @@ function ComposeServiceLogsPanel({
       <div className="flex flex-col gap-5">
         <div className="flex items-center justify-between gap-4">
           <div className="flex min-w-0 items-center gap-3">
-            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-border/50 bg-muted/40 text-muted-foreground">
+            {/* Borderless chip — see globals.css: the card override only clears
+                `border-border/50` on `.bg-card`, so every tinted chip and box
+                INSIDE a card kept its hairline and the panel read as a stack of
+                outlined rectangles. Full-strength `bg-muted` (not `/50`) is what
+                lets the fill carry it alone: `--muted` is `--th-sf-04`, so at 50%
+                it lands on ~2% over light's white card — too faint to read as a
+                surface once the hairline is gone. */}
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground">
               {generateIcon("terminal-58-1658431404.png", 18, "currentColor")}
             </div>
             <div className="min-w-0">
@@ -722,10 +733,11 @@ function ComposeServiceLogsPanel({
             </div>
           </div>
           {total > 0 && (
-            <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-border/50 bg-muted/30 px-2.5 py-1 text-xs text-muted-foreground tabular-nums">
-              <span className="font-semibold text-foreground">{running}/{total}</span> {cd.running}
-              {building > 0 && <span>{interpolate(cd.buildingSuffix, { count: String(building) })}</span>}
-              {failed > 0 && <span className="text-destructive">{interpolate(cd.failedSuffix, { count: String(failed) })}</span>}
+            <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-muted px-2.5 py-1 text-xs text-muted-foreground tabular-nums">
+              <span className="font-semibold text-foreground">{running}/{total}</span> {tally.running}
+              {built > 0 && <span>{interpolate(tally.builtSuffix, { count: String(built) })}</span>}
+              {building > 0 && <span>{interpolate(tally.buildingSuffix, { count: String(building) })}</span>}
+              {failed > 0 && <span className="text-destructive">{interpolate(tally.failedSuffix, { count: String(failed) })}</span>}
             </span>
           )}
         </div>
@@ -768,7 +780,16 @@ function ComposeServiceLogsPanel({
           })}
         </div>
 
-        <div className="relative h-[420px] overflow-hidden rounded-xl border border-border/50 bg-white dark:bg-black">
+        {/* Borderless on dark/dim, where the console is the darkest surface on the
+            page and finds itself — the hairline there (inside an already-bordered
+            card) is what made this screen read as boxes inside boxes.
+            LIGHT KEEPS ITS BORDER: xterm paints `#ffffff` (TerminalSurface's light
+            theme) inside a `bg-card` that is also `#ffffff`, so with no hairline
+            the console becomes a white rectangle on a white card with no boundary
+            at all. A recessed container can't fix it either — the terminal's own
+            paint covers whatever is underneath. Same rule the card override
+            follows: borderless depends on fill contrast, and light has none here. */}
+        <div className="relative h-[420px] overflow-hidden rounded-xl border border-border/50 bg-white dark:border-transparent dark:bg-black dim:border-transparent dim:bg-black">
           {terminalTabs.length > 0 ? (
             terminalTabs.map((tab) => (
               <ComposeLogTerminal
@@ -924,11 +945,11 @@ function PartialSuccessModalContent({
         </p>
       </div>
 
-      <div className="rounded-xl border border-amber-500/30 bg-amber-500/8 p-4 space-y-2">
-        <p className="text-xs uppercase tracking-wide text-amber-700 dark:text-amber-300">
+      <div className="rounded-xl border border-warning-border bg-warning-bg p-4 space-y-2">
+        <p className="text-xs uppercase tracking-wide text-warning">
           {p.warning}
         </p>
-        <p className="text-sm text-amber-700/90 dark:text-amber-300/90">{warningMessage}</p>
+        <p className="text-sm text-warning/90">{warningMessage}</p>
       </div>
 
       <div className="rounded-xl border border-border bg-muted/40 p-4">
@@ -948,7 +969,7 @@ function PartialSuccessModalContent({
         </button>
         <button
           type="button"
-          className="rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-red-700 disabled:opacity-50"
+          className="rounded-lg bg-danger-solid px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-danger-solid/90 disabled:opacity-50"
           onClick={async () => {
             setIsRejecting(true);
             try {

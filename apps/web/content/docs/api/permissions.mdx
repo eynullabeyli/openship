@@ -1,0 +1,316 @@
+---
+title: Members and permissions
+description: Manage organizations, members, invitations, and grants.
+---
+
+import { TypeTable } from 'fumadocs-ui/components/type-table';
+
+The Permissions API runs Openship's team and access-control model: it reports whether the active org is a
+team, lists the resources you can grant, creates a team organization, and manages the
+per-member **grants** and invitations that scope a `restricted` member to specific projects, servers, or
+other resources. In the dashboard this is the organization's **Team** tab. See
+[Auth & access](/docs/security/auth) for how roles and grants combine.
+
+User grants give a `restricted` member access to specific resources. Roles also provide their standard
+permissions. Token grants and read-only restrictions are an additional limit for every role. A user
+grant is `(user, resourceType, resourceId, permissions[])`; `resourceId: "*"` applies across the organization.
+
+## Create a team organization
+
+Creates a brand-new organization, marks it as a team, and sets the caller as its owner. Personal workspaces
+stay personal — this is the way to get a shared, multi-member org.
+
+<Tabs items={['SDK', 'REST API']} groupId="api-transport" persist>
+<Tab value="SDK">
+
+```ts
+const result = await ship.permissions.createTeamOrg({
+  name: "Acme Platform",
+});
+console.log(result);
+```
+
+</Tab>
+<Tab value="REST API">
+
+```bash
+curl -X POST "$OPENSHIP_URL/api/permissions/create-team-org" \
+  -H "Authorization: Bearer $OPENSHIP_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Acme Platform"}'
+```
+
+</Tab>
+</Tabs>
+
+<TypeTable
+  type={{
+    name: { type: 'string', description: 'Display name for the new team organization.', required: true },
+    slug: { type: 'string', description: 'URL slug. Auto-derived from the name (lowercased, hyphenated) when omitted.' },
+  }}
+/>
+
+Returns `201` with `{ data: { id, name, isTeam: true } }`.
+
+## List grantable resources
+
+Side-effect-free picker payload for the grant modal and invite flow. Pass the resource `type`; get back
+`{ id, label, meta? }[]`. The `*` wildcard is not listed — the picker adds it itself.
+
+<Tabs items={['SDK', 'REST API']} groupId="api-transport" persist>
+<Tab value="SDK">
+
+```ts
+const result = await ship.permissions.listResources({
+  type: "server",
+});
+console.log(result);
+```
+
+</Tab>
+<Tab value="REST API">
+
+```bash
+curl "$OPENSHIP_URL/api/permissions/resources?type=server" \
+  -H "Authorization: Bearer $OPENSHIP_TOKEN"
+```
+
+</Tab>
+</Tabs>
+
+For `type=billing` or `type=audit` the only entry is the org-wide `*`. For `type=github_repository` you can
+narrow to one account with `&owner=<login>`.
+
+## Grant a resource
+
+Idempotent upsert of a single grant tuple. Re-sending the same `(userId, resourceType, resourceId)` replaces
+its `permissions` in place. An **empty `permissions` array revokes** the grant (Openship keeps no
+zero-permission placeholder rows).
+
+<Tabs items={['SDK', 'REST API']} groupId="api-transport" persist>
+<Tab value="SDK">
+
+```ts
+const result = await ship.permissions.upsertGrant({
+  userId: "user_123",
+  resourceType: "project",
+  resourceId: "proj_abc",
+  permissions: ["read", "write"],
+});
+console.log(result);
+```
+
+</Tab>
+<Tab value="REST API">
+
+```bash
+curl -X POST "$OPENSHIP_URL/api/permissions/grants" \
+  -H "Authorization: Bearer $OPENSHIP_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"userId":"user_123","resourceType":"project","resourceId":"proj_abc","permissions":["read","write"]}'
+```
+
+</Tab>
+</Tabs>
+
+<TypeTable
+  type={{
+    userId: { type: 'string', description: 'Member to grant access to. Must already belong to the active org.', required: true },
+    resourceType: { type: 'string', description: 'project | server | mail_server | backup_destination | billing | audit | github_installation | github_repository.', required: true },
+    resourceId: { type: 'string', description: 'The resource id, or "*" for org-wide.', required: true },
+    permissions: { type: 'string[]', description: 'Any of read, write, admin. An empty array revokes the grant.', required: true },
+  }}
+/>
+
+Returns `201` with `{ data: <grant> }`, or `{ data: null, revoked: true }` when `permissions` was empty.
+
+## Replace a member's grant set
+
+Sends the member's **entire** desired grant set; the server diffs against what exists — upserting
+added/changed tuples and deleting any that are absent. This is the single save path for the member-grants
+editor. Zero-permission entries are dropped.
+
+<Tabs items={['SDK', 'REST API']} groupId="api-transport" persist>
+<Tab value="SDK">
+
+```ts
+const result = await ship.permissions.replaceGrants({
+  userId: "user_123",
+  grants: [
+    {
+      resourceType: "project",
+      resourceId: "proj_abc",
+      permissions: ["read", "write"],
+    },
+    {
+      resourceType: "server",
+      resourceId: "srv_1",
+      permissions: ["read"],
+    },
+  ],
+});
+console.log(result);
+```
+
+</Tab>
+<Tab value="REST API">
+
+```bash
+curl -X PUT "$OPENSHIP_URL/api/permissions/grants" \
+  -H "Authorization: Bearer $OPENSHIP_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "userId":"user_123",
+    "grants":[
+      {"resourceType":"project","resourceId":"proj_abc","permissions":["read","write"]},
+      {"resourceType":"server","resourceId":"srv_1","permissions":["read"]}
+    ]
+  }'
+```
+
+</Tab>
+</Tabs>
+
+<TypeTable
+  type={{
+    userId: { type: 'string', description: 'Member whose grants are being replaced.', required: true },
+    grants: { type: 'Grant[]', description: 'Full desired grant set. Any existing grant not present is removed.', required: true },
+  }}
+/>
+
+Each entry of `grants` is a `Grant` object:
+
+<TypeTable
+  type={{
+    resourceType: { type: 'string', description: 'project | server | mail_server | backup_destination | billing | audit | github_installation | github_repository.', required: true },
+    resourceId: { type: 'string', description: 'The resource id, or "*" for org-wide.', required: true },
+    permissions: { type: 'string[]', description: 'Any of read, write, admin. Zero-permission entries are dropped.', required: true },
+  }}
+/>
+
+Non-wildcard, row-backed resources are checked to belong to the active org; a foreign id is rejected with
+`400 RESOURCE_NOT_IN_ORG`.
+
+## Invite a member with grants
+
+Wraps Better Auth's invite and, in the same call, stores **pending** grants against the invitation. When the
+invitee accepts, the accept-invite page calls `POST /invitations/:id/materialize` to turn those pending
+grants into real ones.
+
+<Tabs items={['SDK', 'REST API']} groupId="api-transport" persist>
+<Tab value="SDK">
+
+```ts
+const result = await ship.permissions.inviteWithGrants({
+  email: "dev@acme.com",
+  role: "restricted",
+  grants: [
+    {
+      resourceType: "project",
+      resourceId: "proj_abc",
+      permissions: ["read", "write"],
+    },
+  ],
+});
+console.log(result);
+```
+
+</Tab>
+<Tab value="REST API">
+
+```bash
+curl -X POST "$OPENSHIP_URL/api/permissions/invite-with-grants" \
+  -H "Authorization: Bearer $OPENSHIP_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email":"dev@acme.com",
+    "role":"restricted",
+    "grants":[{"resourceType":"project","resourceId":"proj_abc","permissions":["read","write"]}]
+  }'
+```
+
+</Tab>
+</Tabs>
+
+<TypeTable
+  type={{
+    email: { type: 'string', description: 'Email address to invite.', required: true },
+    role: { type: '"owner" | "admin" | "member" | "restricted"', description: 'Org role for the invitee.', default: 'member' },
+    grants: { type: 'Grant[]', description: 'Pending grants to attach (same Grant shape as above). Only affect access for the restricted role; stored for other roles but inert.' },
+  }}
+/>
+
+Returns `201` with `{ data: { id, email, role, pendingGrantCount } }`.
+
+## Materialize an invitation's grants
+
+Called from the accept-invite page after Better Auth records the acceptance. It finds the invitation's
+pending grants, upserts them as real grants for the now-joined user, and clears the pending rows. Authorized
+by the invitation itself — the caller's email must match the invite and its status must be `accepted`.
+
+<Tabs items={['SDK', 'REST API']} groupId="api-transport" persist>
+<Tab value="SDK">
+
+```ts
+const result = await ship.permissions.materializeInvitation("inv_123");
+console.log(result);
+```
+
+</Tab>
+<Tab value="REST API">
+
+```bash
+curl -X POST "$OPENSHIP_URL/api/permissions/invitations/inv_123/materialize" \
+  -H "Authorization: Bearer $OPENSHIP_TOKEN"
+```
+
+</Tab>
+</Tabs>
+
+Returns `{ data: { materialized: <count> } }`.
+
+## Errors
+
+<Callout title="400 — missing or invalid fields" type="warn">
+`userId`, `resourceType`, and `resourceId` are required on `POST /grants`; `name` is required on
+`create-team-org`; `email` on `invite-with-grants`. An unknown `resourceType` returns
+`code: "INVALID_RESOURCE_TYPE"`. On the invitation flow, `400` also means the invite hasn't been accepted yet
+or has expired.
+</Callout>
+
+<Callout title="403 — not admin, or wrong invitee" type="error">
+The grant/invitation routes require the caller to be `admin` or `owner` in the active org. On
+`/invitations/:id/materialize`, `403` means your account's email doesn't match the invitation.
+</Callout>
+
+<Callout title="404 — not a member / grant not found" type="error">
+`POST /grants` returns `404` when the target `userId` isn't a member of the active org;
+`DELETE /grants/:id` returns `404` when the id doesn't belong to your organization (grants are org-scoped, so
+you can't touch another tenant's rows even by guessing the id).
+</Callout>
+
+## Operations
+
+{/* api-operations:start */}
+
+| Operation | SDK | REST API |
+| --- | --- | --- |
+| Read the selected organization’s permission metadata. | `permissions.orgMeta()` | `GET /api/permissions/org-meta`<br />`permissions:read` |
+| List resources available for permission grants. | `permissions.listResources(input)` | `GET /api/permissions/resources`<br />`permissions:read` |
+| Create a team organization with the caller as its owner. | `permissions.createTeamOrg(input)` | `POST /api/permissions/create-team-org`<br />`permissions:write` |
+| Read grants for the requested subject. | `permissions.listGrants(input)` | `GET /api/permissions/grants`<br />`permissions:read` |
+| Create or update one resource grant. | `permissions.upsertGrant(input)` | `POST /api/permissions/grants`<br />`permissions:write` |
+| Replace the requested subject’s grant set. | `permissions.replaceGrants(input)` | `PUT /api/permissions/grants`<br />`permissions:write` |
+| List organization invitations. | `permissions.listInvitations()` | `GET /api/permissions/invitations`<br />`permissions:read` |
+| Invite a member with explicit role and optional grants. | `permissions.inviteWithGrants(input)` | `POST /api/permissions/invite-with-grants`<br />`permissions:write` |
+| List organization members. | `permissions.listMembers()` | `GET /api/permissions/members`<br />`permissions:read` |
+| Apply accepted invitation grants to the resulting membership. | `permissions.materializeInvitation(id)` | `POST /api/permissions/invitations/:id/materialize`<br />`permissions:write` |
+| Remove one grant. | `permissions.deleteGrant(id)` | `DELETE /api/permissions/grants/:id`<br />`permissions:admin` |
+| Accept an authorized invitation. | `permissions.acceptInvitation(id)` | `POST /api/permissions/invitations/:id/accept`<br />`permissions:write` |
+| Reject an invitation. | `permissions.rejectInvitation(id)` | `POST /api/permissions/invitations/:id/reject`<br />`permissions:write` |
+| Cancel a pending invitation. | `permissions.cancelInvitation(id)` | `POST /api/permissions/invitations/:id/cancel`<br />`permissions:write` |
+| Resend an eligible invitation. | `permissions.resendInvitation(id, input?)` | `POST /api/permissions/invitations/:id/resend`<br />`permissions:write` |
+| Change a member’s organization role. | `permissions.setMemberRole(id, input)` | `PATCH /api/permissions/members/:id`<br />`permissions:write` |
+| Remove a member while preserving the final owner. | `permissions.removeMember(id)` | `DELETE /api/permissions/members/:id`<br />`permissions:admin` |
+
+{/* api-operations:end */}

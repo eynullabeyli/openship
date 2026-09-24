@@ -19,26 +19,33 @@
 
 import type { Context } from "hono";
 import { getRequestContext } from "../../lib/request-context";
-import { auth } from "../../lib/auth";
-import { issueNamespaceToken } from "../../lib/openship-cloud";
+import { auth } from "@repo/platform/engine/lib/auth";
+import { issueNamespaceToken } from "@repo/platform/engine/lib/openship-cloud";
 import {
   exchangeHandoffCode,
   validateDesktopRedirect,
   validateConnectRedirect,
   buildAuthHandoff,
   generateHandoffCode,
+  findHandoffCodeByState,
   mintSession,
 } from "../../lib/cloud-auth-proxy";
-import { runCloudPreflight } from "../../lib/cloud-preflight";
-import { cloudRuntimeTarget } from "../../config/env";
-import * as githubAuth from "../github/github.auth";
+import { runCloudPreflight } from "@repo/platform/engine/lib/cloud-preflight";
+import { cloudRuntimeTarget } from "@repo/platform/engine/config/env";
+import * as githubAuth from "@repo/platform/engine/modules/github/github.auth";
+import { canMintInstallationToken } from "@repo/platform/engine/modules/github/github-access";
 import {
   proxyCloudAnalytics,
   CloudAnalyticsForbiddenError,
   type CloudAnalyticsOperation,
-} from "./cloud-analytics.service";
+} from "@repo/platform/engine/modules/cloud/cloud-analytics.service";
 import { revokeCloudSession } from "./cloud-session.service";
-import { syncCloudEdgeProxy } from "./cloud-edge-proxy.service";
+import {
+  syncCloudEdgeProxy,
+  deleteCloudEdgeProxy,
+  requestCloudEdgeVerification,
+  checkCloudEdgeVerification,
+} from "./cloud-edge-proxy.service";
 import {
   createCloudPage,
   dispatchCloudPageAction,
@@ -67,7 +74,7 @@ import {
   mintOrgInstallationToken,
   oauthBridgeStore,
   OAUTH_BRIDGE_TTL_MS,
-} from "./cloud-github.service";
+} from "@repo/platform/engine/modules/cloud/cloud-github.service";
 
 /** Coerce a thrown Oblien SDK error into an HTTP response shape. */
 function oblienErrorResponse(c: Context, err: unknown, fallback: string) {
@@ -244,12 +251,11 @@ export async function desktopHandoff(c: Context) {
  *   - Code mint happens on POST /connect-authorize, not here
  */
 export async function connectHandoff(c: Context) {
+  const isDevice = c.req.query("mode") === "device";
   const codeChallenge = c.req.query("code_challenge");
   if (!codeChallenge || !/^[A-Za-z0-9_-]{40,128}$/.test(codeChallenge)) {
     return c.json({ error: "code_challenge query parameter is required", code: "MISSING_CODE_CHALLENGE" }, 400);
   }
-  const validation = validateConnectRedirect(c.req.query("redirect"));
-  if (!validation.ok) return c.json({ error: validation.error }, validation.status);
   const state = c.req.query("state");
   if (!state || typeof state !== "string" || state.length === 0 || state.length > 256) {
     return c.json({ error: "state query parameter is required", code: "MISSING_STATE" }, 400);
@@ -261,9 +267,18 @@ export async function connectHandoff(c: Context) {
   // /api/cloud/connect-authorize below, which is where the code mint
   // actually happens.
   const consentUrl = new URL("/cloud-authorize", cloudRuntimeTarget.dashboard);
-  consentUrl.searchParams.set("redirect", validation.url.toString());
   consentUrl.searchParams.set("state", state);
   consentUrl.searchParams.set("code_challenge", codeChallenge);
+  if (isDevice) {
+    // Device/poll flow (headless CLI): the code is delivered via connect-poll,
+    // not a browser redirect, so `redirect` is neither required nor forwarded —
+    // the consent page confirms in-place.
+    consentUrl.searchParams.set("mode", "device");
+  } else {
+    const validation = validateConnectRedirect(c.req.query("redirect"));
+    if (!validation.ok) return c.json({ error: validation.error }, validation.status);
+    consentUrl.searchParams.set("redirect", validation.url.toString());
+  }
   return c.redirect(consentUrl.toString());
 }
 
@@ -285,13 +300,14 @@ export async function connectHandoff(c: Context) {
  *   500 { error, code }        — on unexpected mint failure
  */
 export async function connectAuthorize(c: Context) {
-  let body: { redirect?: string; state?: string; codeChallenge?: string };
+  let body: { redirect?: string; state?: string; codeChallenge?: string; mode?: string };
   try {
-    body = await c.req.json<{ redirect?: string; state?: string; codeChallenge?: string }>();
+    body = await c.req.json<{ redirect?: string; state?: string; codeChallenge?: string; mode?: string }>();
   } catch {
     return c.json({ error: "Invalid JSON body", code: "INVALID_BODY" }, 400);
   }
 
+  const isDevice = body.mode === "device";
   const codeChallenge = body.codeChallenge;
   if (!codeChallenge || !/^[A-Za-z0-9_-]{40,128}$/.test(codeChallenge)) {
     return c.json(
@@ -299,9 +315,17 @@ export async function connectAuthorize(c: Context) {
       400,
     );
   }
-  const validation = validateConnectRedirect(body.redirect);
-  if (!validation.ok) {
-    return c.json({ error: validation.error, code: "INVALID_REDIRECT" }, validation.status);
+  // `redirect` is the delivery channel ONLY for the browser flow, where it MUST
+  // be validated (open-redirect/SSRF). The device/poll flow delivers the code via
+  // connect-poll — PKCE-locked + state-keyed — so it needs no redirect and there's
+  // no redirect target to guard.
+  let redirectUrl: string | undefined;
+  if (!isDevice) {
+    const validation = validateConnectRedirect(body.redirect);
+    if (!validation.ok) {
+      return c.json({ error: validation.error, code: "INVALID_REDIRECT" }, validation.status);
+    }
+    redirectUrl = validation.url.toString();
   }
   const state = body.state;
   if (!state || typeof state !== "string" || state.length === 0 || state.length > 256) {
@@ -346,8 +370,13 @@ export async function connectAuthorize(c: Context) {
       },
       linked.token,
       codeChallenge,
+      // Record `state` so a headless CLI (device/poll flow) can retrieve this
+      // code via connect-poll instead of catching the browser redirect.
+      state,
     );
-    const callbackUrl = new URL(validation.url.toString());
+    // Device/poll: nothing to navigate to — the CLI's poll picks up the code.
+    if (isDevice) return c.json({ authorized: true });
+    const callbackUrl = new URL(redirectUrl!);
     callbackUrl.searchParams.set("code", code);
     callbackUrl.searchParams.set("state", state);
     return c.json({ callbackUrl: callbackUrl.toString() });
@@ -374,6 +403,31 @@ export async function exchangeCode(c: Context) {
   }
 
   return c.json({ data: result });
+}
+
+// ─── Device/poll flow (headless CLI — no browser redirect back to the box) ───
+
+/**
+ * GET /api/cloud/connect-poll?state=<state>
+ *
+ * The server-friendly half of cloud-connect: a CLI running on a remote box
+ * (over SSH) can't receive the browser redirect to its own loopback listener,
+ * so instead it POLLS here with the unguessable `state` it generated. Returns
+ * the one-time handoff code once the user has clicked Authorize in their
+ * browser, else `{ status: "pending" }`.
+ *
+ * No session (the CLI has no SaaS cookie). Security rests on: `state` is a
+ * 128+-bit capability never shown to the user; the returned `code` is still
+ * PKCE-locked (worthless without the verifier the CLI holds) and one-time at
+ * exchange; the endpoint is rate-limited per-IP.
+ */
+export async function connectPoll(c: Context) {
+  const state = c.req.query("state");
+  if (!state || state.length < 16 || state.length > 256) {
+    return c.json({ error: "state is required", code: "MISSING_STATE" }, 400);
+  }
+  const code = await findHandoffCodeByState(state);
+  return code ? c.json({ status: "ready", code }) : c.json({ status: "pending" });
 }
 
 // ─── Managed edge proxy sync ─────────────────────────────────────────────────
@@ -403,6 +457,74 @@ export async function syncEdgeProxy(c: Context) {
     return c.json({ ok: true, hostname: result.hostname });
   } catch (err) {
     return oblienErrorResponse(c, err, "Failed to sync edge proxy");
+  }
+}
+
+/**
+ * POST /api/cloud/edge-proxy/delete  { slug }
+ *
+ * Tear down the caller's managed edge proxy for a freed slug (a dropped free
+ * *.opsh.io domain). Namespace-scoped, so a caller can only remove its own
+ * proxy. Idempotent — an unknown slug returns `removed:false`, not an error.
+ */
+export async function deleteEdgeProxy(c: Context) {
+  const ctx = getRequestContext(c);
+  const body = await c.req.json<{ slug?: string }>();
+  if (!body.slug) {
+    return c.json({ error: "slug is required" }, 400);
+  }
+  try {
+    const result = await deleteCloudEdgeProxy(ctx.organizationId, { slug: body.slug });
+    if (!result.ok) return c.json({ error: result.error }, result.status);
+    return c.json({ ok: true, removed: result.removed });
+  } catch (err) {
+    return oblienErrorResponse(c, err, "Failed to delete edge proxy");
+  }
+}
+
+/**
+ * POST /api/cloud/edge-proxy/verify  { target }
+ *
+ * Start proving that the caller controls a routing target. Returns a one-time token
+ * and the path to serve it at; the box installs it on its edge and then calls
+ * /verify-check. Namespace-scoped, so the record belongs to the caller's org.
+ */
+export async function requestEdgeVerification(c: Context) {
+  const ctx = getRequestContext(c);
+  const body = await c.req.json<{ target?: string }>();
+  if (!body.target) {
+    return c.json({ error: "target is required" }, 400);
+  }
+  try {
+    const result = await requestCloudEdgeVerification(ctx.organizationId, { target: body.target });
+    if (!result.ok) return c.json({ error: result.error }, result.status);
+    return c.json({ ok: true, verification: result.verification });
+  } catch (err) {
+    return oblienErrorResponse(c, err, "Failed to request edge target verification");
+  }
+}
+
+/**
+ * POST /api/cloud/edge-proxy/verify-check  { verificationId }
+ *
+ * Run the probe for a challenge this org requested. The upstream fetches the token
+ * from the target over an SSRF-safe pinned connection; on success the target becomes
+ * routable and the route is pinned to the validated IP.
+ */
+export async function checkEdgeVerification(c: Context) {
+  const ctx = getRequestContext(c);
+  const body = await c.req.json<{ verificationId?: number }>();
+  if (typeof body.verificationId !== "number") {
+    return c.json({ error: "verificationId is required" }, 400);
+  }
+  try {
+    const result = await checkCloudEdgeVerification(ctx.organizationId, {
+      verificationId: body.verificationId,
+    });
+    if (!result.ok) return c.json({ error: result.error }, result.status);
+    return c.json({ ok: true, verification: result.verification });
+  } catch (err) {
+    return oblienErrorResponse(c, err, "Failed to check edge target verification");
   }
 }
 
@@ -898,7 +1020,7 @@ export async function githubOauthSuccess(c: Context) {
  */
 export async function githubInstallUrl(c: Context) {
   const ctx = getRequestContext(c);
-  const { url, state } = await buildOrgScopedInstallUrl(ctx.organizationId);
+  const { url, state } = await buildOrgScopedInstallUrl(ctx.userId, ctx.organizationId);
   return c.json({ data: { url, state } });
 }
 
@@ -908,9 +1030,10 @@ export async function githubInstallUrl(c: Context) {
  * Public endpoint (no session auth) — GitHub redirects the user's browser
  * here AFTER they approve the App installation on github.com. We use the
  * one-time state token (issued by githubInstallUrl and embedded into the
- * install URL) to recover the SaaS userId that started the flow, then
- * use the App-JWT (which only the SaaS holds) to read the installation
- * details and write the gitInstallation row. NO OAuth identity required.
+ * install URL) to recover the SaaS userId + workspace that started the flow.
+ * Attribution then requires that user's GitHub token and the Openship App JWT
+ * to resolve the same installation before the state and workspace claim are
+ * committed atomically. No browser session is trusted on this callback.
  */
 export async function githubInstallCallback(c: Context) {
   const result = await attributeGithubInstall({
@@ -949,8 +1072,16 @@ export async function githubInstallCallback(c: Context) {
       return c.html(
         renderCallbackHtml(
           "Installation requested",
-          "An organization admin needs to approve the install. The Openship App will activate once approved.",
+          "An organization admin needs to approve the install. After approval, return to Openship Settings and choose Install GitHub App again to complete the verified workspace connection.",
         ),
+      );
+    case "forbidden":
+      return c.html(
+        renderCallbackHtml(
+          "Installation not authorized",
+          result.message,
+        ),
+        403,
       );
     case "ok":
       return c.html(
@@ -1034,13 +1165,37 @@ export async function githubInstallations(c: Context) {
  * against github.com for the actual git clone — cloud never sees the
  * source code.
  *
- * SECURITY: `installationId` is intentionally NOT accepted from the
- * request body — see service comments.
+ * SECURITY, two halves:
+ *   - `installationId` is intentionally NOT accepted from the request body, so a
+ *     caller cannot name another org's installation — see service comments.
+ *   - the caller must hold a GitHub grant for what they are asking for. The route
+ *     tag alone does NOT establish this: "cloud" is an org-singleton resource, so a
+ *     plain `member` satisfies `cloud:write`. See the gate in the handler.
  */
 export async function githubInstallationToken(c: Context) {
   const ctx = getRequestContext(c);
   const body = await c.req.json<{ owner?: string; repos?: string[] }>();
   if (!body.owner) return c.json({ error: "owner is required" }, 400);
+
+  // The repo-grant gate. Without it the route's `cloud:write` tag was the only check,
+  // and "cloud" is an org SINGLETON resource — so the assert runs with resourceId "*"
+  // and roleAllowsResourceType lets plain `member` through. Any member could mint a
+  // live GitHub App installation token, and the grant system that decides WHICH repos
+  // a member may touch was never consulted. The repos-vs-no-repos distinction is the
+  // security-relevant part; it lives in canMintInstallationToken.
+  const requested = (body.repos ?? []).map((r) => r.trim()).filter(Boolean);
+  if (!(await canMintInstallationToken(ctx, body.owner, body.repos))) {
+    return c.json(
+      {
+        error: requested.length
+          ? `You don't have access to all of the requested repositories under ${body.owner}. Ask an organization owner to grant you access.`
+          : `You don't have access to every repository under ${body.owner}. Ask an organization owner to grant you access, or request specific repositories instead.`,
+        code: "GITHUB_ACCESS_DENIED",
+      },
+      403,
+    );
+  }
+
   const result = await mintOrgInstallationToken(ctx.organizationId, body.owner, body.repos);
   if (result.kind === "not-found") {
     return c.json({ error: `No GitHub App installation found for ${result.owner}` }, 404);

@@ -1,0 +1,92 @@
+---
+title: Deploy and manage releases
+description: Deploy a linked project or local folder, follow logs, and control releases.
+---
+
+First [connect to an installation](/docs/cli/access) or configure [native mode](/docs/cli/native).
+
+## Deploy a Git project
+
+From your repository, link an existing Openship project whose source is configured:
+
+```bash
+openship init --project proj_123
+openship deploy --watch
+```
+
+Use `--project` to select a project without changing the local link. Select a branch, commit,
+variable set, or registered server when needed:
+
+```bash
+openship deploy --project proj_123 --branch main --env production --watch
+openship deploy --project proj_123 --server srv_123 --watch
+```
+
+For a preview, first create or select a **non-production project environment** in the dashboard,
+then deploy its project ID. That row owns its own routes, runtime and active release:
+
+```bash
+openship deploy --project proj_preview --env preview --watch
+```
+
+`--env` selects stored variables within that project. It does not create a preview runtime or switch
+project IDs. Preview variables are refused on a production target before deployment starts.
+Omitting `--env` uses the project's default `production` variable set, including the values edited
+in the dashboard of a preview project.
+
+## Deploy a folder
+
+Upload the current directory explicitly, including from a Git checkout:
+
+```bash
+openship deploy --folder --name my-site --watch
+```
+
+The CLI stages the directory through the shared SDK source workflow. Outside Git, `--name` also
+opts into a folder upload for existing scripts. A project ID alone never opts into uploading the
+current directory. Use `--project <id>` to redeploy from outside the checkout; the stored branch is
+used unless `--branch` is supplied.
+
+`--branch`, `--commit`, `--smart-route`, and `--refresh` select the Git path and cannot be combined
+with `--folder`. `--service-ids` works for both paths. Archive staging must remain outside the source
+tree: the system temporary directory and its ancestors are refused. Select your project directory,
+or set `TMPDIR` outside the source tree.
+
+Native directory deployment requires the directory to be inside `policy.sourceRoots`. See
+[folder deployment](/docs/guides/deploy-local-folder) for packaging behavior.
+
+## Select what changes
+
+| Option | Behavior |
+| --- | --- |
+| `--force-all` | Rebuild all enabled services. |
+| `--service-ids svc_a,svc_b` | Select services to deploy. |
+| `--smart-route` | Use source changes to select affected services. |
+| `--refresh` | Reapply environment configuration without pulling source or rebuilding. |
+
+See the [deploy reference](/docs/cli/reference/deploy) for every option.
+
+## Inspect progress
+
+```bash
+openship deployment list --project proj_123
+openship deployment get dep_123
+openship logs dep_123 --follow
+```
+
+Without `--watch`, deployment submission returns an ID that you can inspect later. A submitted build
+is not yet a successful release. Follow the final status and any requested decisions.
+
+## Control a release
+
+```bash
+openship deployment cancel dep_123
+openship deployment redeploy dep_123 --use-existing-commit
+openship deployment rollback dep_previous
+```
+
+Rollback availability depends on retained artifacts or rebuild support. `pin` retains a deployment's
+rollback artifacts; `keep` and `reject` settle releases waiting for a decision.
+
+Use the [deployment command reference](/docs/cli/reference/deployment) for controls and
+[rollback guide](/docs/guides/rollback-redeploy) for recovery behavior.

@@ -4,10 +4,12 @@ import React, { useState, useCallback, useEffect, useRef, useMemo } from "react"
 import { Terminal, Server } from "lucide-react";
 import { useSearchParams, useRouter } from "next/navigation";
 import { useProjectSettings } from "@/context/ProjectSettingsContext";
+import { workloadOf } from "@/context/deployment/types";
 import { useI18n } from "@/components/i18n-provider";
 import { TerminalLogs } from "./logs/TerminalLogs";
 import { ServerLogs } from "./logs/ServerLogs";
 import { LogsActions } from "./logs/LogsActions";
+import { CustomSelect } from "@/components/ui/CustomSelect";
 import { endpoints } from "@/lib/api/endpoints";
 import { sortServicesByPublicFirst } from "@/lib/api/services";
 
@@ -30,10 +32,16 @@ export const LogsSettings = () => {
     typeof projectData?.options?.hasServer === "boolean" ||
     typeof projectData?.hasServer === "boolean" ||
     buildData.isLoading === false;
+  // A worker runs a container and produces logs like a web app; only a static
+  // (edge-served) deploy has no runtime logs. Resolve the workload so a worker
+  // (hasServer=false) still gets its logs surfaced (#538). Gate on
+  // hasResolvedServerMode so we don't assume "web" before the data loads.
   const effectiveHasServer =
-    projectData?.options?.hasServer === true ||
-    projectData?.hasServer === true ||
-    (buildData.isLoading === false && buildData.hasServer === true);
+    hasResolvedServerMode &&
+    workloadOf({
+      workloadType: projectData?.workloadType ?? projectData?.options?.workloadType ?? buildData.workloadType,
+      hasServer: projectData?.options?.hasServer ?? projectData?.hasServer ?? buildData.hasServer,
+    }) !== "static";
   const searchParams = useSearchParams();
   const router = useRouter();
   const serviceIdFromUrl = searchParams.get("service");
@@ -54,14 +62,26 @@ export const LogsSettings = () => {
   const servicesLoading = servicesData.isLoading;
   const servicesLoaded = !servicesData.isLoading;
   const hasServices = services.length > 0;
-  // Cloud deploys (including static apps) always have edge-access
-  // logs available via the same /server-logs/* endpoints — those
-  // endpoints route by `resolveProjectTrafficSource` server-side and
-  // fall back to Oblien's edge proxy when there's no runtime
-  // container. So a static .opsh.io page still has request logs even
-  // with no runtime stdout to stream.
+  // A project has a standalone "project runtime" log source ONLY when it has no
+  // services. A services/compose project's runtime IS its services — there's no
+  // project-level container, so `projects/:id/logs` 404s for it. Treating
+  // `effectiveHasServer` as a project-runtime log target was the bug: it offered
+  // + defaulted "Project runtime" for services projects, which 404'd.
+  const hasProjectRuntime = effectiveHasServer && !hasServices;
+  // Request logs come from the EDGE, not from a runtime process — so anything
+  // served through an edge has them, whether or not it has a container to stream
+  // stdout from. That's every project with a domain: cloud (Oblien's edge proxy)
+  // and self-hosted alike (`/server-logs/stream` → the edge's mgmt API, including
+  // a containerized edge via execMgmtStream).
+  //
+  // This used to be `deployTarget === "cloud"`, which meant a STATIC app on a
+  // server — the case with no runtime logs by definition — showed "No runtime
+  // logs, nothing to stream" while its edge was logging every request. The
+  // backend already supported it (ServerLogs handles `kind: "self-hosted"`); only
+  // this gate said no.
   const deployTarget = projectData?.deployTarget as string | null | undefined;
-  const canShowRequestLogs = deployTarget === "cloud";
+  const hasDomain = (projectData?.domains?.length ?? 0) > 0;
+  const canShowRequestLogs = deployTarget === "cloud" || hasDomain;
   const canShowRuntimeLogs = effectiveHasServer || hasServices;
   const canShowLogs = canShowRuntimeLogs || canShowRequestLogs;
   // Terminal (container stdout) still requires an actual runtime —
@@ -78,7 +98,7 @@ export const LogsSettings = () => {
   // Previously this was `hasMultipleServices` (services count > 1) which
   // missed the common case of "single app + 1 service" where the user
   // still needs to pick which one to look at.
-  const logTargetCount = (effectiveHasServer ? 1 : 0) + services.length;
+  const logTargetCount = (hasProjectRuntime ? 1 : 0) + services.length;
   const hasMultipleLogTargets = logTargetCount > 1;
 
   useEffect(() => {
@@ -145,16 +165,16 @@ export const LogsSettings = () => {
       if (hasMultipleLogTargets) {
         // Multi-target: default to the project runtime if it exists,
         // otherwise the first service.
-        return effectiveHasServer ? null : (services[0]?.id ?? null);
+        return hasProjectRuntime ? null : (services[0]?.id ?? null);
       }
 
-      return !effectiveHasServer && services.length === 1 ? services[0].id : null;
+      return !hasProjectRuntime && services.length === 1 ? services[0].id : null;
     });
-  }, [effectiveHasServer, hasMultipleLogTargets, hasProjectId, services, servicesLoading]);
+  }, [hasProjectRuntime, hasMultipleLogTargets, hasProjectId, services, servicesLoading]);
 
   const selectedService = services.find((service) => service.id === selectedServiceId) ?? null;
   const implicitSingleService =
-    !hasMultipleLogTargets && !effectiveHasServer ? (services[0] ?? null) : null;
+    !hasMultipleLogTargets && !hasProjectRuntime ? (services[0] ?? null) : null;
   const terminalService = hasMultipleLogTargets ? selectedService : implicitSingleService;
   const isServiceLogTarget = Boolean(terminalService);
   const terminalStreamTarget = !hasProjectId
@@ -309,31 +329,33 @@ export const LogsSettings = () => {
                   <div>
                     <p className="text-sm font-medium text-foreground">{t.projectSettings.logs.target}</p>
                     <p className="text-sm text-muted-foreground">
-                      {effectiveHasServer
+                      {hasProjectRuntime
                         ? t.projectSettings.logs.targetDescProject
                         : t.projectSettings.logs.targetDescService}
                     </p>
                   </div>
                   <div className="min-w-[220px]">
-                    <select
+                    <CustomSelect
                       value={selectedServiceId ?? ""}
-                      onChange={(event) => setSelectedServiceId(event.target.value || null)}
-                      disabled={servicesLoading}
-                      className="w-full rounded-xl border border-border bg-background px-3 py-2 text-sm text-foreground outline-none"
-                    >
-                      {effectiveHasServer && <option value="">{t.projectSettings.logs.projectRuntime}</option>}
-                      {services.map((service) => (
-                        <option key={service.id} value={service.id}>
-                          {service.name}
-                        </option>
-                      ))}
-                    </select>
+                      onChange={(value) => setSelectedServiceId(value || null)}
+                      options={[
+                        ...(hasProjectRuntime
+                          ? [{ value: "", label: t.projectSettings.logs.projectRuntime, icon: <Server className="size-4" /> }]
+                          : []),
+                        ...services.map((service) => ({
+                          value: service.id,
+                          label: service.name,
+                          icon: <Server className="size-4" />,
+                        })),
+                      ]}
+                      placeholder={t.projectSettings.logs.selectService}
+                    />
                   </div>
                 </div>
               </div>
             )}
 
-            {hasMultipleLogTargets && !effectiveHasServer && !selectedService ? (
+            {hasMultipleLogTargets && !hasProjectRuntime && !selectedService ? (
               <div className="flex min-h-[420px] items-center justify-center rounded-3xl border border-border/50 bg-card text-sm text-muted-foreground">
                 {t.projectSettings.logs.selectService}
               </div>

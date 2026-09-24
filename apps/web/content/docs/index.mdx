@@ -1,25 +1,36 @@
 ---
-title: Introduction
-description: Welcome to Openship - the open-source, self-hostable deployment platform.
+title: Openship documentation
+description: Deploy applications, operate your infrastructure, and build integrations with Openship.
 ---
 
-Openship is an open-source deployment platform that lets you deploy apps, databases, and full-stack infrastructure on your own servers.
+Openship builds and deploys applications from Git repositories, local folders, generated files, and app
+templates. Run workloads on your machine, a connected server, or Openship Cloud.
 
-## Why Openship?
+## Start here
 
-- **Self-hosted** - Run on your own servers. Your data stays yours.
-- **AI-assisted** - Intelligent build detection, config generation, and diagnostics.
-- **Zero lock-in** - Export everything, migrate anytime. No proprietary formats.
-- **Open source** - Apache-2.0 licensed. Inspect, modify, contribute.
+<Cards>
+  <Card title="Deploy your first app" href="/docs/getting-started/quickstart" description="Choose an installation, connect your code, and follow a deployment." />
+  <Card title="Install Openship" href="/docs/getting-started/installation" description="Set up the desktop app, a server, or a development checkout." />
+  <Card title="Use the CLI" href="/docs/cli" description="Deploy and manage projects from a terminal or CI job." />
+  <Card title="Use the Node.js SDK" href="/docs/api/sdk" description="Connect to an existing API or embed the platform in your application." />
+</Cards>
 
-## How it works
+## Find a task
 
-1. **Connect** - Point Openship at your Git repo or push a Docker image.
-2. **Build** - AI detects your framework and configures the build automatically.
-3. **Deploy** - Your app goes live with SSL, domains, and monitoring out of the box.
+| Task | Read |
+| --- | --- |
+| Deploy from Git or a folder | [Deployment guides](/docs/guides#deploy) |
+| Configure domains, secrets, and storage | [Application configuration](/docs/guides#configure) |
+| Inspect logs, back up data, or fix a failure | [Operations](/docs/guides#operate) |
+| Move projects or an installation | [Migration guides](/docs/guides#move) |
+| Learn the dashboard | [Dashboard guide](/docs/dashboard) |
+| Call HTTP endpoints | [API reference](/docs/api) |
+| Connect an AI tool | [MCP guide](/docs/mcp) |
 
-## Next steps
+## Key concepts
 
-- [Quickstart](/docs/quickstart) - Deploy your first app in under 2 minutes.
-- [Installation](/docs/installation) - Set up Openship on your own server.
-- [CLI Reference](/docs/cli) - Manage deployments from the terminal.
+An **organization** owns projects and grants access to its members. A **project** holds source and
+configuration. A **deployment** is one build and release of that project. A **service** is a workload
+inside a project, such as an application or database.
+
+See [core concepts](/docs/getting-started/core-concepts) for environments, runtimes, servers, and domains.

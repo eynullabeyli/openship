@@ -36,7 +36,7 @@ const SECTIONS = [
     title: "The service",
     body: [
       "We provide infrastructure to build, ship, and run your applications - managed databases, mail, storage, routing, and the platform tooling around it.",
-      "Cloud has free allowances for compute and bandwidth. Beyond those, usage is metered and billed in arrears. Per-seat pricing applies to active team members each month.",
+      "Openship Cloud is offered on published subscription plans, listed on our pricing page, with usage-based credits on top. Self-hosted use is free under the Apache 2.0 license.",
       "We may improve the service, fix bugs, or evolve features at any time. Material breaking changes get at least 30 days' notice.",
     ],
   },
@@ -69,17 +69,15 @@ const SECTIONS = [
     id: "billing",
     title: "Billing",
     body: [
-      "Cloud is per-seat per month, billed monthly. Yearly billing prices in 20% discount. Usage overages (compute, bandwidth) are billed in arrears with itemised invoices.",
-      "We accept major cards via Stripe. Invoices are also available for Business plans.",
-      "If a charge fails we retry, then email account owners. Persistent failure pauses deploys after 14 days; data is retained 30 more days before deletion.",
-      "Refunds: unused prepaid time is refunded prorated within 30 days of cancellation. Usage charges are non-refundable.",
+      "Openship Cloud plan prices are published on our pricing page. Paid plans are billed monthly in advance and you may cancel at any time; cancellation takes effect at the end of the period you have already paid for. Self-hosted use is free.",
+      "We accept major cards via Stripe. Price changes to a plan you are on are announced at least 30 days in advance and apply from your next billing period. A failed payment triggers retries and email notice before any suspension.",
     ],
   },
   {
     id: "uptime-sla",
     title: "Uptime and SLA",
     body: [
-      "Cloud targets 99.9% monthly uptime on a best-effort basis. Business plans receive a 99.9% contractual SLA with service credits as the sole remedy.",
+      "Openship Cloud targets 99.9% monthly uptime on a best-effort basis, with contractual SLAs and service credits available on eligible paid plans.",
       "Scheduled maintenance is announced at least 7 days in advance and excluded from uptime calculations.",
     ],
   },

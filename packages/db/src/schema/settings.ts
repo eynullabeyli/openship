@@ -45,6 +45,24 @@ export const instanceSettings = pgTable("instance_settings", {
    */
   authMode: text("auth_mode").notNull().default("none"),
 
+  /**
+   * Which PRODUCT this instance presents itself as:
+   *   "platform" → the full deploy platform (default)
+   *   "mail"     → Openship Mail: the dashboard's left rail becomes the mail
+   *                control plane and the platform nav (Projects, Apps,
+   *                Deployments, Library) is hidden.
+   *
+   * Nullable ON PURPOSE: null means "no instance override, use OPENSHIP_PRODUCT".
+   * A notNull default would make the env var permanently unreachable, since the
+   * row exists on every instance. Resolved by lib/product-mode.ts — never read
+   * directly, so the CLOUD_MODE rule stays in one place.
+   *
+   * This is presentation scope, NOT authorization: mail mode hides nav entries
+   * and never gates a route (webmail deploys through the normal project
+   * pipeline, so the platform endpoints must stay live).
+   */
+  productMode: text("product_mode"),
+
   // ── Defaults ───────────────────────────────────────────────────────────────
 
   /** Default build mode for new users on this instance */
@@ -126,6 +144,95 @@ export const instanceSettings = pgTable("instance_settings", {
    */
   migrationStartedAt: timestamp("migration_started_at"),
 
+  // ── Email / SMTP transport ──────────────────────────────────────────────────
+  //
+  // Operator-configured SMTP used for ALL instance-sent mail — password reset,
+  // email verification, team invites, and notifications. When set, this is the
+  // highest-priority source in `lib/mail.ts` (above the provisioned mail-server
+  // platform mailbox and the static env SMTP). Instance-wide, matching the auth
+  // layer's scope. The password is encrypted at rest (`lib/encryption`) and is
+  // NEVER returned to the client (masked on read). All-null = not configured.
+  smtpHost: text("smtp_host"),
+  smtpPort: integer("smtp_port"),
+  smtpUser: text("smtp_user"),
+  smtpPasswordEncrypted: text("smtp_password_encrypted"),
+  /** From header, e.g. "Openship <no-reply@example.com>". Falls back to smtpUser. */
+  smtpFrom: text("smtp_from"),
+
+  // ── GitHub device sign-in ───────────────────────────────────────────────────
+  //
+  // The token from the in-UI GitHub device flow, encrypted at rest.
+  //
+  // Instance-scoped, not per-user, because it stands in for the HOST's `gh`
+  // login: `getLocalGhToken()` answers "what git identity does this machine
+  // have" with no user context, and the separate `ghCliOperatorOptedIn` gate
+  // decides who may use it. Putting it on a user row would mean threading a
+  // userId through every clone path for no gain.
+  //
+  // Durable ON PURPOSE. It used to live only in the 8-hour `gh-cli-token`
+  // cache, whose fallbacks are `gh auth token` and ~/.config/gh/hosts.yml —
+  // neither of which exists in the api container, which is exactly where this
+  // flow is used. So the operator signed in and was silently signed out 8 hours
+  // later. GitHub's own OAuth-app tokens don't expire; only our storage did.
+  ghDeviceTokenEncrypted: text("gh_device_token_encrypted"),
+  ghDeviceTokenSetAt: timestamp("gh_device_token_set_at"),
+  /**
+   * HOW that credential was established: "device" (browser device flow) or
+   * "token" (operator pasted a PAT). Null = no stored credential.
+   *
+   * Stored rather than inferred because the UI has to name it correctly. Every
+   * stored identity used to surface as "gh CLI" — the label for a token probed
+   * off the HOST's `gh` login — so pasting a PAT showed up as a gh-CLI
+   * connection, which is simply not what happened. It also decides whether the
+   * library's first-run consent prompt applies: probing the host's pre-existing
+   * gh login warrants asking before enumerating repos; a credential the operator
+   * just typed into Openship is already consent.
+   */
+  ghDeviceTokenMethod: text("gh_device_token_method").$type<"device" | "token" | null>(),
+
+  // ── Remote infra (edge / mail container) updates ────────────────────────────
+  //
+  // When the control plane's APP_VERSION moves forward (desktop self-update or
+  // `openship update`), the edge/mail containers already deployed on remote
+  // servers stay on their old image tag. These two columns drive the
+  // "monitor → advise → apply" loop for that drift (server-containers.service):
+  //
+  //   autoUpdateInfra → true reconciles behind containers automatically on the
+  //     version-change boot hook; false surfaces an advisory the operator applies.
+  //     Instance-wide (not per-user) so it holds on desktop's zero-auth user and
+  //     on self-hosted alike. Off by default — an update recreates a live edge.
+  //   lastSeenVersion → the APP_VERSION the infra reconcile last ran for. The
+  //     boot hook compares readApiVersion() to this to fire `infra:scan` exactly
+  //     once per upgrade rather than on every boot. Null on a fresh install.
+  autoUpdateInfra: boolean("auto_update_infra").notNull().default(false),
+  //   autoScanInfra → true lets the dashboard run ONE detect-only scan when a
+  //     relevant surface loads (Infrastructure tab / home) if the cached drift
+  //     state is stale, so the attention dot + issue list stay fresh without a
+  //     manual Scan. Detect-only — it never applies (that's autoUpdateInfra).
+  //     The 6h cron + boot hook run regardless. On by default (cheap probe).
+  autoScanInfra: boolean("auto_scan_infra").notNull().default(true),
+  lastSeenVersion: text("last_seen_version"),
+
+  // ── Host control ─────────────────────────────────────────────────────────────
+
+  /**
+   * May OpenShip deploy to the machine it runs on ("This Server")?
+   *
+   * Nullable ON PURPOSE — the exact contract as productMode above: null means
+   * "no instance override, use the OPENSHIP_HOST_CONTROL env default" (which the
+   * `openship up --no-host-control` install flag writes). A notNull default would
+   * write a concrete value on every instance and permanently shadow that env var.
+   * Resolved by apps/api/src/lib/host-control.ts, never read directly, so the
+   * env-fallback + selfhosted-target rules live in one place.
+   *
+   * Unlike productMode this DOES gate privileged behavior (host-root deploys via
+   * the container→host SSH channel + mounted docker socket), so the WRITE is
+   * gated to the box-owning org's owner in setup.controller. The precedence still
+   * lets the DB override env — the operator's stated need is to re-enable from
+   * Settings what `--no-host-control` turned off, "from settings again anytime".
+   */
+  hostControlEnabled: boolean("host_control_enabled"),
+
   // ── Timestamps ─────────────────────────────────────────────────────────────
 
   createdAt: timestamp("created_at").notNull().defaultNow(),
@@ -154,6 +261,13 @@ export const userSettings = pgTable("user_settings", {
    *   "local"  → always build locally, transfer the output
    */
   buildMode: text("build_mode").notNull().default("auto"),
+
+  /**
+   * Default edge→app upstream strategy for new deploys: "auto" (→ loopback host
+   * port), "loopback-port", or "container-ip" (advanced). Per-project +
+   * per-deploy overrides win. Mirrors buildMode.
+   */
+  routeStrategy: text("route_strategy").notNull().default("auto"),
 
   /**
    * Encrypted session token for the user's Openship Cloud account.
@@ -201,12 +315,38 @@ export const userSettings = pgTable("user_settings", {
   cloneStrategyPreference: text("clone_strategy_preference").notNull().default("prompt"),
 
   /**
+   * Volume-transfer strategy for migrations / server-to-server moves.
+   *   "auto"   → topology-aware (direct on same daemon, stream cross-host)
+   *   "stream" → always tar-stream (streamPath → receiveStream)
+   *   "direct" → single-helper same-daemon copy (falls back to stream cross-host)
+   *   "rsync"  → reserved; falls back to stream until delta-rsync ships
+   */
+  transferMode: text("transfer_mode").notNull().default("auto"),
+  /**
+   * Compression for the stream path.
+   *   "auto" → none on same host, gzip cross-host
+   *   "zstd" | "gzip" | "none" → forced (zstd needs helper egress to fetch the codec)
+   */
+  transferCompression: text("transfer_compression").notNull().default("auto"),
+
+  /**
    * Local-mode gh-CLI suppression. In `cli` auth mode the API falls back to
    * the host's `gh auth token` when no OAuth row is stored. That makes
    * Disconnect feel broken because gh silently re-authenticates. When this
    * flag is true the API treats gh CLI as if it isn't installed.
    */
   githubCliDisabled: boolean("github_cli_disabled").notNull().default(false),
+
+  /**
+   * Generic, instance-wide (per-operator) opt-in to FORWARD this host's git
+   * identity to a remote build server for clone-on-server — replaces the old
+   * per-deploy `forwardGitCredentials` choice. When on, a server build that has
+   * no credential of its own forwards the operator's local `gh` over the SSH
+   * reverse tunnel (token never persists on the server). When off, forwarding is
+   * never attempted and the clone falls to the server's own auth / public / the
+   * api-host clone. Set once in Settings → GitHub, not per project.
+   */
+  forwardGitToServer: boolean("forward_git_to_server").notNull().default(false),
 
   /**
    * Operator opt-in for the gh-CLI escape hatch. The gh CLI token is the
